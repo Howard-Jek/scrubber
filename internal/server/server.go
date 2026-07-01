@@ -1,40 +1,69 @@
-// Package server exposes the control/observability plane. It is intentionally
-// data-free: no endpoint accepts or returns bundle bytes, so it is safe to expose
-// on an external Route even under the network-only auth model. All log data flows
-// through internal MinIO buckets, never through here.
+// Package server exposes the control/observability plane plus a thin browser API.
+// No bundle bytes ever pass through the service: uploads/downloads happen directly
+// between the browser and MinIO via presigned URLs that this server mints. The
+// browser-facing responses expose only replacement labels and preset names — never
+// literal values or matched originals — so nothing sensitive leaks over the Route.
 package server
 
 import (
+	"context"
 	"encoding/json"
 	"net/http"
+	"time"
 
 	"github.com/howard/scrubber/internal/metrics"
 	"github.com/howard/scrubber/internal/policy"
+	"github.com/howard/scrubber/internal/scrub"
 	"github.com/prometheus/client_golang/prometheus"
 	"github.com/prometheus/client_golang/prometheus/promhttp"
 )
 
-// Server holds the dependencies for the control endpoints.
-type Server struct {
-	policies *policy.Registry
-	jobs     *metrics.JobLog
-	reg      *prometheus.Registry
-	ready    func() bool
+// Presigner mints presigned object URLs (implemented by store.Client).
+type Presigner interface {
+	PresignPut(ctx context.Context, bucket, key string, expiry time.Duration) (string, error)
+	PresignGet(ctx context.Context, bucket, key string, expiry time.Duration) (string, error)
 }
 
-// New builds a control server. ready reports readiness (e.g. MinIO reachable).
-func New(pol *policy.Registry, jobs *metrics.JobLog, reg *prometheus.Registry, ready func() bool) *Server {
-	return &Server{policies: pol, jobs: jobs, reg: reg, ready: ready}
+// Deps are the server's dependencies.
+type Deps struct {
+	Policies     *policy.Registry
+	Jobs         *metrics.JobLog
+	Prom         *prometheus.Registry
+	Ready        func() bool
+	Presigner    Presigner
+	Matcher      *scrub.Matcher // default policy, for the /api/policy summary
+	InputBucket  string
+	OutputBucket string
+	UploadExpiry time.Duration
+}
+
+// Server holds the dependencies for the endpoints.
+type Server struct{ d Deps }
+
+// New builds a server from its dependencies.
+func New(d Deps) *Server {
+	if d.UploadExpiry == 0 {
+		d.UploadExpiry = 15 * time.Minute
+	}
+	return &Server{d: d}
 }
 
 // Handler returns the routed HTTP handler.
 func (s *Server) Handler() http.Handler {
 	mux := http.NewServeMux()
+	// Control plane.
 	mux.HandleFunc("/healthz", s.healthz)
 	mux.HandleFunc("/readyz", s.readyz)
-	mux.Handle("/metrics", promhttp.HandlerFor(s.reg, promhttp.HandlerOpts{}))
+	mux.Handle("/metrics", promhttp.HandlerFor(s.d.Prom, promhttp.HandlerOpts{}))
 	mux.HandleFunc("/policies", s.listPolicies)
 	mux.HandleFunc("/jobs", s.listJobs)
+	// Browser API (URL-minting only; bytes go browser <-> MinIO).
+	mux.HandleFunc("/api/policy", s.apiPolicy)
+	mux.HandleFunc("/api/uploads", s.apiUpload)
+	mux.HandleFunc("/api/status", s.apiStatus)
+	mux.HandleFunc("/api/downloads", s.apiDownload)
+	// Static front page.
+	mux.HandleFunc("/", s.index)
 	return mux
 }
 
@@ -44,7 +73,7 @@ func (s *Server) healthz(w http.ResponseWriter, _ *http.Request) {
 }
 
 func (s *Server) readyz(w http.ResponseWriter, _ *http.Request) {
-	if s.ready != nil && !s.ready() {
+	if s.d.Ready != nil && !s.d.Ready() {
 		http.Error(w, "not ready", http.StatusServiceUnavailable)
 		return
 	}
@@ -53,14 +82,90 @@ func (s *Server) readyz(w http.ResponseWriter, _ *http.Request) {
 }
 
 func (s *Server) listPolicies(w http.ResponseWriter, _ *http.Request) {
-	writeJSON(w, map[string]any{"policies": s.policies.Names()})
+	writeJSON(w, map[string]any{"policies": s.d.Policies.Names()})
 }
 
 func (s *Server) listJobs(w http.ResponseWriter, _ *http.Request) {
-	writeJSON(w, map[string]any{"jobs": s.jobs.Recent()})
+	writeJSON(w, map[string]any{"jobs": s.d.Jobs.Recent()})
+}
+
+// apiPolicy returns the sanitized rule summary of the default policy for the UI.
+func (s *Server) apiPolicy(w http.ResponseWriter, _ *http.Request) {
+	var rules []scrub.RuleInfo
+	if s.d.Matcher != nil {
+		rules = s.d.Matcher.Rules()
+	}
+	writeJSON(w, map[string]any{"rules": rules})
+}
+
+// apiUpload mints a presigned PUT URL for a new input object.
+func (s *Server) apiUpload(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+	var body struct {
+		Name string `json:"name"`
+	}
+	if err := json.NewDecoder(http.MaxBytesReader(w, r.Body, 1<<16)).Decode(&body); err != nil || body.Name == "" {
+		http.Error(w, "expected JSON {\"name\": ...}", http.StatusBadRequest)
+		return
+	}
+	key := newKey(body.Name)
+	url, err := s.d.Presigner.PresignPut(r.Context(), s.d.InputBucket, key, s.d.UploadExpiry)
+	if err != nil {
+		http.Error(w, "could not mint upload URL", http.StatusBadGateway)
+		return
+	}
+	writeJSON(w, map[string]any{"key": key, "url": url, "method": "PUT"})
+}
+
+// apiStatus reports the outcome of a previously uploaded key (browser-safe fields).
+func (s *Server) apiStatus(w http.ResponseWriter, r *http.Request) {
+	key := r.URL.Query().Get("key")
+	if key == "" {
+		http.Error(w, "missing key", http.StatusBadRequest)
+		return
+	}
+	for _, j := range s.d.Jobs.Recent() {
+		if j.Key == key {
+			writeJSON(w, map[string]any{
+				"status": j.Status, "policy": j.Policy, "matches": j.Matches,
+				"bytes_in": j.BytesIn, "bytes_out": j.BytesOut, "by_label": j.ByLabel, "error": j.Error,
+			})
+			return
+		}
+	}
+	writeJSON(w, map[string]any{"status": "processing"})
+}
+
+// apiDownload mints a presigned GET URL for the scrubbed output object.
+func (s *Server) apiDownload(w http.ResponseWriter, r *http.Request) {
+	key := r.URL.Query().Get("key")
+	if key == "" {
+		http.Error(w, "missing key", http.StatusBadRequest)
+		return
+	}
+	url, err := s.d.Presigner.PresignGet(r.Context(), s.d.OutputBucket, key, s.d.UploadExpiry)
+	if err != nil {
+		http.Error(w, "could not mint download URL", http.StatusBadGateway)
+		return
+	}
+	writeJSON(w, map[string]any{"url": url})
+}
+
+func (s *Server) index(w http.ResponseWriter, r *http.Request) {
+	if r.URL.Path != "/" {
+		http.NotFound(w, r)
+		return
+	}
+	w.Header().Set("Content-Type", "text/html; charset=utf-8")
+	_, _ = w.Write(indexHTML)
 }
 
 func writeJSON(w http.ResponseWriter, v any) {
 	w.Header().Set("Content-Type", "application/json")
-	_ = json.NewEncoder(w).Encode(v)
+	enc := json.NewEncoder(w)
+	enc.SetEscapeHTML(false) // keep presigned URLs (with &) intact for all clients
+	_ = enc.Encode(v)
 }

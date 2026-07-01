@@ -70,6 +70,10 @@ type Summary struct {
 	FilesPassthrough int            `json:"files_passthrough"`
 	TotalMatches     int            `json:"total_matches"`
 	MatchesByRule    map[string]int `json:"matches_by_rule"`
+	// MatchesByLabel is keyed by the replacement label (e.g. "[EMAIL]") rather than
+	// the rule ID. Rule IDs can embed literal values, so this is the safe breakdown
+	// to surface over a browser-facing / external API.
+	MatchesByLabel map[string]int `json:"matches_by_label"`
 }
 
 // Report is the full run record.
@@ -93,7 +97,7 @@ func New(source, output string, audit AuditLevel, redact bool, salt string) *Rep
 		audit:   audit,
 		redact:  redact,
 		salt:    []byte(salt),
-		Summary: Summary{MatchesByRule: map[string]int{}},
+		Summary: Summary{MatchesByRule: map[string]int{}, MatchesByLabel: map[string]int{}},
 	}
 }
 
@@ -138,6 +142,7 @@ func (r *Report) Record(path string, status Status, detail string, bytesIn, byte
 	for _, m := range matches {
 		r.Summary.TotalMatches++
 		r.Summary.MatchesByRule[m.RuleID]++
+		r.Summary.MatchesByLabel[m.Replacement]++
 	}
 }
 

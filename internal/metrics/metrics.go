@@ -53,6 +53,8 @@ type Job struct {
 	BytesOut  int       `json:"bytes_out"`
 	Error     string    `json:"error,omitempty"`
 	Timestamp time.Time `json:"timestamp"`
+	// ByLabel is the browser-safe match breakdown keyed by replacement label.
+	ByLabel map[string]int `json:"by_label,omitempty"`
 }
 
 // JobLog is a fixed-size ring buffer of recent jobs.

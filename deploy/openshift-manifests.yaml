@@ -37,6 +37,12 @@ data:
   MAX_DEPTH: "16"
   MAX_RATIO: "200"
   PORT: "8080"
+  # Web UI: browser uploads straight to MinIO via presigned URLs, so the browser
+  # must be able to reach MinIO. Set these to MinIO's externally reachable host.
+  # (MinIO also needs CORS allowing the scrubber Route origin.)
+  MINIO_PUBLIC_ENDPOINT: "<MINIO_PUBLIC_HOST>"
+  MINIO_PUBLIC_TLS: "true"
+  UPLOAD_EXPIRY: "15m"
 ---
 apiVersion: apps/v1
 kind: Deployment
@@ -110,8 +116,10 @@ spec:
       port: 8080
       targetPort: 8080
 ---
-# External Route — exposes ONLY the data-free control plane
-# (/healthz, /readyz, /metrics, /policies, /jobs). No bundle data traverses it.
+# External Route — serves the upload UI (/) + control plane + browser API
+# (/api/uploads|status|downloads|policy, /metrics, /healthz, /readyz). The API only
+# mints presigned URLs and returns label-only summaries; bundle bytes go directly
+# browser <-> MinIO and never traverse this Route.
 apiVersion: route.openshift.io/v1
 kind: Route
 metadata:

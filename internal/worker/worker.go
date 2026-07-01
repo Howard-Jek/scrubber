@@ -198,6 +198,7 @@ func (w *Worker) processObject(ctx context.Context, o store.Object) {
 	job.Matches = sum.TotalMatches
 	job.BytesIn = len(data)
 	job.BytesOut = len(out)
+	job.ByLabel = sum.MatchesByLabel
 	w.jobs.Add(job)
 	w.log.Info("scrubbed", "key", o.Key, "policy", res.Name, "matches", sum.TotalMatches,
 		"passthrough", sum.FilesPassthrough, "changed", !bytes.Equal(out, data))

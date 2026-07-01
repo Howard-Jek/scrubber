@@ -10,8 +10,10 @@ import (
 	"crypto/x509"
 	"fmt"
 	"net/http"
+	"net/url"
 	"os"
 	"strings"
+	"time"
 
 	"github.com/minio/minio-go/v7"
 	"github.com/minio/minio-go/v7/pkg/credentials"
@@ -41,11 +43,17 @@ type Config struct {
 	UseTLS    bool
 	CACert    string // optional path to a CA cert for the MinIO endpoint
 	Region    string
+	// PublicEndpoint (host[:port]) rewrites the host of presigned URLs so a browser
+	// can reach MinIO even when the in-cluster endpoint differs. Empty = use Endpoint.
+	PublicEndpoint string
+	PublicTLS      bool
 }
 
 // Client is the concrete MinIO-backed ObjectStore.
 type Client struct {
-	mc *minio.Client
+	mc             *minio.Client
+	publicEndpoint string
+	publicTLS      bool
 }
 
 // New builds a MinIO client from Config.
@@ -66,7 +74,38 @@ func New(cfg Config) (*Client, error) {
 	if err != nil {
 		return nil, fmt.Errorf("minio client: %w", err)
 	}
-	return &Client{mc: mc}, nil
+	return &Client{mc: mc, publicEndpoint: cfg.PublicEndpoint, publicTLS: cfg.PublicTLS}, nil
+}
+
+// PresignPut returns a presigned URL a browser can PUT an object to directly.
+func (c *Client) PresignPut(ctx context.Context, bucket, key string, expiry time.Duration) (string, error) {
+	u, err := c.mc.PresignedPutObject(ctx, bucket, key, expiry)
+	if err != nil {
+		return "", err
+	}
+	return c.rewrite(u), nil
+}
+
+// PresignGet returns a presigned URL a browser can GET an object from directly.
+func (c *Client) PresignGet(ctx context.Context, bucket, key string, expiry time.Duration) (string, error) {
+	u, err := c.mc.PresignedGetObject(ctx, bucket, key, expiry, url.Values{})
+	if err != nil {
+		return "", err
+	}
+	return c.rewrite(u), nil
+}
+
+// rewrite swaps the presigned URL host for the browser-reachable public endpoint.
+func (c *Client) rewrite(u *url.URL) string {
+	if c.publicEndpoint != "" {
+		u.Host = c.publicEndpoint
+		if c.publicTLS {
+			u.Scheme = "https"
+		} else {
+			u.Scheme = "http"
+		}
+	}
+	return u.String()
 }
 
 func caPool(path string) (*x509.CertPool, error) {

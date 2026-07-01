@@ -1,0 +1,197 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>Scrubber</title>
+<style>
+  :root{
+    --bg:#faf9f6; --surface:#ffffff; --surface-2:#f1efe8; --surface-3:#e8e6de;
+    --text:#2c2c2a; --text-2:#5f5e5a; --text-3:#8a897f; --border:#e2e0d7;
+    --accent:#0f6e56; --accent-bg:#e1f5ee; --info:#185fa5; --info-bg:#e6f1fb;
+    --radius:12px; --radius-sm:8px;
+    --mono:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;
+    --sans:-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,Helvetica,Arial,sans-serif;
+  }
+  @media (prefers-color-scheme:dark){
+    :root{ --bg:#1f1e1c; --surface:#2a2926; --surface-2:#33322e; --surface-3:#3d3c37;
+      --text:#f1efe8; --text-2:#b4b2a9; --text-3:#888780; --border:#3d3c37;
+      --accent:#5dcaa5; --accent-bg:#0f3b30; --info:#85b7eb; --info-bg:#0c3455; }
+  }
+  *{box-sizing:border-box;}
+  body{margin:0; background:var(--bg); color:var(--text); font-family:var(--sans); line-height:1.6; -webkit-font-smoothing:antialiased;}
+  .wrap{max-width:860px; margin:0 auto; padding:2rem 1.25rem 4rem;}
+  .brand{display:flex; align-items:center; gap:12px; margin-bottom:1.5rem;}
+  .logo{width:40px; height:40px; border-radius:var(--radius-sm); background:var(--surface); border:1px solid var(--border); display:flex; align-items:center; justify-content:center;}
+  .title{font-size:18px; font-weight:500;}
+  .sub{font-size:13px; color:var(--text-2);}
+  .pill{margin-left:auto; font-size:12px; color:var(--text-2); background:var(--surface); border:1px solid var(--border); padding:5px 11px; border-radius:var(--radius-sm); display:flex; gap:6px; align-items:center;}
+  .cols{display:flex; gap:18px; align-items:flex-start; flex-wrap:wrap;}
+  .main{flex:2 1 340px; min-width:300px;}
+  .aside{flex:1 1 240px; min-width:230px; background:var(--surface); border:1px solid var(--border); border-radius:var(--radius); padding:16px;}
+  .drop{background:var(--surface); border:1.5px dashed var(--border); border-radius:var(--radius); padding:2.5rem 1rem; text-align:center; cursor:pointer; transition:.15s;}
+  .drop.hot{border-color:var(--info); background:var(--info-bg);}
+  .drop svg{width:34px; height:34px; color:var(--text-3);}
+  .drop .l1{font-size:15px; margin-top:8px;}
+  .drop .l2{font-size:13px; color:var(--text-3); margin-top:4px;}
+  .link{color:var(--info);}
+  .row2{display:flex; justify-content:space-between; align-items:center; margin-top:12px; font-size:12px; color:var(--text-3);}
+  button{font-family:inherit; font-size:13px; color:var(--text); background:var(--surface); border:1px solid var(--border); padding:7px 12px; border-radius:var(--radius-sm); cursor:pointer; transition:.12s;}
+  button:hover{background:var(--surface-2);} button:active{transform:scale(.98);}
+  .list{margin-top:1.25rem; display:flex; flex-direction:column; gap:12px;}
+  .job{background:var(--surface); border:1px solid var(--border); border-radius:var(--radius); padding:14px 16px;}
+  .jhead{display:flex; align-items:center; gap:10px;}
+  .jname{font-family:var(--mono); font-size:13px; overflow:hidden; text-overflow:ellipsis; white-space:nowrap;}
+  .jst{margin-left:auto; font-size:12px; color:var(--text-2); white-space:nowrap;}
+  .track{margin-top:10px; height:6px; background:var(--surface-3); border-radius:999px; overflow:hidden;}
+  .bar{height:100%; width:0; background:var(--accent); border-radius:999px; transition:width .25s;}
+  .meta{display:flex; justify-content:space-between; margin-top:7px; font-size:12px; color:var(--text-3);}
+  .badge{display:inline-flex; align-items:center; gap:5px; color:var(--accent); background:var(--accent-bg); padding:3px 9px; border-radius:var(--radius-sm);}
+  .actions{display:flex; gap:8px; margin-top:12px;}
+  .panel{margin-top:12px; padding-top:12px; border-top:1px solid var(--border); display:none;}
+  .cards{display:grid; grid-template-columns:repeat(3,minmax(0,1fr)); gap:10px;}
+  .card{background:var(--surface-2); border-radius:var(--radius-sm); padding:10px 12px;}
+  .card .k{font-size:12px; color:var(--text-2);} .card .v{font-size:22px; font-weight:500;}
+  .chips{display:flex; flex-wrap:wrap; gap:6px;}
+  .chip{font-family:var(--mono); font-size:12px; color:var(--text-2); background:var(--surface-2); padding:3px 8px; border-radius:var(--radius-sm);}
+  .pgrp{font-size:11px; color:var(--text-3); margin:10px 0 4px;}
+  .rule{display:flex; align-items:center; gap:6px; padding:5px 7px; border-radius:var(--radius-sm); transition:background .4s;}
+  .rule .txt{font-family:var(--mono); font-size:12px; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; flex:1;}
+  .cnt{visibility:hidden; font-size:11px; font-weight:500; color:var(--accent); background:var(--accent-bg); padding:1px 7px; border-radius:999px; min-width:14px; text-align:center;}
+  .sr{position:absolute; width:1px; height:1px; overflow:hidden; clip:rect(0 0 0 0);}
+</style>
+</head>
+<body>
+<div class="wrap">
+  <div class="brand">
+    <div class="logo"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7"><path d="M19 20H9l-5-5a2 2 0 010-3l8-8a2 2 0 013 0l5 5a2 2 0 010 3l-7 7"/><path d="M8 20l-3-3"/></svg></div>
+    <div><div class="title">Scrubber</div><div class="sub">Sanitize logs before you share them</div></div>
+    <div class="pill" id="policyPill">policy: default</div>
+  </div>
+
+  <div class="cols">
+    <div class="main">
+      <div class="drop" id="drop" role="button" tabindex="0" aria-label="Drop files here or click to browse">
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6"><path d="M12 16V4m0 0L8 8m4-4l4 4"/><path d="M4 16v2a2 2 0 002 2h12a2 2 0 002-2v-2"/></svg>
+        <div class="l1">Drop files here or <span class="link">click to browse</span></div>
+        <div class="l2">Archives, logs, any file — unpacked, scrubbed, repacked</div>
+      </div>
+      <input type="file" id="picker" multiple class="sr" />
+      <div class="row2">
+        <span>Bytes go straight to storage — never through this page</span>
+      </div>
+      <div class="list" id="list"></div>
+    </div>
+
+    <aside class="aside">
+      <div style="display:flex; align-items:center; gap:7px;">
+        <svg viewBox="0 0 24 24" width="17" height="17" fill="none" stroke="currentColor" stroke-width="1.7"><circle cx="11" cy="11" r="7"/><path d="M21 21l-4-4"/></svg>
+        <span style="font-size:14px; font-weight:500;">Active policy</span>
+        <span style="margin-left:auto; font-family:var(--mono); font-size:11px; color:var(--text-3);">terms.json</span>
+      </div>
+      <div style="font-size:12px; color:var(--text-3); margin:2px 0 8px;">What's being picked up</div>
+      <div id="policy"></div>
+    </aside>
+  </div>
+</div>
+
+<script>
+(function(){
+  var drop=document.getElementById('drop'), picker=document.getElementById('picker'),
+      list=document.getElementById('list'), policyEl=document.getElementById('policy'),
+      pill=document.getElementById('policyPill');
+  var totals={}, labelRows={};
+
+  function el(t,c,h){var e=document.createElement(t); if(c)e.className=c; if(h!=null)e.innerHTML=h; return e;}
+  function esc(s){return String(s).replace(/[&<>]/g,function(c){return{'&':'&amp;','<':'&lt;','>':'&gt;'}[c];});}
+
+  function loadPolicy(){
+    fetch('/api/policy').then(function(r){return r.json();}).then(function(d){
+      var groups={literal:[],regex:[],preset:[]};
+      (d.rules||[]).forEach(function(r){ (groups[r.kind]||(groups[r.kind]=[])).push(r); });
+      var order=[['literal','Literals'],['regex','Regex'],['preset','Presets']], html='';
+      order.forEach(function(g){
+        var rows=groups[g[0]]||[]; if(!rows.length) return;
+        html+='<div class="pgrp">'+g[1]+'</div>';
+        rows.forEach(function(r){
+          var disp = r.preset ? r.preset : r.label;
+          html+='<div class="rule" data-label="'+esc(r.label)+'"><span class="txt" title="'+esc(r.label)+'">'+esc(disp)+'</span><span class="cnt">0</span></div>';
+        });
+      });
+      policyEl.innerHTML = html || '<div style="font-size:12px;color:var(--text-3)">No rules loaded.</div>';
+      policyEl.querySelectorAll('.rule').forEach(function(row){ labelRows[row.getAttribute('data-label')]=row; });
+    }).catch(function(){ policyEl.innerHTML='<div style="font-size:12px;color:var(--text-3)">Policy unavailable.</div>'; });
+  }
+
+  function bump(label, n){
+    totals[label]=(totals[label]||0)+n;
+    var row=labelRows[label]; if(!row) return;
+    var c=row.querySelector('.cnt'); c.textContent=totals[label]; c.style.visibility='visible';
+    row.style.background='var(--accent-bg)'; setTimeout(function(){row.style.background='transparent';},400);
+  }
+
+  function addJob(file){
+    var card=el('div','job'); var start=Date.now();
+    card.innerHTML=
+      '<div class="jhead"><svg viewBox="0 0 24 24" width="20" height="20" fill="none" stroke="currentColor" stroke-width="1.6" style="color:var(--text-2)"><path d="M14 3v4a1 1 0 001 1h4"/><path d="M5 3h9l5 5v11a1 1 0 01-1 1H5a1 1 0 01-1-1V4a1 1 0 011-1z"/></svg>'
+      +'<span class="jname">'+esc(file.name)+'</span><span class="jst">Uploading…</span></div>'
+      +'<div class="track"><div class="bar"></div></div>'
+      +'<div class="meta"><span class="pct">0%</span><span class="el">0.0s</span></div>'
+      +'<div class="done"></div>';
+    list.appendChild(card);
+    var bar=card.querySelector('.bar'), st=card.querySelector('.jst'), pct=card.querySelector('.pct'),
+        elp=card.querySelector('.el'), meta=card.querySelector('.meta'), done=card.querySelector('.done');
+    var tick=setInterval(function(){ elp.textContent=((Date.now()-start)/1000).toFixed(1)+'s'; },100);
+    function setp(p){ p=Math.round(p); bar.style.width=p+'%'; pct.textContent=p+'%'; }
+
+    fetch('/api/uploads',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({name:file.name})})
+      .then(function(r){ if(!r.ok) throw new Error('upload URL'); return r.json(); })
+      .then(function(u){
+        var xhr=new XMLHttpRequest(); xhr.open('PUT',u.url);
+        xhr.upload.onprogress=function(e){ if(e.lengthComputable) setp(e.loaded/e.total*55); };
+        xhr.onload=function(){ if(xhr.status>=200&&xhr.status<300){ st.textContent='Scrubbing…'; setp(60); poll(u.key,60); } else fail('upload failed ('+xhr.status+')'); };
+        xhr.onerror=function(){ fail('upload blocked (CORS?)'); };
+        xhr.send(file);
+      }).catch(function(){ fail('could not start upload'); });
+
+    function poll(key,creep){
+      fetch('/api/status?key='+encodeURIComponent(key)).then(function(r){return r.json();}).then(function(s){
+        if(s.status==='scrubbed'){ setp(100); finish(s); }
+        else if(s.status==='error'){ fail(s.error||'processing error'); }
+        else { creep=Math.min(95,creep+4); setp(creep); setTimeout(function(){poll(key,creep);},1200); }
+      }).catch(function(){ setTimeout(function(){poll(key,creep);},1500); });
+      function finish(s){
+        clearInterval(tick); meta.style.display='none';
+        st.innerHTML='<span class="badge"><svg viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" stroke-width="2.2"><path d="M5 13l4 4L19 7"/></svg>Scrubbed in '+((Date.now()-start)/1000).toFixed(1)+'s</span>';
+        var bl=s.by_label||{}; Object.keys(bl).forEach(function(l){ bump(l,bl[l]); });
+        var chips=Object.keys(bl).map(function(l){return '<span class="chip">'+esc(l)+' ×'+bl[l]+'</span>';}).join('');
+        var cards=[['Matches',s.matches||0],['Bytes in',s.bytes_in||0],['Bytes out',s.bytes_out||0]]
+          .map(function(c){return '<div class="card"><div class="k">'+c[0]+'</div><div class="v">'+c[1]+'</div></div>';}).join('');
+        done.innerHTML='<div class="actions"><button class="dl">Download scrubbed</button><button class="rp">View report</button></div>'
+          +'<div class="panel"><div class="cards">'+cards+'</div>'
+          +'<div style="font-size:12px;color:var(--text-2);margin:12px 0 8px;">Replacements by rule</div>'
+          +'<div class="chips">'+(chips||'<span style="font-size:12px;color:var(--text-3)">no matches</span>')+'</div></div>';
+        done.querySelector('.rp').onclick=function(){ var p=done.querySelector('.panel'); p.style.display=p.style.display==='block'?'none':'block'; };
+        done.querySelector('.dl').onclick=function(){
+          fetch('/api/downloads?key='+encodeURIComponent(key)).then(function(r){return r.json();}).then(function(d){
+            var a=document.createElement('a'); a.href=d.url; a.download=''; document.body.appendChild(a); a.click(); a.remove();
+          });
+        };
+      }
+    }
+    function fail(msg){ clearInterval(tick); st.innerHTML='<span style="color:#c0392b">'+esc(msg)+'</span>'; bar.style.background='#c0392b'; }
+  }
+
+  function handle(files){ Array.prototype.forEach.call(files,addJob); }
+  drop.onclick=function(){picker.click();};
+  drop.onkeydown=function(e){ if(e.key==='Enter'||e.key===' '){e.preventDefault();picker.click();} };
+  picker.onchange=function(){ handle(picker.files); picker.value=''; };
+  ['dragenter','dragover'].forEach(function(ev){ drop.addEventListener(ev,function(e){e.preventDefault();drop.classList.add('hot');}); });
+  ['dragleave','drop'].forEach(function(ev){ drop.addEventListener(ev,function(e){e.preventDefault();drop.classList.remove('hot');}); });
+  drop.addEventListener('drop',function(e){ if(e.dataTransfer&&e.dataTransfer.files.length) handle(e.dataTransfer.files); });
+
+  loadPolicy();
+})();
+</script>
+</body>
+</html>

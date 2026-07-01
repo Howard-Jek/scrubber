@@ -40,12 +40,14 @@ func realMain(log *slog.Logger) error {
 
 	// --- MinIO store ---
 	st, err := store.New(store.Config{
-		Endpoint:  mustEnv("MINIO_ENDPOINT"),
-		AccessKey: mustEnv("MINIO_ACCESS_KEY"),
-		SecretKey: mustEnv("MINIO_SECRET_KEY"),
-		UseTLS:    envBool("MINIO_USE_TLS", true),
-		CACert:    os.Getenv("MINIO_CA_CERT"),
-		Region:    os.Getenv("MINIO_REGION"),
+		Endpoint:       mustEnv("MINIO_ENDPOINT"),
+		AccessKey:      mustEnv("MINIO_ACCESS_KEY"),
+		SecretKey:      mustEnv("MINIO_SECRET_KEY"),
+		UseTLS:         envBool("MINIO_USE_TLS", true),
+		CACert:         os.Getenv("MINIO_CA_CERT"),
+		Region:         os.Getenv("MINIO_REGION"),
+		PublicEndpoint: os.Getenv("MINIO_PUBLIC_ENDPOINT"),
+		PublicTLS:      envBool("MINIO_PUBLIC_TLS", true),
 	})
 	if err != nil {
 		return err
@@ -98,11 +100,22 @@ func realMain(log *slog.Logger) error {
 	}
 	wk := worker.New(st, reg, m, jobs, wcfg, log)
 
-	// --- control server ---
+	// --- control + browser API server ---
 	ready := func() bool { return st.Healthy(ctx, inputBucket) }
+	defaultMatcher, _ := reg.Get(os.Getenv("DEFAULT_POLICY"))
 	srv := &http.Server{
-		Addr:              ":" + envDefault("PORT", "8080"),
-		Handler:           server.New(reg, jobs, promReg, ready).Handler(),
+		Addr: ":" + envDefault("PORT", "8080"),
+		Handler: server.New(server.Deps{
+			Policies:     reg,
+			Jobs:         jobs,
+			Prom:         promReg,
+			Ready:        ready,
+			Presigner:    st,
+			Matcher:      defaultMatcher,
+			InputBucket:  inputBucket,
+			OutputBucket: mustEnv("OUTPUT_BUCKET"),
+			UploadExpiry: envDuration("UPLOAD_EXPIRY", 15*time.Minute),
+		}).Handler(),
 		ReadHeaderTimeout: 10 * time.Second,
 	}
 

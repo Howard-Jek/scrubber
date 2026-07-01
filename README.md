@@ -231,6 +231,35 @@ The image runs as an arbitrary non-root UID (group 0), `readOnlyRootFilesystem` 
 an emptyDir `/work` for temp, drops all capabilities, and ships with `replicas: 1`
 (single-writer; horizontal scale-out is a documented follow-up).
 
+### Web front page
+
+`scrubberd` serves a small self-contained upload page at `/` plus a thin browser API.
+Crucially, **no bundle bytes pass through the service**: the browser uploads straight
+to MinIO and downloads straight from it, using short-lived presigned URLs that the
+service mints.
+
+Flow: browser `POST /api/uploads {name}` → gets a presigned PUT + object key → PUTs the
+file directly to the input bucket → polls `GET /api/status?key=…` until `scrubbed` → gets
+the label-only match breakdown for the "active policy" panel → `GET /api/downloads?key=…`
+for a presigned GET of the scrubbed output.
+
+Browser-facing responses expose **only replacement labels and preset names** (`[EMAIL]`,
+`email`) — never literal values or matched originals, so the sensitive terms you're
+scrubbing don't leak back out over the API.
+
+Extra env for the UI:
+- `MINIO_PUBLIC_ENDPOINT` / `MINIO_PUBLIC_TLS` — the browser-reachable MinIO host, used to
+  rewrite presigned URLs when the in-cluster endpoint differs from the external one.
+- `UPLOAD_EXPIRY` — presigned URL lifetime (default `15m`).
+
+Two deployment requirements for the browser path:
+- MinIO must be reachable by the browser (its own Route/ingress) and have **CORS** allowing
+  the scrubber page origin (presigned PUT/GET are cross-origin to MinIO).
+- Under **network-only** auth the browser API is unauthenticated — anyone who can reach the
+  Route can mint upload/download URLs for those buckets. That's acceptable only on a locked-
+  down internal network; for genuine external exposure, put auth in front (e.g. OpenShift
+  OAuth proxy) — the endpoints are structured so this can be added without app changes.
+
 ## Exit codes
 
 | Code | Meaning |
