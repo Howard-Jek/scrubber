@@ -56,7 +56,8 @@
   .chip{font-family:var(--mono); font-size:12px; color:var(--text-2); background:var(--surface-2); padding:3px 8px; border-radius:var(--radius-sm);}
   .pgrp{font-size:11px; color:var(--text-3); margin:10px 0 4px;}
   .rule{display:flex; align-items:center; gap:6px; padding:5px 7px; border-radius:var(--radius-sm); transition:background .4s;}
-  .rule .txt{font-family:var(--mono); font-size:12px; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; flex:1;}
+  .rule .txt{font-family:var(--mono); font-size:12px; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; flex:1; min-width:0;}
+  .rule .lbl{font-family:var(--mono); font-size:11px; color:var(--text-3); white-space:nowrap;}
   .cnt{visibility:hidden; font-size:11px; font-weight:500; color:var(--accent); background:var(--accent-bg); padding:1px 7px; border-radius:999px; min-width:14px; text-align:center;}
   .sr{position:absolute; width:1px; height:1px; overflow:hidden; clip:rect(0 0 0 0);}
 </style>
@@ -114,8 +115,10 @@
         var rows=groups[g[0]]||[]; if(!rows.length) return;
         html+='<div class="pgrp">'+g[1]+'</div>';
         rows.forEach(function(r){
-          var disp = r.preset ? r.preset : r.label;
-          html+='<div class="rule" data-label="'+esc(r.label)+'"><span class="txt" title="'+esc(r.label)+'">'+esc(disp)+'</span><span class="cnt">0</span></div>';
+          html+='<div class="rule" data-label="'+esc(r.label)+'" title="'+esc(r.text)+' → '+esc(r.label)+'">'
+            +'<span class="txt">'+esc(r.text)+'</span>'
+            +'<span class="lbl">'+esc(r.label)+'</span>'
+            +'<span class="cnt">0</span></div>';
         });
       });
       policyEl.innerHTML = html || '<div style="font-size:12px;color:var(--text-3)">No rules loaded.</div>';

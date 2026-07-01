@@ -67,16 +67,17 @@ func NewMatcher(defaultReplacement string, rules []Rule) (*Matcher, error) {
 // RuleCount returns the number of compiled rules.
 func (m *Matcher) RuleCount() int { return len(m.rules) }
 
-// RuleInfo is a browser-safe description of a rule: it never contains the literal
-// value or regex source (those can themselves be sensitive), only the kind, the
-// replacement label, and — for presets — the preset name.
+// RuleInfo describes a rule for the operator's policy panel: the kind, the actual
+// term being matched (literal value, regex pattern, or preset name), and the
+// replacement label. Operators are inside the trust boundary and need to see the
+// literal terms to verify what will be scrubbed.
 type RuleInfo struct {
-	Kind   string `json:"kind"`            // "literal" | "regex" | "preset"
-	Label  string `json:"label"`           // e.g. "[EMAIL]"
-	Preset string `json:"preset,omitempty"` // preset name when Kind == "preset"
+	Kind  string `json:"kind"`  // "literal" | "regex" | "preset"
+	Text  string `json:"text"`  // literal value, regex pattern, or preset name
+	Label string `json:"label"` // replacement, e.g. "[EMAIL]"
 }
 
-// Rules returns the sanitized rule summary for the policy.
+// Rules returns the rule summary for the policy.
 func (m *Matcher) Rules() []RuleInfo {
 	out := make([]RuleInfo, 0, len(m.rules))
 	for _, r := range m.rules {
@@ -88,11 +89,7 @@ func (m *Matcher) Rules() []RuleInfo {
 		if label == "" {
 			label = m.defaultReplacement
 		}
-		info := RuleInfo{Kind: kind, Label: label}
-		if kind == "preset" {
-			info.Preset = rest
-		}
-		out = append(out, info)
+		out = append(out, RuleInfo{Kind: kind, Text: rest, Label: label})
 	}
 	return out
 }

@@ -33,7 +33,10 @@ data:
   POLL_INTERVAL: "15s"
   WORKERS: "4"
   MAX_OBJECT_BYTES: "536870912"   # 512Mi; keep below the container memory limit
-  REDACT_REPORTS: "true"          # store salted hashes, not cleartext, in reports
+  # Reports live in an internal bucket for operators to verify the scrub, so they
+  # show the actual original values by default. Set "true" to store salted hashes
+  # instead if the reports bucket is less trusted than the operators.
+  REDACT_REPORTS: "false"
   MAX_DEPTH: "16"
   MAX_RATIO: "200"
   PORT: "8080"

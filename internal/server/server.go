@@ -1,8 +1,10 @@
 // Package server exposes the control/observability plane plus a thin browser API.
-// No bundle bytes ever pass through the service: uploads/downloads happen directly
-// between the browser and MinIO via presigned URLs that this server mints. The
-// browser-facing responses expose only replacement labels and preset names — never
-// literal values or matched originals — so nothing sensitive leaks over the Route.
+// No bundle *bytes* pass through the service: uploads/downloads happen directly
+// between the browser and MinIO via presigned URLs that this server mints. The API
+// serves the operator preparing logs (an insider), so it does surface the policy —
+// including literal terms — so they can verify what will be scrubbed. Keep the Route
+// on a trusted network (see deploy notes); the scrubbed log content is what must not
+// leave, and that is enforced by the scrubbing itself, not by hiding the policy.
 package server
 
 import (
@@ -89,7 +91,8 @@ func (s *Server) listJobs(w http.ResponseWriter, _ *http.Request) {
 	writeJSON(w, map[string]any{"jobs": s.d.Jobs.Recent()})
 }
 
-// apiPolicy returns the sanitized rule summary of the default policy for the UI.
+// apiPolicy returns the rule summary of the default policy for the operator's UI
+// (kind, the matched term, and the replacement label).
 func (s *Server) apiPolicy(w http.ResponseWriter, _ *http.Request) {
 	var rules []scrub.RuleInfo
 	if s.d.Matcher != nil {

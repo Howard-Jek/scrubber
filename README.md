@@ -243,9 +243,13 @@ file directly to the input bucket → polls `GET /api/status?key=…` until `scr
 the label-only match breakdown for the "active policy" panel → `GET /api/downloads?key=…`
 for a presigned GET of the scrubbed output.
 
-Browser-facing responses expose **only replacement labels and preset names** (`[EMAIL]`,
-`email`) — never literal values or matched originals, so the sensitive terms you're
-scrubbing don't leak back out over the API.
+The tool is operated by people **inside** your trust boundary who are preparing logs to
+send out, so the UI deliberately shows the full policy — the literal terms, patterns, and
+presets — so operators can verify exactly what will be scrubbed. The thing that must never
+leave your environment is the **scrubbed log content**, and that is enforced by the
+scrubbing itself. Reports (in an internal bucket) show the actual original values by
+default so the scrub can be audited; set `REDACT_REPORTS=true` to store salted hashes
+instead if that bucket is less trusted than the operators.
 
 Extra env for the UI:
 - `MINIO_PUBLIC_ENDPOINT` / `MINIO_PUBLIC_TLS` — the browser-reachable MinIO host, used to
@@ -256,9 +260,10 @@ Two deployment requirements for the browser path:
 - MinIO must be reachable by the browser (its own Route/ingress) and have **CORS** allowing
   the scrubber page origin (presigned PUT/GET are cross-origin to MinIO).
 - Under **network-only** auth the browser API is unauthenticated — anyone who can reach the
-  Route can mint upload/download URLs for those buckets. That's acceptable only on a locked-
-  down internal network; for genuine external exposure, put auth in front (e.g. OpenShift
-  OAuth proxy) — the endpoints are structured so this can be added without app changes.
+  Route can mint upload/download URLs and see the policy (including literal terms). Since the
+  operators are insiders, keep the Route on a trusted/internal network. For genuine external
+  exposure, put auth in front (e.g. OpenShift OAuth proxy) — the endpoints are structured so
+  this can be added without app changes.
 
 ## Exit codes
 
