@@ -1,6 +1,7 @@
 package worker
 
 import (
+	"bytes"
 	"context"
 	"io"
 	"log/slog"
@@ -50,6 +51,19 @@ func (m *memStore) Get(_ context.Context, bucket, key string) ([]byte, error) {
 	v, ok := m.buckets[bucket][key]
 	if !ok {
 		return nil, os.ErrNotExist
+	}
+	return append([]byte(nil), v...), nil
+}
+
+func (m *memStore) GetLimited(_ context.Context, bucket, key string, max int64) ([]byte, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	v, ok := m.buckets[bucket][key]
+	if !ok {
+		return nil, os.ErrNotExist
+	}
+	if int64(len(v)) > max {
+		return nil, store.ErrTooLarge
 	}
 	return append([]byte(nil), v...), nil
 }
@@ -152,6 +166,43 @@ func TestWorkerScrubsAndMoves(t *testing.T) {
 	}
 	if !ms.has("input", "processed/app.log") {
 		t.Error("input not moved to processed/ prefix")
+	}
+}
+
+func TestWorkerSkipsOversizedWithoutCrashing(t *testing.T) {
+	ms := newMemStore("input", "output", "reports")
+	big := bytes.Repeat([]byte("x"), 1024)
+	ms.Put(context.Background(), "input", "huge.log", big, "")
+
+	w := newTestWorker(t, ms)
+	w.cfg.MaxObjectBytes = 256 // smaller than the object
+
+	w.pollOnce(context.Background()) // must not OOM/crash
+
+	if ms.has("output", "huge.log") {
+		t.Error("oversized object should not have produced output")
+	}
+	if ms.has("input", "huge.log") {
+		t.Error("oversized input should be moved aside so it isn't retried")
+	}
+	if !ms.has("input", "processed/huge.log") {
+		t.Error("oversized input should be moved to processed/")
+	}
+}
+
+func TestWorkerScrubsFilenames(t *testing.T) {
+	ms := newMemStore("input", "output", "reports")
+	ms.Put(context.Background(), "input", "AcmeCorp-dump.log", []byte("inner has AcmeCorp too\n"), "")
+
+	w := newTestWorker(t, ms)
+	w.cfg.ScrubNames = true
+	w.pollOnce(context.Background())
+
+	if !ms.has("output", "[CO]-dump.log") {
+		t.Errorf("output object key should be scrubbed to [CO]-dump.log")
+	}
+	if ms.has("output", "AcmeCorp-dump.log") {
+		t.Errorf("output should not carry the sensitive filename")
 	}
 }
 

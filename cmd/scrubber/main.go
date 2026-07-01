@@ -40,6 +40,7 @@ func run(args []string) int {
 		dryRun      = fs.Bool("dry-run", false, "analyze and report without writing any output")
 		maxDepth    = fs.Int("max-depth", 16, "maximum container nesting depth")
 		maxRatio    = fs.Int("max-ratio", 200, "maximum decompression expansion ratio per stream")
+		scrubNames  = fs.Bool("scrub-names", true, "also scrub archive member names/paths, not just contents")
 		verbose     = fs.Bool("verbose", false, "print the per-rule breakdown to stderr")
 	)
 	if err := fs.Parse(args); err != nil {
@@ -85,8 +86,9 @@ func run(args []string) int {
 	rep := report.New(*inPath, outDisplay, audit, *redact, *salt)
 
 	eng := &pipeline.Engine{
-		Matcher: matcher,
-		Report:  rep,
+		Matcher:    matcher,
+		Report:     rep,
+		ScrubNames: *scrubNames,
 		Limits: pipeline.Limits{
 			MaxDepth:      *maxDepth,
 			MaxRatio:      *maxRatio,

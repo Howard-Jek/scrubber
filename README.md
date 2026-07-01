@@ -210,7 +210,20 @@ Resolution per object, highest precedence first:
 `MINIO_SECRET_KEY`, `MINIO_USE_TLS`, `MINIO_CA_CERT`, `INPUT_BUCKET`, `OUTPUT_BUCKET`,
 `REPORTS_BUCKET`, `INPUT_PREFIX`, `DEFAULT_POLICY`, `PREFIX_POLICY_MAP` (JSON),
 `PROCESSED_ACTION` (`move`|`delete`), `POLL_INTERVAL`, `WORKERS`, `MAX_OBJECT_BYTES`,
-`REDACT_REPORTS` (default `false`), `PORT` (default `8080`).
+`REDACT_REPORTS` (default `false`), `SCRUB_FILENAMES` (default `true`), `PORT` (default `8080`).
+
+**Filenames & paths** are scrubbed by default (`SCRUB_FILENAMES=true`): archive member
+names, directory segments, and the output object key are run through the same policy, so a
+sensitive term in a *name* (`AcmeCorp-logs/jsmith-trace.log`) doesn't leak the way it would
+if only contents were cleaned. Replacements can't introduce a path separator, so renaming is
+traversal-safe. Set `SCRUB_FILENAMES=false` to keep exact names (CLI: `--scrub-names=false`).
+
+**Large objects & memory.** The service processes each object in memory, so it caps the read
+at `MAX_OBJECT_BYTES` (default 512Mi) via a bounded fetch: an object larger than the cap is
+**skipped and moved aside**, never downloaded whole — so a huge upload can't OOM-kill the
+pod. Keep `MAX_OBJECT_BYTES` (and the decompression cap) comfortably below the pod's
+`limits.memory`. Genuinely large archives (multi-GB) are out of scope for this in-memory
+design; reject them via the cap, or see the streaming follow-up.
 
 **Run it locally (Docker)** — one command brings up MinIO + the service, wired for
 browser uploads:

@@ -139,6 +139,34 @@ func (m *Matcher) Scrub(text string) (string, []Match) {
 	return b.String(), matches
 }
 
+// ScrubName applies the matcher to a file path, one segment at a time so the
+// directory structure is preserved. A replacement can never introduce a path
+// separator (any "/" or "\" it produces is neutralized to "_"), so scrubbing a
+// name can't create path traversal or escape a directory.
+func (m *Matcher) ScrubName(name string) (string, []Match) {
+	parts := strings.Split(name, "/")
+	var all []Match
+	changed := false
+	for i, p := range parts {
+		if p == "" || p == "." || p == ".." {
+			continue
+		}
+		s, ms := m.Scrub(p)
+		if len(ms) == 0 {
+			continue
+		}
+		s = strings.ReplaceAll(s, "/", "_")
+		s = strings.ReplaceAll(s, `\`, "_")
+		parts[i] = s
+		all = append(all, ms...)
+		changed = true
+	}
+	if !changed {
+		return name, nil
+	}
+	return strings.Join(parts, "/"), all
+}
+
 // attribute returns the first rule whose own pattern matches the full span,
 // which is the rule that produced this combined match (precedence = order).
 func (m *Matcher) attribute(span string) *Rule {

@@ -71,6 +71,42 @@ func buildFixture(t *testing.T) []byte {
 	return gbuf.Bytes()
 }
 
+func TestScrubNamesRenamesMembers(t *testing.T) {
+	// tar with a sensitive term in both a directory name and a file name.
+	var tbuf bytes.Buffer
+	tw := tar.NewWriter(&tbuf)
+	body := []byte("nothing sensitive in here\n")
+	tw.WriteHeader(&tar.Header{Name: "AcmeCorp/report.log", Mode: 0o644, Size: int64(len(body)), Typeflag: tar.TypeReg})
+	tw.Write(body)
+	tw.Close()
+
+	rep := report.New("b.tar", "out.tar", report.AuditFull, false, "salt")
+	eng := &Engine{Matcher: testMatcher(t), Report: rep, Limits: DefaultLimits(), ScrubNames: true}
+	out := eng.Process("b.tar", tbuf.Bytes(), 0)
+
+	tr := tar.NewReader(bytes.NewReader(out))
+	h, err := tr.Next()
+	if err != nil {
+		t.Fatalf("read rebuilt tar: %v", err)
+	}
+	if h.Name != "[COMPANY]/report.log" {
+		t.Errorf("member name not scrubbed, got %q", h.Name)
+	}
+	if strings.Contains(h.Name, "AcmeCorp") {
+		t.Errorf("sensitive term left in name: %q", h.Name)
+	}
+
+	// With ScrubNames off, the name is preserved.
+	rep2 := report.New("b.tar", "out.tar", report.AuditFull, false, "salt")
+	eng2 := &Engine{Matcher: testMatcher(t), Report: rep2, Limits: DefaultLimits(), ScrubNames: false}
+	out2 := eng2.Process("b.tar", tbuf.Bytes(), 0)
+	tr2 := tar.NewReader(bytes.NewReader(out2))
+	h2, _ := tr2.Next()
+	if h2.Name != "AcmeCorp/report.log" {
+		t.Errorf("name should be untouched when ScrubNames off, got %q", h2.Name)
+	}
+}
+
 func TestProcessNestedBundle(t *testing.T) {
 	fixture := buildFixture(t)
 	rep := report.New("fixture.tar.gz", "out.tar.gz", report.AuditFull, false, "salt")
