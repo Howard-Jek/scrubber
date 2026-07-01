@@ -210,22 +210,36 @@ Resolution per object, highest precedence first:
 `MINIO_SECRET_KEY`, `MINIO_USE_TLS`, `MINIO_CA_CERT`, `INPUT_BUCKET`, `OUTPUT_BUCKET`,
 `REPORTS_BUCKET`, `INPUT_PREFIX`, `DEFAULT_POLICY`, `PREFIX_POLICY_MAP` (JSON),
 `PROCESSED_ACTION` (`move`|`delete`), `POLL_INTERVAL`, `WORKERS`, `MAX_OBJECT_BYTES`,
-`REDACT_REPORTS` (default `true`), `PORT` (default `8080`).
+`REDACT_REPORTS` (default `false`), `PORT` (default `8080`).
 
-**Build & deploy:**
+**Run it locally (Docker)** — one command brings up MinIO + the service, wired for
+browser uploads:
 ```sh
-# build the container (air-gap: override BASE_*_IMAGE / GOPROXY to Artifactory mirrors)
+./scripts/run-local.sh
+#  Scrubber UI:   http://localhost:8080
+#  MinIO console: http://localhost:9002  (minioadmin / minioadmin)
+# stop:  docker rm -f scrubberd scrubber-minio && docker network rm scrubnet
+```
+
+**Deploy on OpenShift:**
+```sh
+# 1. build + push the image (air-gap: override BASE_*_IMAGE / GOPROXY to Artifactory mirrors)
 podman build -f deploy/Containerfile -t <artifactory>/docker-local/scrubberd:0.1.0 .
 podman push <artifactory>/docker-local/scrubberd:0.1.0
+#    (air-gapped: transfer dist/scrubberd-0.1.0.tar and `podman load -i` on the target)
 
-# prereqs: MinIO creds Secret + named-policy ConfigMap
+# 2. prereqs: MinIO creds Secret + named-policy ConfigMap
 oc create secret generic scrubber-secret \
   --from-literal=MINIO_ACCESS_KEY=... --from-literal=MINIO_SECRET_KEY=...
 oc create configmap scrubber-policies --from-file=deploy/policies/
 
-# edit <PLACEHOLDERS>, then apply
+# 3. edit <PLACEHOLDERS> in deploy/openshift-manifests.yaml (image ref, MINIO_ENDPOINT,
+#    MINIO_PUBLIC_ENDPOINT, buckets), then apply
 oc apply -f deploy/openshift-manifests.yaml
 ```
+Buckets `scrub-input` / `scrub-output` / `scrub-reports` must exist in MinIO, MinIO must be
+browser-reachable (its own Route) with CORS allowing the scrubber origin, and the Route
+should stay on a trusted network (see the auth caveat below).
 
 The image runs as an arbitrary non-root UID (group 0), `readOnlyRootFilesystem` with
 an emptyDir `/work` for temp, drops all capabilities, and ships with `replicas: 1`
