@@ -51,18 +51,24 @@ type Config struct {
 
 // Client is the concrete MinIO-backed ObjectStore.
 type Client struct {
-	mc             *minio.Client
-	publicEndpoint string
-	publicTLS      bool
+	mc      *minio.Client // in-cluster endpoint, used for all object operations
+	presign *minio.Client // signs presigned URLs against the browser-reachable host
 }
 
-// New builds a MinIO client from Config.
+// New builds a MinIO client from Config. When PublicEndpoint is set, a second
+// client is created bound to that host purely for presigning: SigV4 signs the host
+// header, so a presigned URL must be *signed* against the host the browser will use,
+// not merely rewritten afterwards (rewriting breaks the signature).
 func New(cfg Config) (*Client, error) {
-	opts := &minio.Options{
-		Creds:  credentials.NewStaticV4(cfg.AccessKey, cfg.SecretKey, ""),
-		Secure: cfg.UseTLS,
-		Region: cfg.Region,
+	creds := credentials.NewStaticV4(cfg.AccessKey, cfg.SecretKey, "")
+	// Pin a region so presigning never needs a live GetBucketLocation call — the
+	// presign client is bound to the public host, which may be unreachable from
+	// inside the pod. MinIO's default region is us-east-1.
+	region := cfg.Region
+	if region == "" {
+		region = "us-east-1"
 	}
+	opts := &minio.Options{Creds: creds, Secure: cfg.UseTLS, Region: region}
 	if cfg.UseTLS && cfg.CACert != "" {
 		pool, err := caPool(cfg.CACert)
 		if err != nil {
@@ -74,38 +80,37 @@ func New(cfg Config) (*Client, error) {
 	if err != nil {
 		return nil, fmt.Errorf("minio client: %w", err)
 	}
-	return &Client{mc: mc, publicEndpoint: cfg.PublicEndpoint, publicTLS: cfg.PublicTLS}, nil
+
+	presign := mc
+	if cfg.PublicEndpoint != "" {
+		popts := &minio.Options{Creds: creds, Secure: cfg.PublicTLS, Region: region}
+		if cfg.PublicTLS && cfg.CACert != "" {
+			popts.Transport = opts.Transport
+		}
+		presign, err = minio.New(cfg.PublicEndpoint, popts)
+		if err != nil {
+			return nil, fmt.Errorf("minio presign client: %w", err)
+		}
+	}
+	return &Client{mc: mc, presign: presign}, nil
 }
 
 // PresignPut returns a presigned URL a browser can PUT an object to directly.
 func (c *Client) PresignPut(ctx context.Context, bucket, key string, expiry time.Duration) (string, error) {
-	u, err := c.mc.PresignedPutObject(ctx, bucket, key, expiry)
+	u, err := c.presign.PresignedPutObject(ctx, bucket, key, expiry)
 	if err != nil {
 		return "", err
 	}
-	return c.rewrite(u), nil
+	return u.String(), nil
 }
 
 // PresignGet returns a presigned URL a browser can GET an object from directly.
 func (c *Client) PresignGet(ctx context.Context, bucket, key string, expiry time.Duration) (string, error) {
-	u, err := c.mc.PresignedGetObject(ctx, bucket, key, expiry, url.Values{})
+	u, err := c.presign.PresignedGetObject(ctx, bucket, key, expiry, url.Values{})
 	if err != nil {
 		return "", err
 	}
-	return c.rewrite(u), nil
-}
-
-// rewrite swaps the presigned URL host for the browser-reachable public endpoint.
-func (c *Client) rewrite(u *url.URL) string {
-	if c.publicEndpoint != "" {
-		u.Host = c.publicEndpoint
-		if c.publicTLS {
-			u.Scheme = "https"
-		} else {
-			u.Scheme = "http"
-		}
-	}
-	return u.String()
+	return u.String(), nil
 }
 
 func caPool(path string) (*x509.CertPool, error) {
