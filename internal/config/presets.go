@@ -1,5 +1,7 @@
 package config
 
+import "strings"
+
 // presetRule defines a built-in PII pattern. valid is an optional second-stage
 // check applied to a candidate span to suppress false positives.
 type presetRule struct {
@@ -44,6 +46,64 @@ var presets = map[string]presetRule{
 		pattern:     `\b(?:\+?1[ .\-]?)?\(?\d{3}\)?[ .\-]?\d{3}[ .\-]?\d{4}\b`,
 		replacement: "[PHONE]",
 	},
+	// Windows/NetBIOS account: DOMAIN\user. Anchored on the backslash, so very low
+	// false-positive rate.
+	"windows_account": {
+		pattern:     `\b[A-Za-z][A-Za-z0-9.\-]{0,61}\\[A-Za-z0-9._$\-]+`,
+		replacement: "[ACCOUNT]",
+	},
+	// User principal name / login: user@domain.tld (same shape as an email address).
+	"upn": {
+		pattern:     `\b[A-Za-z0-9._%+\-]+@[A-Za-z0-9.\-]+\.[A-Za-z]{2,}\b`,
+		replacement: "[UPN]",
+	},
+	// Fully-qualified domain / host name, e.g. db-prod-01.internal.acme.com. The
+	// validator rejects things that are really filenames (archive.tar.gz).
+	"fqdn": {
+		pattern:     `\b(?:[A-Za-z0-9](?:[A-Za-z0-9\-]{0,61}[A-Za-z0-9])?\.)+[A-Za-z]{2,24}\b`,
+		replacement: "[FQDN]",
+		valid:       notFileName,
+	},
+	// Short (single-label) host name, e.g. db-prod-01. Noisiest preset: the
+	// validator requires a digit or hyphen so plain dictionary words are ignored,
+	// but you should still anchor to your own naming convention where possible.
+	"hostname": {
+		pattern:     `\b[A-Za-z][A-Za-z0-9\-]{1,62}\b`,
+		replacement: "[HOST]",
+		valid:       looksLikeHostname,
+	},
+}
+
+// commonFileExts are extensions we do NOT want the fqdn preset to treat as a domain.
+var commonFileExts = map[string]bool{
+	"go": true, "json": true, "log": true, "txt": true, "md": true, "yaml": true,
+	"yml": true, "conf": true, "cfg": true, "ini": true, "xml": true, "csv": true,
+	"png": true, "jpg": true, "jpeg": true, "gif": true, "svg": true, "pdf": true,
+	"zip": true, "tar": true, "gz": true, "tgz": true, "bz2": true, "xz": true,
+	"7z": true, "rar": true, "exe": true, "dll": true, "so": true, "sh": true,
+	"ps1": true, "bat": true, "py": true, "js": true, "ts": true, "html": true,
+	"htm": true, "css": true, "sql": true, "bak": true, "tmp": true, "old": true,
+}
+
+// notFileName rejects an fqdn candidate whose final label is a common file
+// extension (so "archive.tar.gz" or "app.log" is not mistaken for a domain).
+func notFileName(s string) bool {
+	dot := strings.LastIndexByte(s, '.')
+	if dot < 0 {
+		return true
+	}
+	return !commonFileExts[strings.ToLower(s[dot+1:])]
+}
+
+// looksLikeHostname requires a digit or hyphen in the label so ordinary words
+// (e.g. "login", "error") are not scrubbed as host names.
+func looksLikeHostname(s string) bool {
+	for i := 0; i < len(s); i++ {
+		if s[i] == '-' || (s[i] >= '0' && s[i] <= '9') {
+			return true
+		}
+	}
+	return false
 }
 
 // luhn validates a candidate card-number span (ignoring spaces/dashes) using the

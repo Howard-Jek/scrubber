@@ -105,6 +105,18 @@ rules could match the same span, the earlier one wins.
 | `aws_key` | AWS access key IDs (`AKIA…`/`ASIA…`) | `[AWS_KEY]` |
 | `jwt` | JSON Web Tokens | `[JWT]` |
 | `phone_us` | US phone numbers | `[PHONE]` |
+| `windows_account` | `DOMAIN\user` accounts (e.g. `ACME\jsmith`) | `[ACCOUNT]` |
+| `upn` | User principal names / logins `user@domain` (e.g. `jsmith@acme.com`) | `[UPN]` |
+| `fqdn` | Domain / host names (e.g. `db-prod-01.internal.acme.com`); skips filenames like `app.log`, `x.tar.gz` | `[FQDN]` |
+| `hostname` | Short single-label hosts (e.g. `db-prod-01`); requires a digit/hyphen so plain words aren't matched | `[HOST]` |
+
+> **Exact strings vs. patterns.** If you know the specific domains, hosts, or accounts,
+> listing them under `literals` is the simplest and false-positive-free option. The
+> `fqdn` and especially `hostname` presets match by *shape* and are the noisiest — for
+> best accuracy, anchor to your own naming with a `regex` rule instead, e.g.
+> `{ "pattern": "[a-z0-9-]+\\.(internal|corp|acme)\\.com", "replacement": "[HOST]" }`.
+> Rule precedence is literals → regex → presets (earlier wins), so a literal that
+> overlaps a preset takes over that match.
 
 ## CLI flags
 
