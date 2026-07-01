@@ -8,7 +8,9 @@ import (
 	"context"
 	"crypto/tls"
 	"crypto/x509"
+	"errors"
 	"fmt"
+	"io"
 	"net/http"
 	"net/url"
 	"os"
@@ -18,6 +20,10 @@ import (
 	"github.com/minio/minio-go/v7"
 	"github.com/minio/minio-go/v7/pkg/credentials"
 )
+
+// ErrTooLarge is returned by GetLimited when an object exceeds the byte cap. The
+// worker treats it as a graceful skip so an oversized object never OOMs the pod.
+var ErrTooLarge = errors.New("object exceeds size limit")
 
 // Object is a listed object's identity.
 type Object struct {
@@ -29,6 +35,7 @@ type Object struct {
 type ObjectStore interface {
 	List(ctx context.Context, bucket, prefix string) ([]Object, error)
 	Get(ctx context.Context, bucket, key string) ([]byte, error)
+	GetLimited(ctx context.Context, bucket, key string, max int64) ([]byte, error)
 	Exists(ctx context.Context, bucket, key string) (bool, []byte, error)
 	Put(ctx context.Context, bucket, key string, data []byte, contentType string) error
 	Move(ctx context.Context, bucket, srcKey, dstKey string) error
@@ -150,6 +157,27 @@ func (c *Client) Get(ctx context.Context, bucket, key string) ([]byte, error) {
 	var buf bytes.Buffer
 	if _, err := buf.ReadFrom(obj); err != nil {
 		return nil, err
+	}
+	return buf.Bytes(), nil
+}
+
+// GetLimited fetches an object but reads at most max bytes into memory. If the
+// object is larger than max it returns ErrTooLarge without buffering the whole
+// thing — the backstop that keeps a huge object from OOM-killing the pod even if
+// its listed size was unknown or wrong.
+func (c *Client) GetLimited(ctx context.Context, bucket, key string, max int64) ([]byte, error) {
+	obj, err := c.mc.GetObject(ctx, bucket, key, minio.GetObjectOptions{})
+	if err != nil {
+		return nil, err
+	}
+	defer obj.Close()
+	var buf bytes.Buffer
+	n, err := io.CopyN(&buf, obj, max+1)
+	if err != nil && err != io.EOF {
+		return nil, err
+	}
+	if n > max {
+		return nil, ErrTooLarge
 	}
 	return buf.Bytes(), nil
 }

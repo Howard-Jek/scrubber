@@ -175,7 +175,16 @@ func (s *Server) apiDownload(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "missing key", http.StatusBadRequest)
 		return
 	}
-	url, err := s.d.Presigner.PresignGet(r.Context(), s.d.OutputBucket, key, s.d.UploadExpiry)
+	// The scrubbed output may live under a different key if filename scrubbing
+	// renamed it — resolve via the job record.
+	outKey := key
+	for _, j := range s.d.Jobs.Recent() {
+		if j.Key == key && j.OutputKey != "" {
+			outKey = j.OutputKey
+			break
+		}
+	}
+	url, err := s.d.Presigner.PresignGet(r.Context(), s.d.OutputBucket, outKey, s.d.UploadExpiry)
 	if err != nil {
 		http.Error(w, "could not mint download URL", http.StatusBadGateway)
 		return

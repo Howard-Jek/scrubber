@@ -32,7 +32,9 @@ data:
   PROCESSED_ACTION: "move"        # move (to processed/) or delete
   POLL_INTERVAL: "15s"
   WORKERS: "4"
-  MAX_OBJECT_BYTES: "536870912"   # 512Mi; keep below the container memory limit
+  MAX_OBJECT_BYTES: "536870912"   # 512Mi; objects larger than this are skipped, not
+                                  # downloaded whole. Keep it below limits.memory.
+  SCRUB_FILENAMES: "true"         # also scrub archive member names/paths + output key
   # Reports live in an internal bucket for operators to verify the scrub, so they
   # show the actual original values by default. Set "true" to store salted hashes
   # instead if the reports bucket is less trusted than the operators.

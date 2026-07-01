@@ -29,9 +29,24 @@ func DefaultLimits() Limits {
 
 // Engine carries the compiled rules, the report sink, and the limits.
 type Engine struct {
-	Matcher *scrub.Matcher
-	Report  *report.Report
-	Limits  Limits
+	Matcher    *scrub.Matcher
+	Report     *report.Report
+	Limits     Limits
+	ScrubNames bool // also scrub archive member names / paths, not just contents
+}
+
+// scrubMemberName scrubs an archive entry's name (when enabled), records any hits,
+// and reports whether the name changed. origPath is the report label.
+func (e *Engine) scrubMemberName(origPath, name string, inBytes int) (string, bool) {
+	if !e.ScrubNames {
+		return name, false
+	}
+	newName, matches := e.Matcher.ScrubName(name)
+	if len(matches) == 0 {
+		return name, false
+	}
+	e.Report.Record(origPath+" [name]", report.StatusScrubbed, "filename scrubbed", inBytes, len(newName), matches)
+	return newName, true
 }
 
 // Process transforms one stream (file or archive) and returns the result. It never
@@ -124,10 +139,15 @@ func (e *Engine) handleTar(path string, data []byte, depth int) []byte {
 	}
 	changed := false
 	for i := range members {
+		origName := members[i].Header.Name
+		memberPath := path + "!" + origName
+		if newName, ok := e.scrubMemberName(memberPath, origName, len(members[i].Body)); ok {
+			members[i].Header.Name = newName
+			changed = true
+		}
 		if !members[i].IsRegular() {
 			continue
 		}
-		memberPath := path + "!" + members[i].Header.Name
 		out := e.Process(memberPath, members[i].Body, depth+1)
 		if !bytes.Equal(out, members[i].Body) {
 			members[i].Body = out
@@ -160,10 +180,15 @@ func (e *Engine) handleZip(path string, data []byte, depth int) []byte {
 	}
 	changed := false
 	for i := range members {
+		origName := members[i].Header.Name
+		memberPath := path + "!" + origName
+		if newName, ok := e.scrubMemberName(memberPath, origName, len(members[i].Body)); ok {
+			members[i].Header.Name = newName
+			changed = true
+		}
 		if members[i].IsDir() {
 			continue
 		}
-		memberPath := path + "!" + members[i].Header.Name
 		out := e.Process(memberPath, members[i].Body, depth+1)
 		if !bytes.Equal(out, members[i].Body) {
 			members[i].Body = out

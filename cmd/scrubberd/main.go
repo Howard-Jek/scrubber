@@ -91,6 +91,7 @@ func realMain(log *slog.Logger) error {
 		Workers:        envInt("WORKERS", 4),
 		MaxObjectBytes: int64(envInt("MAX_OBJECT_BYTES", 512<<20)),
 		RedactReports:  envBool("REDACT_REPORTS", false),
+		ScrubNames:     envBool("SCRUB_FILENAMES", true),
 		Limits: pipeline.Limits{
 			MaxDepth:      envInt("MAX_DEPTH", 16),
 			MaxRatio:      envInt("MAX_RATIO", 200),

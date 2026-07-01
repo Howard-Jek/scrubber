@@ -55,6 +55,9 @@ type Job struct {
 	Timestamp time.Time `json:"timestamp"`
 	// ByLabel is the browser-safe match breakdown keyed by replacement label.
 	ByLabel map[string]int `json:"by_label,omitempty"`
+	// OutputKey is where the scrubbed object was written (may differ from Key when
+	// filename scrubbing renamed it).
+	OutputKey string `json:"output_key,omitempty"`
 }
 
 // JobLog is a fixed-size ring buffer of recent jobs.

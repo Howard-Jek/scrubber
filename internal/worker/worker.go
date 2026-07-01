@@ -7,6 +7,7 @@ package worker
 import (
 	"bytes"
 	"context"
+	"errors"
 	"fmt"
 	"log/slog"
 	"path"
@@ -41,6 +42,7 @@ type Config struct {
 	Workers       int
 	MaxObjectBytes int64
 	RedactReports bool
+	ScrubNames    bool // also scrub archive member names/paths and the output object key
 	Limits        pipeline.Limits
 }
 
@@ -64,6 +66,9 @@ func New(s store.ObjectStore, p *policy.Registry, m *metrics.Metrics, jl *metric
 	}
 	if cfg.Workers <= 0 {
 		cfg.Workers = 4
+	}
+	if cfg.MaxObjectBytes <= 0 {
+		cfg.MaxObjectBytes = 512 << 20 // never 0/unbounded: the read cap prevents OOM
 	}
 	return &Worker{store: s, policies: p, metrics: m, jobs: jl, cfg: cfg, log: log}
 }
@@ -121,10 +126,8 @@ func (w *Worker) eligible(o store.Object) bool {
 	if strings.HasPrefix(o.Key, w.cfg.ProcessedPrefix) {
 		return false
 	}
-	if w.cfg.MaxObjectBytes > 0 && o.Size > w.cfg.MaxObjectBytes {
-		w.log.Warn("object exceeds MaxObjectBytes; skipping", "key", o.Key, "size", o.Size)
-		return false
-	}
+	// Size is enforced in processObject via a bounded read (GetLimited), so an
+	// object whose listed size is unknown or wrong still can't OOM the pod.
 	return true
 }
 
@@ -141,8 +144,21 @@ func (w *Worker) processObject(ctx context.Context, o store.Object) {
 		w.log.Error("process object", "key", o.Key, "err", err)
 	}
 
-	data, err := w.store.Get(ctx, w.cfg.InputBucket, o.Key)
+	data, err := w.store.GetLimited(ctx, w.cfg.InputBucket, o.Key, w.cfg.MaxObjectBytes)
 	if err != nil {
+		if errors.Is(err, store.ErrTooLarge) {
+			// Backstop against OOM: skip the object and move it aside so the loop
+			// keeps running and doesn't re-download it every poll.
+			w.metrics.Objects.WithLabelValues("too_large").Inc()
+			job.Status = "skipped"
+			job.Error = fmt.Sprintf("object exceeds MaxObjectBytes (%d); skipped", w.cfg.MaxObjectBytes)
+			w.jobs.Add(job)
+			w.log.Warn("object too large; skipping", "key", o.Key, "limit", w.cfg.MaxObjectBytes)
+			if ferr := w.finish(ctx, o.Key); ferr != nil {
+				w.log.Warn("move oversized input aside", "key", o.Key, "err", ferr)
+			}
+			return
+		}
 		fail(fmt.Errorf("get: %w", err))
 		return
 	}
@@ -161,18 +177,28 @@ func (w *Worker) processObject(ctx context.Context, o store.Object) {
 	}
 	job.Policy = res.Name
 
-	rep := report.New(o.Key, path.Join(w.cfg.OutputBucket, o.Key), auditLevel(w.cfg.RedactReports), w.cfg.RedactReports, "scrubber")
-	eng := &pipeline.Engine{Matcher: res.Matcher, Report: rep, Limits: w.cfg.Limits}
+	// Scrub the object's own name too (so a sensitive term in the filename doesn't
+	// leak via the output key). Falls back to the original key if nothing matched.
+	outKey := o.Key
+	if w.cfg.ScrubNames {
+		if nk, nameMatches := res.Matcher.ScrubName(o.Key); len(nameMatches) > 0 {
+			outKey = nk
+		}
+	}
+	job.OutputKey = outKey
+
+	rep := report.New(o.Key, path.Join(w.cfg.OutputBucket, outKey), auditLevel(w.cfg.RedactReports), w.cfg.RedactReports, "scrubber")
+	eng := &pipeline.Engine{Matcher: res.Matcher, Report: rep, Limits: w.cfg.Limits, ScrubNames: w.cfg.ScrubNames}
 	out := eng.Process(o.Key, data, 0)
 
-	// Write scrubbed output.
-	if err := w.store.Put(ctx, w.cfg.OutputBucket, o.Key, out, ""); err != nil {
+	// Write scrubbed output under the (possibly scrubbed) key.
+	if err := w.store.Put(ctx, w.cfg.OutputBucket, outKey, out, ""); err != nil {
 		fail(fmt.Errorf("put output: %w", err))
 		return
 	}
 	// Write report (best-effort: a report failure must not lose the scrubbed output).
 	if reportBytes, jerr := rep.JSON(); jerr == nil {
-		if err := w.store.Put(ctx, w.cfg.ReportsBucket, o.Key+".report.json", reportBytes, "application/json"); err != nil {
+		if err := w.store.Put(ctx, w.cfg.ReportsBucket, outKey+".report.json", reportBytes, "application/json"); err != nil {
 			w.log.Warn("put report", "key", o.Key, "err", err)
 		}
 	}
