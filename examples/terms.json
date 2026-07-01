@@ -1,0 +1,12 @@
+{
+  "default_replacement": "[REDACTED]",
+  "literals": [
+    { "value": "AcmeCorp", "replacement": "[COMPANY]", "case_insensitive": true },
+    { "value": "hunter2", "whole_word": true }
+  ],
+  "regex": [
+    { "pattern": "Bearer\\s+[A-Za-z0-9._-]+", "replacement": "[TOKEN]" },
+    { "pattern": "user-\\d+", "replacement": "[USER]" }
+  ],
+  "presets": ["email", "ipv4", "ipv6", "credit_card", "ssn", "aws_key", "jwt"]
+}

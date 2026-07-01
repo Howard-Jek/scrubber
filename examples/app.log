@@ -1,0 +1,8 @@
+2026-07-01T08:00:01Z INFO  user-1024 logged into AcmeCorp portal
+2026-07-01T08:00:02Z INFO  auth header: Bearer eyJabc123.def456.ghi789
+2026-07-01T08:00:03Z WARN  failed login for bob@acme.test from 192.168.10.42
+2026-07-01T08:00:04Z DEBUG password was hunter2 (do not log this)
+2026-07-01T08:00:05Z INFO  payment card 4111 1111 1111 1111 charged
+2026-07-01T08:00:06Z INFO  ssn on file 123-45-6789 for account
+2026-07-01T08:00:07Z INFO  AKIAIOSFODNN7EXAMPLE used for s3 access
+2026-07-01T08:00:08Z INFO  peer connected from 2001:0db8:85a3:0000:0000:8a2e:0370:7334
