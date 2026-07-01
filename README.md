@@ -256,6 +256,11 @@ Extra env for the UI:
   rewrite presigned URLs when the in-cluster endpoint differs from the external one.
 - `UPLOAD_EXPIRY` — presigned URL lifetime (default `15m`).
 
+The page uses the same clean design language as the project's mockups (claude-style
+neutral tokens, light/dark, Tabler outline icons). The icon font is loaded from a CDN;
+on an **air-gapped** cluster the layout still works but icons render blank — vendor the
+Tabler `woff2` + CSS into the image (or an internal mirror) to make it fully offline.
+
 Two deployment requirements for the browser path:
 - MinIO must be reachable by the browser (its own Route/ingress) and have **CORS** allowing
   the scrubber page origin (presigned PUT/GET are cross-origin to MinIO).
