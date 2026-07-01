@@ -10,6 +10,7 @@ package server
 import (
 	"context"
 	"encoding/json"
+	"io"
 	"net/http"
 	"time"
 
@@ -32,11 +33,12 @@ type Deps struct {
 	Jobs         *metrics.JobLog
 	Prom         *prometheus.Registry
 	Ready        func() bool
-	Presigner    Presigner
-	Matcher      *scrub.Matcher // default policy, for the /api/policy summary
-	InputBucket  string
-	OutputBucket string
-	UploadExpiry time.Duration
+	Presigner     Presigner
+	DefaultPolicy string // policy shown/edited in the UI
+	AllowEdit     bool   // permit PUT /api/policy from the UI
+	InputBucket   string
+	OutputBucket  string
+	UploadExpiry  time.Duration
 }
 
 // Server holds the dependencies for the endpoints.
@@ -91,14 +93,38 @@ func (s *Server) listJobs(w http.ResponseWriter, _ *http.Request) {
 	writeJSON(w, map[string]any{"jobs": s.d.Jobs.Recent()})
 }
 
-// apiPolicy returns the rule summary of the default policy for the operator's UI
-// (kind, the matched term, and the replacement label).
-func (s *Server) apiPolicy(w http.ResponseWriter, _ *http.Request) {
-	var rules []scrub.RuleInfo
-	if s.d.Matcher != nil {
-		rules = s.d.Matcher.Rules()
+// apiPolicy serves the operator's policy view. GET returns the rule summary
+// (kind, matched term, replacement label) plus the source terms.json. PUT/POST
+// validates + compiles a new terms.json and activates it live.
+func (s *Server) apiPolicy(w http.ResponseWriter, r *http.Request) {
+	switch r.Method {
+	case http.MethodGet:
+		var rules []scrub.RuleInfo
+		if m, ok := s.d.Policies.Get(s.d.DefaultPolicy); ok {
+			rules = m.Rules()
+		}
+		src, _ := s.d.Policies.Raw(s.d.DefaultPolicy)
+		writeJSON(w, map[string]any{"name": s.d.DefaultPolicy, "rules": rules, "source": string(src)})
+	case http.MethodPut, http.MethodPost:
+		if !s.d.AllowEdit {
+			writeJSONStatus(w, http.StatusForbidden, map[string]any{"error": "policy editing is disabled (ALLOW_POLICY_EDIT=false)"})
+			return
+		}
+		body, err := io.ReadAll(http.MaxBytesReader(w, r.Body, 1<<20))
+		if err != nil {
+			writeJSONStatus(w, http.StatusBadRequest, map[string]any{"error": "request body too large"})
+			return
+		}
+		if err := s.d.Policies.Set(s.d.DefaultPolicy, body); err != nil {
+			writeJSONStatus(w, http.StatusBadRequest, map[string]any{"error": err.Error()})
+			return
+		}
+		m, _ := s.d.Policies.Get(s.d.DefaultPolicy)
+		src, _ := s.d.Policies.Raw(s.d.DefaultPolicy)
+		writeJSON(w, map[string]any{"name": s.d.DefaultPolicy, "rules": m.Rules(), "source": string(src)})
+	default:
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
 	}
-	writeJSON(w, map[string]any{"rules": rules})
 }
 
 // apiUpload mints a presigned PUT URL for a new input object.
@@ -170,5 +196,13 @@ func writeJSON(w http.ResponseWriter, v any) {
 	w.Header().Set("Content-Type", "application/json")
 	enc := json.NewEncoder(w)
 	enc.SetEscapeHTML(false) // keep presigned URLs (with &) intact for all clients
+	_ = enc.Encode(v)
+}
+
+func writeJSONStatus(w http.ResponseWriter, code int, v any) {
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(code)
+	enc := json.NewEncoder(w)
+	enc.SetEscapeHTML(false)
 	_ = enc.Encode(v)
 }

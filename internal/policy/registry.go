@@ -24,6 +24,7 @@ type Registry struct {
 
 	mu       sync.RWMutex
 	compiled map[string]*scrub.Matcher
+	raws     map[string][]byte // source JSON per policy, for the editor UI
 }
 
 type prefixRule struct {
@@ -65,6 +66,7 @@ func (r *Registry) Reload() error {
 		return fmt.Errorf("reading policy dir: %w", err)
 	}
 	next := make(map[string]*scrub.Matcher)
+	nextRaw := make(map[string][]byte)
 	for _, e := range entries {
 		if e.IsDir() || !strings.HasSuffix(e.Name(), ".json") {
 			continue
@@ -79,12 +81,43 @@ func (r *Registry) Reload() error {
 		}
 		name := strings.TrimSuffix(e.Name(), ".json")
 		next[name] = m
+		nextRaw[name] = raw
 	}
 	if len(next) == 0 {
 		return fmt.Errorf("no policies found in %s", r.dir)
 	}
 	r.mu.Lock()
 	r.compiled = next
+	r.raws = nextRaw
+	r.mu.Unlock()
+	return nil
+}
+
+// Raw returns the source JSON of a named policy (for the editor UI).
+func (r *Registry) Raw(name string) ([]byte, bool) {
+	r.mu.RLock()
+	defer r.mu.RUnlock()
+	b, ok := r.raws[name]
+	return b, ok
+}
+
+// Set validates and compiles raw as the named policy and activates it in memory
+// immediately. It returns a descriptive error (identical to CLI validation) if the
+// JSON is invalid, in which case the current policy is left untouched.
+//
+// The change is live but in-memory: a subsequent Reload (e.g. a ConfigMap update)
+// or a pod restart reverts it. Durable changes should go through the policy source
+// (the ConfigMap / deploy files).
+func (r *Registry) Set(name string, raw []byte) error {
+	m, err := config.CompileBytes(raw)
+	if err != nil {
+		return err
+	}
+	cp := make([]byte, len(raw))
+	copy(cp, raw)
+	r.mu.Lock()
+	r.compiled[name] = m
+	r.raws[name] = cp
 	r.mu.Unlock()
 	return nil
 }

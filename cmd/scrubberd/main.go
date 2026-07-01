@@ -102,19 +102,19 @@ func realMain(log *slog.Logger) error {
 
 	// --- control + browser API server ---
 	ready := func() bool { return st.Healthy(ctx, inputBucket) }
-	defaultMatcher, _ := reg.Get(os.Getenv("DEFAULT_POLICY"))
 	srv := &http.Server{
 		Addr: ":" + envDefault("PORT", "8080"),
 		Handler: server.New(server.Deps{
-			Policies:     reg,
-			Jobs:         jobs,
-			Prom:         promReg,
-			Ready:        ready,
-			Presigner:    st,
-			Matcher:      defaultMatcher,
-			InputBucket:  inputBucket,
-			OutputBucket: mustEnv("OUTPUT_BUCKET"),
-			UploadExpiry: envDuration("UPLOAD_EXPIRY", 15*time.Minute),
+			Policies:      reg,
+			Jobs:          jobs,
+			Prom:          promReg,
+			Ready:         ready,
+			Presigner:     st,
+			DefaultPolicy: os.Getenv("DEFAULT_POLICY"),
+			AllowEdit:     envBool("ALLOW_POLICY_EDIT", true),
+			InputBucket:   inputBucket,
+			OutputBucket:  mustEnv("OUTPUT_BUCKET"),
+			UploadExpiry:  envDuration("UPLOAD_EXPIRY", 15*time.Minute),
 		}).Handler(),
 		ReadHeaderTimeout: 10 * time.Second,
 	}

@@ -46,6 +46,10 @@ data:
   MINIO_PUBLIC_ENDPOINT: "<MINIO_PUBLIC_HOST>"
   MINIO_PUBLIC_TLS: "true"
   UPLOAD_EXPIRY: "15m"
+  # Allow operators to edit/upload the policy from the UI (PUT /api/policy). Live
+  # edits are in-memory only; durable changes go through the scrubber-policies
+  # ConfigMap. Set "false" to make the policy read-only from the UI.
+  ALLOW_POLICY_EDIT: "true"
 ---
 apiVersion: apps/v1
 kind: Deployment

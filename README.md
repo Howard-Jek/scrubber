@@ -251,10 +251,20 @@ scrubbing itself. Reports (in an internal bucket) show the actual original value
 default so the scrub can be audited; set `REDACT_REPORTS=true` to store salted hashes
 instead if that bucket is less trusted than the operators.
 
+The **Active policy** panel has an **Edit terms.json** control: operators can edit the
+policy inline or **Upload** a `terms.json`, then **Apply**. Apply validates and compiles
+it server-side (identical fail-fast rules to the CLI — a bad preset or regex returns a
+precise error and the current policy is left untouched) and activates it immediately for
+subsequent scrubs; the panel re-renders from the result. This edit is **live but
+in-memory** — a policy reload or pod restart reverts it, so durable changes should go
+through the policy source (see "Updating the default policy" below). Disable UI editing
+with `ALLOW_POLICY_EDIT=false`.
+
 Extra env for the UI:
 - `MINIO_PUBLIC_ENDPOINT` / `MINIO_PUBLIC_TLS` — the browser-reachable MinIO host, used to
   rewrite presigned URLs when the in-cluster endpoint differs from the external one.
 - `UPLOAD_EXPIRY` — presigned URL lifetime (default `15m`).
+- `ALLOW_POLICY_EDIT` — allow `PUT /api/policy` from the UI (default `true`).
 
 The page uses the same clean design language as the project's mockups (claude-style
 neutral tokens, light/dark, Tabler outline icons). The icon font is loaded from a CDN;
@@ -269,6 +279,40 @@ Two deployment requirements for the browser path:
   operators are insiders, keep the Route on a trusted/internal network. For genuine external
   exposure, put auth in front (e.g. OpenShift OAuth proxy) — the endpoints are structured so
   this can be added without app changes.
+
+## Updating the default policy and presets
+
+There are three ways to change what gets scrubbed, from most transient to most permanent:
+
+1. **Live, from the UI** (fastest) — Active policy panel → Edit terms.json → Apply, or
+   Upload a `terms.json`. Takes effect immediately; reverts on reload/restart. Also
+   available as `PUT /api/policy` with a terms.json body.
+
+2. **Durable, via the policy source** — the named policies are files:
+   - Repo/CLI default: [examples/terms.json](examples/terms.json).
+   - Service defaults: [deploy/policies/](deploy/policies/) (`default.json`, `strict.json`).
+   - In-cluster the service reads them from the `scrubber-policies` ConfigMap; update it and
+     the pod hot-reloads (fsnotify):
+     ```sh
+     oc create configmap scrubber-policies --from-file=deploy/policies/ \
+       --dry-run=client -o yaml | oc apply -f -
+     ```
+   Add a new named policy by adding `deploy/policies/<name>.json`, then reference it from
+   `DEFAULT_POLICY` or `PREFIX_POLICY_MAP`.
+
+3. **Adding a new preset** (a code change — presets are compiled in) — edit
+   [internal/config/presets.go](internal/config/presets.go): add an entry to the `presets`
+   map with a `pattern`, a `replacement` label, and an optional `valid` validator to cut
+   false positives (RE2 has no lookahead, so validators are how `fqdn`/`hostname` filter
+   filenames and plain words). Example:
+   ```go
+   "mac_address": {
+       pattern:     `\b(?:[0-9A-Fa-f]{2}:){5}[0-9A-Fa-f]{2}\b`,
+       replacement: "[MAC]",
+   },
+   ```
+   Then rebuild the image (`podman build -f deploy/Containerfile ...`) and redeploy. Add a
+   test in [internal/config/presets_test.go](internal/config/presets_test.go) alongside it.
 
 ## Exit codes
 
