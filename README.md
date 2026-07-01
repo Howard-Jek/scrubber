@@ -105,6 +105,18 @@ rules could match the same span, the earlier one wins.
 | `aws_key` | AWS access key IDs (`AKIA…`/`ASIA…`) | `[AWS_KEY]` |
 | `jwt` | JSON Web Tokens | `[JWT]` |
 | `phone_us` | US phone numbers | `[PHONE]` |
+| `windows_account` | `DOMAIN\user` accounts (e.g. `ACME\jsmith`) | `[ACCOUNT]` |
+| `upn` | User principal names / logins `user@domain` (e.g. `jsmith@acme.com`) | `[UPN]` |
+| `fqdn` | Domain / host names (e.g. `db-prod-01.internal.acme.com`); skips filenames like `app.log`, `x.tar.gz` | `[FQDN]` |
+| `hostname` | Short single-label hosts (e.g. `db-prod-01`); requires a digit/hyphen so plain words aren't matched | `[HOST]` |
+
+> **Exact strings vs. patterns.** If you know the specific domains, hosts, or accounts,
+> listing them under `literals` is the simplest and false-positive-free option. The
+> `fqdn` and especially `hostname` presets match by *shape* and are the noisiest — for
+> best accuracy, anchor to your own naming with a `regex` rule instead, e.g.
+> `{ "pattern": "[a-z0-9-]+\\.(internal|corp|acme)\\.com", "replacement": "[HOST]" }`.
+> Rule precedence is literals → regex → presets (earlier wins), so a literal that
+> overlaps a preset takes over that match.
 
 ## CLI flags
 
@@ -173,6 +185,90 @@ Formats we can't fully round-trip are **passed through verbatim** and recorded a
 `unsupported-format` — the bundle is never corrupted, but content inside those
 containers is not scrubbed. (Nested formats are handled recursively, e.g.
 `outer.tar.gz!inner.zip!app.log`.)
+
+## Running as a service on OpenShift (`scrubberd`)
+
+The same engine runs as a MinIO/S3 bucket-driven service (`cmd/scrubberd`) for
+hosting on OCP. Drop a bundle in the **input** bucket → a scrubbed bundle appears in
+the **output** bucket and a report in the **reports** bucket; the input is then moved
+to a `processed/` prefix (or deleted).
+
+**Two planes:**
+- **Data plane (internal):** MinIO buckets only. No log bytes ever leave the cluster
+  boundary through the service.
+- **Control plane (Route-exposed, data-free):** `/healthz`, `/readyz`, `/metrics`
+  (Prometheus), `/policies`, `/jobs`. Safe to expose externally even without app auth.
+
+**Policies ("both"):** named policy files (same schema as the terms file) are mounted
+from a ConfigMap at `/etc/scrubber/policies/*.json` and hot-reloaded on change.
+Resolution per object, highest precedence first:
+1. per-object override `"<key>.terms.json"` sibling in the input bucket,
+2. longest matching `PREFIX_POLICY_MAP` prefix → named policy,
+3. `DEFAULT_POLICY`.
+
+**Config (env / ConfigMap + Secret):** `MINIO_ENDPOINT`, `MINIO_ACCESS_KEY`/
+`MINIO_SECRET_KEY`, `MINIO_USE_TLS`, `MINIO_CA_CERT`, `INPUT_BUCKET`, `OUTPUT_BUCKET`,
+`REPORTS_BUCKET`, `INPUT_PREFIX`, `DEFAULT_POLICY`, `PREFIX_POLICY_MAP` (JSON),
+`PROCESSED_ACTION` (`move`|`delete`), `POLL_INTERVAL`, `WORKERS`, `MAX_OBJECT_BYTES`,
+`REDACT_REPORTS` (default `true`), `PORT` (default `8080`).
+
+**Build & deploy:**
+```sh
+# build the container (air-gap: override BASE_*_IMAGE / GOPROXY to Artifactory mirrors)
+podman build -f deploy/Containerfile -t <artifactory>/docker-local/scrubberd:0.1.0 .
+podman push <artifactory>/docker-local/scrubberd:0.1.0
+
+# prereqs: MinIO creds Secret + named-policy ConfigMap
+oc create secret generic scrubber-secret \
+  --from-literal=MINIO_ACCESS_KEY=... --from-literal=MINIO_SECRET_KEY=...
+oc create configmap scrubber-policies --from-file=deploy/policies/
+
+# edit <PLACEHOLDERS>, then apply
+oc apply -f deploy/openshift-manifests.yaml
+```
+
+The image runs as an arbitrary non-root UID (group 0), `readOnlyRootFilesystem` with
+an emptyDir `/work` for temp, drops all capabilities, and ships with `replicas: 1`
+(single-writer; horizontal scale-out is a documented follow-up).
+
+### Web front page
+
+`scrubberd` serves a small self-contained upload page at `/` plus a thin browser API.
+Crucially, **no bundle bytes pass through the service**: the browser uploads straight
+to MinIO and downloads straight from it, using short-lived presigned URLs that the
+service mints.
+
+Flow: browser `POST /api/uploads {name}` → gets a presigned PUT + object key → PUTs the
+file directly to the input bucket → polls `GET /api/status?key=…` until `scrubbed` → gets
+the label-only match breakdown for the "active policy" panel → `GET /api/downloads?key=…`
+for a presigned GET of the scrubbed output.
+
+The tool is operated by people **inside** your trust boundary who are preparing logs to
+send out, so the UI deliberately shows the full policy — the literal terms, patterns, and
+presets — so operators can verify exactly what will be scrubbed. The thing that must never
+leave your environment is the **scrubbed log content**, and that is enforced by the
+scrubbing itself. Reports (in an internal bucket) show the actual original values by
+default so the scrub can be audited; set `REDACT_REPORTS=true` to store salted hashes
+instead if that bucket is less trusted than the operators.
+
+Extra env for the UI:
+- `MINIO_PUBLIC_ENDPOINT` / `MINIO_PUBLIC_TLS` — the browser-reachable MinIO host, used to
+  rewrite presigned URLs when the in-cluster endpoint differs from the external one.
+- `UPLOAD_EXPIRY` — presigned URL lifetime (default `15m`).
+
+The page uses the same clean design language as the project's mockups (claude-style
+neutral tokens, light/dark, Tabler outline icons). The icon font is loaded from a CDN;
+on an **air-gapped** cluster the layout still works but icons render blank — vendor the
+Tabler `woff2` + CSS into the image (or an internal mirror) to make it fully offline.
+
+Two deployment requirements for the browser path:
+- MinIO must be reachable by the browser (its own Route/ingress) and have **CORS** allowing
+  the scrubber page origin (presigned PUT/GET are cross-origin to MinIO).
+- Under **network-only** auth the browser API is unauthenticated — anyone who can reach the
+  Route can mint upload/download URLs and see the policy (including literal terms). Since the
+  operators are insiders, keep the Route on a trusted/internal network. For genuine external
+  exposure, put auth in front (e.g. OpenShift OAuth proxy) — the endpoints are structured so
+  this can be added without app changes.
 
 ## Exit codes
 

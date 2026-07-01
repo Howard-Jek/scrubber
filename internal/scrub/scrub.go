@@ -67,6 +67,33 @@ func NewMatcher(defaultReplacement string, rules []Rule) (*Matcher, error) {
 // RuleCount returns the number of compiled rules.
 func (m *Matcher) RuleCount() int { return len(m.rules) }
 
+// RuleInfo describes a rule for the operator's policy panel: the kind, the actual
+// term being matched (literal value, regex pattern, or preset name), and the
+// replacement label. Operators are inside the trust boundary and need to see the
+// literal terms to verify what will be scrubbed.
+type RuleInfo struct {
+	Kind  string `json:"kind"`  // "literal" | "regex" | "preset"
+	Text  string `json:"text"`  // literal value, regex pattern, or preset name
+	Label string `json:"label"` // replacement, e.g. "[EMAIL]"
+}
+
+// Rules returns the rule summary for the policy.
+func (m *Matcher) Rules() []RuleInfo {
+	out := make([]RuleInfo, 0, len(m.rules))
+	for _, r := range m.rules {
+		kind, rest := "rule", r.ID
+		if i := strings.IndexByte(r.ID, ':'); i >= 0 {
+			kind, rest = r.ID[:i], r.ID[i+1:]
+		}
+		label := r.Replacement
+		if label == "" {
+			label = m.defaultReplacement
+		}
+		out = append(out, RuleInfo{Kind: kind, Text: rest, Label: label})
+	}
+	return out
+}
+
 // Scrub replaces all matches in text and returns the scrubbed text plus a record
 // of every replacement made (in document order).
 func (m *Matcher) Scrub(text string) (string, []Match) {

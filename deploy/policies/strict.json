@@ -1,0 +1,4 @@
+{
+  "default_replacement": "[REDACTED]",
+  "presets": ["email", "ipv4", "ipv6", "credit_card", "ssn", "aws_key", "jwt", "phone_us"]
+}

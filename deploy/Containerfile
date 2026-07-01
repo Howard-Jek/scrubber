@@ -1,0 +1,43 @@
+# Multi-stage build for scrubberd (the OCP service form of scrubber).
+#
+# Air-gap note: override BASE_BUILD_IMAGE / BASE_RUNTIME_IMAGE to your
+# Artifactory-mirrored images, and GOPROXY to your Artifactory Go proxy, at build:
+#   podman build -f deploy/Containerfile \
+#     --build-arg BASE_BUILD_IMAGE=<artifactory>/docker-public/golang:1.25 \
+#     --build-arg BASE_RUNTIME_IMAGE=<artifactory>/docker-public/ubi9/ubi-micro:latest \
+#     --build-arg GOPROXY=https://<artifactory>/artifactory/api/go/go-remote \
+#     -t <artifactory>/docker-local/scrubberd:0.1.0 .
+
+ARG BASE_BUILD_IMAGE=docker.io/library/golang:1.25
+ARG BASE_RUNTIME_IMAGE=registry.access.redhat.com/ubi9/ubi-micro:latest
+
+# ---- build stage ----
+FROM ${BASE_BUILD_IMAGE} AS build
+ARG GOPROXY=https://proxy.golang.org
+ARG GOFLAGS=
+ENV GOPROXY=${GOPROXY} GOFLAGS=${GOFLAGS} CGO_ENABLED=0
+WORKDIR /src
+COPY go.mod go.sum ./
+RUN go mod download
+COPY . .
+RUN go build -trimpath -ldflags="-s -w" -o /out/scrubberd ./cmd/scrubberd
+
+# ---- runtime stage ----
+FROM ${BASE_RUNTIME_IMAGE}
+COPY --from=build /out/scrubberd /usr/local/bin/scrubberd
+
+# Writable temp dir for streaming; policies mount here (read-only ConfigMap).
+# OpenShift runs the container as an arbitrary non-root UID in group 0, so make
+# the relevant paths owned by group 0 and group-writable.
+RUN mkdir -p /work /etc/scrubber/policies && \
+    chgrp -R 0 /work /etc/scrubber && \
+    chmod -R g=u /work /etc/scrubber
+
+ENV TMPDIR=/work \
+    PORT=8080 \
+    POLICIES_DIR=/etc/scrubber/policies
+
+USER 1001
+EXPOSE 8080
+
+ENTRYPOINT ["/usr/local/bin/scrubberd"]

@@ -38,6 +38,13 @@ func Load(path string) (*scrub.Matcher, error) {
 	if err != nil {
 		return nil, fmt.Errorf("reading terms file: %w", err)
 	}
+	return CompileBytes(raw)
+}
+
+// CompileBytes parses, validates and compiles a terms document held in memory.
+// The service path (which loads policies from ConfigMaps/objects rather than a
+// file) uses this so validation stays identical to the CLI.
+func CompileBytes(raw []byte) (*scrub.Matcher, error) {
 	var cfg Config
 	dec := json.NewDecoder(strings.NewReader(string(raw)))
 	dec.DisallowUnknownFields()
