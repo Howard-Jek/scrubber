@@ -83,8 +83,17 @@
       </div>
       <div style="font-size:12px; color:var(--color-text-tertiary); margin-bottom:12px;">What's being picked up</div>
       <div id="policy"></div>
-      <button id="viewjson" style="width:100%; font-size:12px; margin-top:12px;"><i class="ti ti-code" style="font-size:14px; vertical-align:-2px; margin-right:5px;" aria-hidden="true"></i>Show terms.json</button>
-      <pre id="jsonsrc" style="display:none; margin-top:10px; padding:10px; background:var(--color-background-tertiary); border-radius:var(--border-radius-md); font-family:var(--font-mono); font-size:11px; line-height:1.5; color:var(--color-text-secondary); overflow:auto;"></pre>
+      <button id="editbtn" style="width:100%; font-size:12px; margin-top:12px;"><i class="ti ti-edit" style="font-size:14px; vertical-align:-2px; margin-right:5px;" aria-hidden="true"></i>Edit terms.json</button>
+      <div id="editor" style="display:none; margin-top:8px;">
+        <textarea id="jsontext" spellcheck="false" aria-label="terms.json editor" style="width:100%; height:190px; box-sizing:border-box; font-family:var(--font-mono); font-size:11px; line-height:1.5; padding:8px; border-radius:var(--border-radius-md); border:0.5px solid var(--color-border-secondary); background:var(--color-background-tertiary); color:var(--color-text-primary); resize:vertical;"></textarea>
+        <div id="policyerr" style="display:none; margin-top:6px; font-family:var(--font-mono); font-size:11px; color:var(--color-text-danger); white-space:pre-wrap;"></div>
+        <div id="policyok" style="display:none; margin-top:6px; font-size:11px; color:var(--color-text-success);"><i class="ti ti-check" style="font-size:13px; vertical-align:-2px;" aria-hidden="true"></i> Applied — active now</div>
+        <div style="display:flex; gap:6px; margin-top:8px;">
+          <button id="applybtn" style="flex:1; font-size:12px;"><i class="ti ti-check" style="font-size:14px; vertical-align:-2px; margin-right:5px;" aria-hidden="true"></i>Apply</button>
+          <button id="uploadbtn" style="font-size:12px;"><i class="ti ti-upload" style="font-size:14px; vertical-align:-2px; margin-right:5px;" aria-hidden="true"></i>Upload</button>
+          <input type="file" id="policyfile" accept=".json,application/json" style="display:none" />
+        </div>
+      </div>
     </aside>
 
   </div>
@@ -100,38 +109,35 @@
 
   function esc(s){return String(s).replace(/[&<>]/g,function(c){return{'&':'&amp;','<':'&lt;','>':'&gt;'}[c];});}
 
-  function loadPolicy(){
-    fetch('/api/policy').then(function(r){return r.json();}).then(function(d){
-      ruleData=d.rules||[];
-      var groups={literal:[],regex:[],preset:[]};
-      ruleData.forEach(function(r){ (groups[r.kind]||(groups[r.kind]=[])).push(r); });
-      var order=[['literal','Literals'],['regex','Regex'],['preset','Presets']], html='';
-      order.forEach(function(g){
-        var rows=groups[g[0]]||[]; if(!rows.length) return;
-        html+='<div style="font-size:11px; color:var(--color-text-tertiary); margin:10px 0 4px;">'+g[1]+'</div>';
-        rows.forEach(function(r){
-          html+='<div class="rule" data-label="'+esc(r.label)+'" title="'+esc(r.text)+' → '+esc(r.label)+'">'
-            +'<i class="ti ti-point" style="font-size:12px; color:var(--color-text-tertiary);" aria-hidden="true"></i>'
-            +'<span style="font-family:var(--font-mono); font-size:12px; color:var(--color-text-primary); overflow:hidden; text-overflow:ellipsis; white-space:nowrap; flex:1; min-width:0;">'+esc(r.text)+'</span>'
-            +'<span style="font-family:var(--font-mono); font-size:11px; color:var(--color-text-tertiary); white-space:nowrap;">'+esc(r.label)+'</span>'
-            +'<span class="cnt">0</span></div>';
-        });
+  function rulesRender(rules){
+    ruleData=rules||[];
+    var groups={literal:[],regex:[],preset:[]};
+    ruleData.forEach(function(r){ (groups[r.kind]||(groups[r.kind]=[])).push(r); });
+    var order=[['literal','Literals'],['regex','Regex'],['preset','Presets']], html='';
+    order.forEach(function(g){
+      var rows=groups[g[0]]||[]; if(!rows.length) return;
+      html+='<div style="font-size:11px; color:var(--color-text-tertiary); margin:10px 0 4px;">'+g[1]+'</div>';
+      rows.forEach(function(r){
+        html+='<div class="rule" data-label="'+esc(r.label)+'" title="'+esc(r.text)+' → '+esc(r.label)+'">'
+          +'<i class="ti ti-point" style="font-size:12px; color:var(--color-text-tertiary);" aria-hidden="true"></i>'
+          +'<span style="font-family:var(--font-mono); font-size:12px; color:var(--color-text-primary); overflow:hidden; text-overflow:ellipsis; white-space:nowrap; flex:1; min-width:0;">'+esc(r.text)+'</span>'
+          +'<span style="font-family:var(--font-mono); font-size:11px; color:var(--color-text-tertiary); white-space:nowrap;">'+esc(r.label)+'</span>'
+          +'<span class="cnt">0</span></div>';
       });
-      policyEl.innerHTML = html || '<div style="font-size:12px;color:var(--color-text-tertiary)">No rules loaded.</div>';
-      policyEl.querySelectorAll('.rule').forEach(function(row){ labelRows[row.getAttribute('data-label')]=row; });
-      buildJSON();
-    }).catch(function(){ policyEl.innerHTML='<div style="font-size:12px;color:var(--color-text-tertiary)">Policy unavailable.</div>'; });
+    });
+    policyEl.innerHTML = html || '<div style="font-size:12px;color:var(--color-text-tertiary)">No rules loaded.</div>';
+    labelRows={};
+    policyEl.querySelectorAll('.rule').forEach(function(row){
+      var l=row.getAttribute('data-label'); labelRows[l]=row;
+      if(totals[l]){ var c=row.querySelector('.cnt'); c.textContent=totals[l]; c.style.visibility='visible'; }
+    });
   }
 
-  function buildJSON(){
-    var lits=ruleData.filter(function(r){return r.kind==='literal';}).map(function(r){return '    { "value": '+JSON.stringify(r.text)+', "replacement": '+JSON.stringify(r.label)+' }';});
-    var rex=ruleData.filter(function(r){return r.kind==='regex';}).map(function(r){return '    { "pattern": '+JSON.stringify(r.text)+', "replacement": '+JSON.stringify(r.label)+' }';});
-    var pre=ruleData.filter(function(r){return r.kind==='preset';}).map(function(r){return JSON.stringify(r.text);});
-    var parts=[];
-    if(lits.length) parts.push('  "literals": [\n'+lits.join(',\n')+'\n  ]');
-    if(rex.length) parts.push('  "regex": [\n'+rex.join(',\n')+'\n  ]');
-    if(pre.length) parts.push('  "presets": ['+pre.join(', ')+']');
-    document.getElementById('jsonsrc').textContent='{\n'+parts.join(',\n')+'\n}';
+  function loadPolicy(){
+    fetch('/api/policy').then(function(r){return r.json();}).then(function(d){
+      if(d.name) document.getElementById('policyName').textContent=d.name;
+      rulesRender(d.rules); document.getElementById('jsontext').value=d.source||'';
+    }).catch(function(){ policyEl.innerHTML='<div style="font-size:12px;color:var(--color-text-tertiary)">Policy unavailable.</div>'; });
   }
 
   function bump(label, n){
@@ -215,9 +221,28 @@
     handle([new File([text],'sample.log',{type:'text/plain'})]);
   };
 
-  var vj=document.getElementById('viewjson'), src=document.getElementById('jsonsrc');
-  vj.onclick=function(){ var open=src.style.display!=='none'; src.style.display=open?'none':'block';
-    vj.innerHTML=(open?'<i class="ti ti-code" style="font-size:14px; vertical-align:-2px; margin-right:5px;" aria-hidden="true"></i>Show terms.json':'<i class="ti ti-x" style="font-size:14px; vertical-align:-2px; margin-right:5px;" aria-hidden="true"></i>Hide terms.json'); };
+  var editbtn=document.getElementById('editbtn'), editor=document.getElementById('editor'),
+      jsontext=document.getElementById('jsontext'), applybtn=document.getElementById('applybtn'),
+      uploadbtn=document.getElementById('uploadbtn'), policyfile=document.getElementById('policyfile'),
+      perr=document.getElementById('policyerr'), pok=document.getElementById('policyok');
+  editbtn.onclick=function(){ var open=editor.style.display!=='none'; editor.style.display=open?'none':'block';
+    editbtn.innerHTML=(open?'<i class="ti ti-edit" style="font-size:14px; vertical-align:-2px; margin-right:5px;" aria-hidden="true"></i>Edit terms.json':'<i class="ti ti-x" style="font-size:14px; vertical-align:-2px; margin-right:5px;" aria-hidden="true"></i>Close editor'); };
+  function showErr(m){ pok.style.display='none'; perr.style.display='block'; perr.textContent=m; }
+  function showOk(){ perr.style.display='none'; pok.style.display='block'; setTimeout(function(){pok.style.display='none';},2500); }
+  function applyPolicy(){
+    perr.style.display='none';
+    fetch('/api/policy',{method:'PUT',headers:{'Content-Type':'application/json'},body:jsontext.value})
+      .then(function(r){ return r.json().then(function(d){ return {ok:r.ok, d:d}; }); })
+      .then(function(res){ if(res.ok){ rulesRender(res.d.rules); if(res.d.source) jsontext.value=res.d.source; showOk(); }
+                           else showErr(res.d.error||'invalid policy'); })
+      .catch(function(){ showErr('could not apply policy'); });
+  }
+  applybtn.onclick=applyPolicy;
+  uploadbtn.onclick=function(){ policyfile.click(); };
+  policyfile.onchange=function(){ var f=policyfile.files[0]; if(!f) return;
+    f.text().then(function(t){ jsontext.value=t; editor.style.display='block';
+      editbtn.innerHTML='<i class="ti ti-x" style="font-size:14px; vertical-align:-2px; margin-right:5px;" aria-hidden="true"></i>Close editor'; applyPolicy(); });
+    policyfile.value=''; };
 
   loadPolicy();
 })();
