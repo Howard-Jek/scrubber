@@ -1,0 +1,160 @@
+# scrubberd on OpenShift — MinIO-driven log sanitizer service.
+#
+# Prereqs (create BEFORE applying this file):
+#   1. oc create secret generic scrubber-secret \
+#        --from-literal=MINIO_ACCESS_KEY='<key>' \
+#        --from-literal=MINIO_SECRET_KEY='<secret>'
+#   2. Put your named policy files in a ConfigMap (each *.json = one policy):
+#        oc create configmap scrubber-policies \
+#          --from-file=default.json=./policies/default.json \
+#          --from-file=strict.json=./policies/strict.json
+#   3. (optional, if MinIO uses a private CA)
+#        oc create configmap scrubber-ca --from-file=minio-ca.crt=./minio-ca.crt
+#   4. (if pulling from Artifactory) oc create secret docker-registry artifactory-pull ...
+# Then edit the <PLACEHOLDERS> below and:  oc apply -f openshift-manifests.yaml
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: scrubber-config
+  labels: { app: scrubberd }
+data:
+  MINIO_ENDPOINT: "<MINIO_HOST>:9000"
+  MINIO_USE_TLS: "true"
+  # MINIO_CA_CERT: "/etc/scrubber/ca/minio-ca.crt"   # uncomment if using scrubber-ca
+  INPUT_BUCKET: "scrub-input"
+  OUTPUT_BUCKET: "scrub-output"
+  REPORTS_BUCKET: "scrub-reports"
+  # INPUT_PREFIX: ""
+  DEFAULT_POLICY: "default"
+  # Map an input key prefix to a named policy (JSON object), highest-specificity wins:
+  PREFIX_POLICY_MAP: '{"secure/":"strict"}'
+  PROCESSED_ACTION: "move"        # move (to processed/) or delete
+  POLL_INTERVAL: "15s"
+  WORKERS: "4"
+  MAX_OBJECT_BYTES: "536870912"   # 512Mi; keep below the container memory limit
+  REDACT_REPORTS: "true"          # store salted hashes, not cleartext, in reports
+  MAX_DEPTH: "16"
+  MAX_RATIO: "200"
+  PORT: "8080"
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: scrubberd
+  labels: { app: scrubberd }
+spec:
+  replicas: 1            # single replica in v1 (no distributed object-claim yet)
+  selector:
+    matchLabels: { app: scrubberd }
+  template:
+    metadata:
+      labels: { app: scrubberd }
+    spec:
+      imagePullSecrets:
+        - name: artifactory-pull   # only if pulling from a private Artifactory repo
+      containers:
+        - name: scrubberd
+          image: <ARTIFACTORY_DOCKER_HOST>/docker-local/scrubberd:0.1.0
+          ports:
+            - containerPort: 8080
+          envFrom:
+            - configMapRef: { name: scrubber-config }
+            - secretRef: { name: scrubber-secret }
+          volumeMounts:
+            - name: policies
+              mountPath: /etc/scrubber/policies
+              readOnly: true
+            - name: work
+              mountPath: /work
+            # - name: ca
+            #   mountPath: /etc/scrubber/ca
+            #   readOnly: true
+          readinessProbe:
+            httpGet: { path: /readyz, port: 8080 }
+            initialDelaySeconds: 5
+            periodSeconds: 10
+          livenessProbe:
+            httpGet: { path: /healthz, port: 8080 }
+            initialDelaySeconds: 10
+            periodSeconds: 20
+          resources:
+            requests: { cpu: 100m, memory: 256Mi }
+            limits:   { cpu: "1",  memory: 1Gi }
+          securityContext:
+            runAsNonRoot: true
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop: ["ALL"]
+            seccompProfile:
+              type: RuntimeDefault
+      volumes:
+        - name: policies
+          configMap: { name: scrubber-policies }
+        - name: work
+          emptyDir: {}
+        # - name: ca
+        #   configMap: { name: scrubber-ca }
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: scrubberd
+  labels: { app: scrubberd }
+spec:
+  type: ClusterIP
+  selector: { app: scrubberd }
+  ports:
+    - name: http
+      port: 8080
+      targetPort: 8080
+---
+# External Route — exposes ONLY the data-free control plane
+# (/healthz, /readyz, /metrics, /policies, /jobs). No bundle data traverses it.
+apiVersion: route.openshift.io/v1
+kind: Route
+metadata:
+  name: scrubberd
+  labels: { app: scrubberd }
+spec:
+  to:
+    kind: Service
+    name: scrubberd
+  port:
+    targetPort: http
+  tls:
+    termination: edge
+    insecureEdgeTerminationPolicy: Redirect
+---
+# Optional: scrape /metrics via user-workload monitoring.
+# apiVersion: monitoring.coreos.com/v1
+# kind: ServiceMonitor
+# metadata:
+#   name: scrubberd
+#   labels: { app: scrubberd }
+# spec:
+#   selector:
+#     matchLabels: { app: scrubberd }
+#   endpoints:
+#     - port: http
+#       path: /metrics
+#       interval: 30s
+---
+# Optional: restrict who can reach the pod (defense-in-depth for network-only auth).
+# apiVersion: networking.k8s.io/v1
+# kind: NetworkPolicy
+# metadata:
+#   name: scrubberd-allow
+#   labels: { app: scrubberd }
+# spec:
+#   podSelector:
+#     matchLabels: { app: scrubberd }
+#   policyTypes: ["Ingress"]
+#   ingress:
+#     - from:
+#         - namespaceSelector:
+#             matchLabels: { network.openshift.io/policy-group: ingress }
+#       ports:
+#         - protocol: TCP
+#           port: 8080

@@ -174,6 +174,51 @@ Formats we can't fully round-trip are **passed through verbatim** and recorded a
 containers is not scrubbed. (Nested formats are handled recursively, e.g.
 `outer.tar.gz!inner.zip!app.log`.)
 
+## Running as a service on OpenShift (`scrubberd`)
+
+The same engine runs as a MinIO/S3 bucket-driven service (`cmd/scrubberd`) for
+hosting on OCP. Drop a bundle in the **input** bucket → a scrubbed bundle appears in
+the **output** bucket and a report in the **reports** bucket; the input is then moved
+to a `processed/` prefix (or deleted).
+
+**Two planes:**
+- **Data plane (internal):** MinIO buckets only. No log bytes ever leave the cluster
+  boundary through the service.
+- **Control plane (Route-exposed, data-free):** `/healthz`, `/readyz`, `/metrics`
+  (Prometheus), `/policies`, `/jobs`. Safe to expose externally even without app auth.
+
+**Policies ("both"):** named policy files (same schema as the terms file) are mounted
+from a ConfigMap at `/etc/scrubber/policies/*.json` and hot-reloaded on change.
+Resolution per object, highest precedence first:
+1. per-object override `"<key>.terms.json"` sibling in the input bucket,
+2. longest matching `PREFIX_POLICY_MAP` prefix → named policy,
+3. `DEFAULT_POLICY`.
+
+**Config (env / ConfigMap + Secret):** `MINIO_ENDPOINT`, `MINIO_ACCESS_KEY`/
+`MINIO_SECRET_KEY`, `MINIO_USE_TLS`, `MINIO_CA_CERT`, `INPUT_BUCKET`, `OUTPUT_BUCKET`,
+`REPORTS_BUCKET`, `INPUT_PREFIX`, `DEFAULT_POLICY`, `PREFIX_POLICY_MAP` (JSON),
+`PROCESSED_ACTION` (`move`|`delete`), `POLL_INTERVAL`, `WORKERS`, `MAX_OBJECT_BYTES`,
+`REDACT_REPORTS` (default `true`), `PORT` (default `8080`).
+
+**Build & deploy:**
+```sh
+# build the container (air-gap: override BASE_*_IMAGE / GOPROXY to Artifactory mirrors)
+podman build -f deploy/Containerfile -t <artifactory>/docker-local/scrubberd:0.1.0 .
+podman push <artifactory>/docker-local/scrubberd:0.1.0
+
+# prereqs: MinIO creds Secret + named-policy ConfigMap
+oc create secret generic scrubber-secret \
+  --from-literal=MINIO_ACCESS_KEY=... --from-literal=MINIO_SECRET_KEY=...
+oc create configmap scrubber-policies --from-file=deploy/policies/
+
+# edit <PLACEHOLDERS>, then apply
+oc apply -f deploy/openshift-manifests.yaml
+```
+
+The image runs as an arbitrary non-root UID (group 0), `readOnlyRootFilesystem` with
+an emptyDir `/work` for temp, drops all capabilities, and ships with `replicas: 1`
+(single-writer; horizontal scale-out is a documented follow-up).
+
 ## Exit codes
 
 | Code | Meaning |

@@ -148,11 +148,16 @@ func (r *Report) hash(s string) string {
 	return "sha256:" + hex.EncodeToString(h.Sum(nil))[:12]
 }
 
-// WriteJSON writes the report as indented JSON to path.
-func (r *Report) WriteJSON(path string) error {
+// JSON renders the report as indented JSON bytes.
+func (r *Report) JSON() ([]byte, error) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
-	b, err := json.MarshalIndent(r, "", "  ")
+	return json.MarshalIndent(r, "", "  ")
+}
+
+// WriteJSON writes the report as indented JSON to path.
+func (r *Report) WriteJSON(path string) error {
+	b, err := r.JSON()
 	if err != nil {
 		return err
 	}

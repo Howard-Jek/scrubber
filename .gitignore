@@ -2,3 +2,5 @@
 /scrubber.exe
 /scrubber-*
 *.out
+/scrubberd
+/scrubberd.exe
