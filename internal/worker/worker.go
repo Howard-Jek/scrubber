@@ -7,6 +7,7 @@ package worker
 import (
 	"bytes"
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"log/slog"
@@ -335,6 +336,14 @@ func (w *Worker) processObject(ctx context.Context, o store.Object) {
 		}
 	} else {
 		w.log.Warn("render report", "key", o.Key, "err", jerr)
+	}
+	// Compact companion record. The API answers status and history from this so
+	// it never has to parse the full per-match audit detail, which grows with
+	// match count and can reach megabytes for a small, repetitive log.
+	if digestBytes, jerr := json.Marshal(rep.Digest()); jerr == nil {
+		if err := w.store.Put(ctx, w.cfg.ReportsBucket, o.Key+report.DigestSuffix, digestBytes, "application/json"); err != nil {
+			w.log.Warn("put digest", "key", o.Key, "err", err)
+		}
 	}
 	// Mark input processed. If this fails the object is still sitting in the input
 	// bucket and would otherwise be re-scrubbed on every poll forever, so hold it

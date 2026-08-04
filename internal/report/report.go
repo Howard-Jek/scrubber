@@ -24,6 +24,49 @@ import (
 // renamed the output.
 const ObjectSuffix = ".report.json"
 
+// DigestSuffix is the companion compact record, keyed the same way.
+//
+// The full report carries every match with its location and original value, so
+// it scales with match count rather than input size: a 1 KiB log that hits 12000
+// terms produces a multi-megabyte report. The status and history endpoints only
+// need counts, so they read this instead — otherwise listing the last 100 runs
+// would mean parsing hundreds of megabytes of audit detail on a page load.
+const DigestSuffix = ".summary.json"
+
+// Digest is the small, browser-safe view of a run.
+type Digest struct {
+	InputKey     string            `json:"input_key"`
+	OutputKey    string            `json:"output_key,omitempty"`
+	Matches      int               `json:"matches"`
+	ByLabel      map[string]int    `json:"by_label,omitempty"`
+	FilesTotal   int               `json:"files_total"`
+	Passthrough  int               `json:"passthrough"`
+	Passthroughs []PassthroughNote `json:"passthroughs,omitempty"`
+	BytesIn      int               `json:"bytes_in"`
+	BytesOut     int               `json:"bytes_out"`
+	StartedAt    time.Time         `json:"started_at,omitempty"`
+	EndedAt      time.Time         `json:"ended_at,omitempty"`
+}
+
+// Digest renders the compact view of this report.
+func (r *Report) Digest() Digest {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	return Digest{
+		InputKey:     r.InputKey,
+		OutputKey:    r.OutputKey,
+		Matches:      r.Summary.TotalMatches,
+		ByLabel:      r.Summary.MatchesByLabel,
+		FilesTotal:   r.Summary.FilesTotal,
+		Passthrough:  r.Summary.FilesPassthrough,
+		Passthroughs: r.Summary.Passthroughs,
+		BytesIn:      r.BytesIn,
+		BytesOut:     r.BytesOut,
+		StartedAt:    r.StartedAt,
+		EndedAt:      r.EndedAt,
+	}
+}
+
 // Status describes the outcome for a single file within the bundle.
 type Status string
 

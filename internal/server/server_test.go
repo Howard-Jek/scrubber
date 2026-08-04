@@ -71,6 +71,25 @@ func (fakePresigner) PresignGet(_ context.Context, b, k string, _ time.Duration)
 	return "https://example.invalid/" + b + "/" + k + "?get", nil
 }
 
+// storedDigest builds the compact record the API reads.
+func storedDigest(t *testing.T, inKey, outKey string, matches, passthrough int) []byte {
+	t.Helper()
+	var notes []report.PassthroughNote
+	for i := 0; i < passthrough; i++ {
+		notes = append(notes, report.PassthroughNote{
+			Path: fmt.Sprintf("blob%d.7z", i), Status: report.StatusUnsupported, Reason: "read-only format"})
+	}
+	b, err := json.Marshal(report.Digest{
+		InputKey: inKey, OutputKey: outKey, Matches: matches,
+		FilesTotal: matches + passthrough, Passthrough: passthrough, Passthroughs: notes,
+		BytesIn: 1000, BytesOut: 900,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	return b
+}
+
 func storedReport(t *testing.T, inKey, outKey string, matches, passthrough int) []byte {
 	t.Helper()
 	rep := report.New(inKey, outKey, report.AuditFull, false, "test")
@@ -123,8 +142,8 @@ func getJSON(t *testing.T, h http.Handler, path string) (int, map[string]any) {
 // must answer from storage rather than reporting "processing" indefinitely.
 func TestStatusRecoversFromStorageAfterRestart(t *testing.T) {
 	arc := newArchive()
-	arc.put("reports", "abc123-bundle.tar.gz"+report.ObjectSuffix,
-		storedReport(t, "abc123-bundle.tar.gz", "abc123-bundle.tar.gz", 7, 0), time.Now())
+	arc.put("reports", "abc123-bundle.tar.gz"+report.DigestSuffix,
+		storedDigest(t, "abc123-bundle.tar.gz", "abc123-bundle.tar.gz", 7, 0), time.Now())
 
 	// Empty job log == a process that has just restarted.
 	h := newTestServer(metrics.NewJobLog(10), arc)
@@ -205,8 +224,8 @@ func TestStaleProcessingRecordFallsBackToStorage(t *testing.T) {
 		Timestamp: time.Now().Add(-10 * time.Minute)})
 
 	arc := newArchive()
-	arc.put("reports", "wedged.tar.gz"+report.ObjectSuffix,
-		storedReport(t, "wedged.tar.gz", "wedged.tar.gz", 5, 0), time.Now())
+	arc.put("reports", "wedged.tar.gz"+report.DigestSuffix,
+		storedDigest(t, "wedged.tar.gz", "wedged.tar.gz", 5, 0), time.Now())
 
 	h := newTestServer(jobs, arc)
 	_, body := getJSON(t, h, "/api/status?key=wedged.tar.gz")
@@ -219,7 +238,7 @@ func TestStaleProcessingRecordFallsBackToStorage(t *testing.T) {
 // client so the UI can warn rather than show success.
 func TestStatusSurfacesPassthroughWarning(t *testing.T) {
 	arc := newArchive()
-	arc.put("reports", "x.zip"+report.ObjectSuffix, storedReport(t, "x.zip", "x.zip", 3, 2), time.Now())
+	arc.put("reports", "x.zip"+report.DigestSuffix, storedDigest(t, "x.zip", "x.zip", 3, 2), time.Now())
 	h := newTestServer(metrics.NewJobLog(10), arc)
 
 	_, body := getJSON(t, h, "/api/status?key=x.zip")
@@ -241,7 +260,7 @@ func TestJobLogEvictionDoesNotStrandClient(t *testing.T) {
 	jobs.Upsert(metrics.Job{Key: "n2", Status: "scrubbed"}) // evicts old.log
 
 	arc := newArchive()
-	arc.put("reports", "old.log"+report.ObjectSuffix, storedReport(t, "old.log", "old.log", 1, 0), time.Now())
+	arc.put("reports", "old.log"+report.DigestSuffix, storedDigest(t, "old.log", "old.log", 1, 0), time.Now())
 
 	h := newTestServer(jobs, arc)
 	_, body := getJSON(t, h, "/api/status?key=old.log")
@@ -257,7 +276,7 @@ func TestHistoryReturnsRecentRunsNewestFirst(t *testing.T) {
 	base := time.Now()
 	for i := 0; i < 5; i++ {
 		key := fmt.Sprintf("run%d.log", i)
-		arc.put("reports", key+report.ObjectSuffix, storedReport(t, key, key, i, 0),
+		arc.put("reports", key+report.DigestSuffix, storedDigest(t, key, key, i, 0),
 			base.Add(time.Duration(i)*time.Minute))
 	}
 	h := newTestServer(metrics.NewJobLog(10), arc)
@@ -277,7 +296,7 @@ func TestHistoryRespectsN(t *testing.T) {
 	arc := newArchive()
 	for i := 0; i < 10; i++ {
 		key := fmt.Sprintf("r%d.log", i)
-		arc.put("reports", key+report.ObjectSuffix, storedReport(t, key, key, 1, 0),
+		arc.put("reports", key+report.DigestSuffix, storedDigest(t, key, key, 1, 0),
 			time.Now().Add(time.Duration(i)*time.Minute))
 	}
 	h := newTestServer(metrics.NewJobLog(10), arc)
@@ -294,7 +313,7 @@ func TestHistoryCapsN(t *testing.T) {
 	arc := newArchive()
 	for i := 0; i < 60; i++ {
 		key := fmt.Sprintf("r%d.log", i)
-		arc.put("reports", key+report.ObjectSuffix, storedReport(t, key, key, 1, 0), time.Now())
+		arc.put("reports", key+report.DigestSuffix, storedDigest(t, key, key, 1, 0), time.Now())
 	}
 	h := newTestServer(metrics.NewJobLog(10), arc) // HistoryMax 50
 
@@ -317,7 +336,7 @@ func TestHistoryRejectsBadN(t *testing.T) {
 // the reports bucket becoming phantom history rows.
 func TestHistoryIgnoresNonReportObjects(t *testing.T) {
 	arc := newArchive()
-	arc.put("reports", "real.log"+report.ObjectSuffix, storedReport(t, "real.log", "real.log", 1, 0), time.Now())
+	arc.put("reports", "real.log"+report.DigestSuffix, storedDigest(t, "real.log", "real.log", 1, 0), time.Now())
 	arc.put("reports", "stray.txt", []byte("not a report"), time.Now())
 	h := newTestServer(metrics.NewJobLog(10), arc)
 
@@ -335,8 +354,8 @@ func TestHistoryIgnoresNonReportObjects(t *testing.T) {
 // the stored report at that point.
 func TestDownloadResolvesScrubbedOutputKeyFromReport(t *testing.T) {
 	arc := newArchive()
-	arc.put("reports", "AcmeCorp-dump.log"+report.ObjectSuffix,
-		storedReport(t, "AcmeCorp-dump.log", "[CO]-dump.log", 2, 0), time.Now())
+	arc.put("reports", "AcmeCorp-dump.log"+report.DigestSuffix,
+		storedDigest(t, "AcmeCorp-dump.log", "[CO]-dump.log", 2, 0), time.Now())
 	h := newTestServer(metrics.NewJobLog(10), arc)
 
 	_, body := getJSON(t, h, "/api/downloads?key=AcmeCorp-dump.log")
@@ -356,4 +375,49 @@ func contains(s, sub string) bool {
 		}
 	}
 	return false
+}
+
+// TestStatusFallsBackToFullReportWhenDigestMissing covers runs recorded before
+// digests existed: the compact record is absent, so the API must still recover
+// the outcome from the full report rather than declaring the key unknown.
+func TestStatusFallsBackToFullReportWhenDigestMissing(t *testing.T) {
+	arc := newArchive()
+	arc.put("reports", "legacy.tar.gz"+report.ObjectSuffix,
+		storedReport(t, "legacy.tar.gz", "legacy-out.tar.gz", 4, 1), time.Now())
+
+	h := newTestServer(metrics.NewJobLog(10), arc)
+	_, body := getJSON(t, h, "/api/status?key=legacy.tar.gz")
+
+	if body["status"] != "scrubbed" {
+		t.Fatalf("status = %v, want scrubbed from the full report", body["status"])
+	}
+	if body["matches"] != float64(4) {
+		t.Errorf("matches = %v, want 4", body["matches"])
+	}
+	if body["passthrough"] != float64(1) {
+		t.Errorf("passthrough = %v, want 1", body["passthrough"])
+	}
+	if body["output_key"] != "legacy-out.tar.gz" {
+		t.Errorf("output_key = %v", body["output_key"])
+	}
+}
+
+// TestHistoryIgnoresFullReports guards the listing against reading the large
+// per-match audit objects: only digests may drive the list, or rendering N rows
+// would parse megabytes per run.
+func TestHistoryIgnoresFullReports(t *testing.T) {
+	arc := newArchive()
+	arc.put("reports", "x.log"+report.DigestSuffix, storedDigest(t, "x.log", "x.log", 2, 0), time.Now())
+	arc.put("reports", "x.log"+report.ObjectSuffix, storedReport(t, "x.log", "x.log", 2, 0), time.Now())
+
+	h := newTestServer(metrics.NewJobLog(10), arc)
+	_, body := getJSON(t, h, "/api/history")
+	runs, _ := body["runs"].([]any)
+	if len(runs) != 1 {
+		t.Fatalf("runs = %d, want 1 (the full report must not add a second row)", len(runs))
+	}
+	first, _ := runs[0].(map[string]any)
+	if first["key"] != "x.log" {
+		t.Errorf("key = %v, want x.log", first["key"])
+	}
 }

@@ -208,8 +208,8 @@ func (s *Server) apiStatus(w http.ResponseWriter, r *http.Request) {
 	// its record has been in-flight implausibly long (a wedged or re-looping
 	// object). Storage is authoritative — check it before reporting in-flight, so
 	// a client is never stranded on an object that actually completed.
-	if rep, ok := s.reportFor(r.Context(), key); ok {
-		writeJSON(w, reportStatusPayload(rep))
+	if d, ok := s.digestFor(r.Context(), key); ok {
+		writeJSON(w, digestStatusPayload(d))
 		return
 	}
 	if known {
@@ -231,7 +231,30 @@ func (s *Server) apiStatus(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, map[string]any{"status": "processing", "phase": "queued"})
 }
 
-// reportFor fetches and decodes the durable run report for an input key.
+// digestFor fetches the compact durable record for an input key.
+//
+// It prefers the small digest object and only falls back to the full report,
+// which carries every match and can be megabytes, when the digest is absent —
+// e.g. for runs recorded before digests existed.
+func (s *Server) digestFor(ctx context.Context, key string) (*report.Digest, bool) {
+	if s.d.Archive == nil || s.d.ReportsBucket == "" {
+		return nil, false
+	}
+	if raw, err := s.d.Archive.Get(ctx, s.d.ReportsBucket, key+report.DigestSuffix); err == nil {
+		var d report.Digest
+		if json.Unmarshal(raw, &d) == nil {
+			return &d, true
+		}
+	}
+	rep, ok := s.reportFor(ctx, key)
+	if !ok {
+		return nil, false
+	}
+	d := rep.Digest()
+	return &d, true
+}
+
+// reportFor fetches and decodes the full durable run report for an input key.
 func (s *Server) reportFor(ctx context.Context, key string) (*report.Report, bool) {
 	if s.d.Archive == nil || s.d.ReportsBucket == "" {
 		return nil, false
@@ -271,28 +294,31 @@ func (s *Server) apiHistory(w http.ResponseWriter, r *http.Request) {
 		writeJSONStatus(w, http.StatusBadGateway, map[string]any{"error": "could not list reports"})
 		return
 	}
-	reports := objs[:0]
+	// List by digest, never by full report: the full report grows with match count
+	// and reading N of them to render a list would mean parsing hundreds of
+	// megabytes of audit detail per page load.
+	digests := objs[:0]
 	for _, o := range objs {
-		if strings.HasSuffix(o.Key, report.ObjectSuffix) {
-			reports = append(reports, o)
+		if strings.HasSuffix(o.Key, report.DigestSuffix) {
+			digests = append(digests, o)
 		}
 	}
-	sort.Slice(reports, func(i, j int) bool { return reports[i].LastModified.After(reports[j].LastModified) })
-	if len(reports) > n {
-		reports = reports[:n]
+	sort.Slice(digests, func(i, j int) bool { return digests[i].LastModified.After(digests[j].LastModified) })
+	if len(digests) > n {
+		digests = digests[:n]
 	}
 
-	runs := make([]map[string]any, len(reports))
+	runs := make([]map[string]any, len(digests))
 	var wg sync.WaitGroup
-	sem := make(chan struct{}, 8) // bounded fan-out; reports are small but numerous
-	for i, o := range reports {
+	sem := make(chan struct{}, 8) // bounded fan-out
+	for i, o := range digests {
 		wg.Add(1)
 		go func(i int, o store.Object) {
 			defer wg.Done()
 			sem <- struct{}{}
 			defer func() { <-sem }()
 
-			key := strings.TrimSuffix(o.Key, report.ObjectSuffix)
+			key := strings.TrimSuffix(o.Key, report.DigestSuffix)
 			entry := map[string]any{"key": key, "at": o.LastModified}
 			raw, err := s.d.Archive.Get(r.Context(), s.d.ReportsBucket, o.Key)
 			if err != nil {
@@ -300,13 +326,13 @@ func (s *Server) apiHistory(w http.ResponseWriter, r *http.Request) {
 				runs[i] = entry
 				return
 			}
-			var rep report.Report
-			if err := json.Unmarshal(raw, &rep); err != nil {
+			var d report.Digest
+			if err := json.Unmarshal(raw, &d); err != nil {
 				entry["status"] = "unreadable"
 				runs[i] = entry
 				return
 			}
-			for k, v := range reportStatusPayload(&rep) {
+			for k, v := range digestStatusPayload(&d) {
 				entry[k] = v
 			}
 			runs[i] = entry
@@ -332,20 +358,19 @@ func (s *Server) apiReport(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, rep)
 }
 
-// reportStatusPayload renders a stored report in the same shape as a live job so
+// digestStatusPayload renders a stored digest in the same shape as a live job so
 // the UI can consume either without branching.
-func reportStatusPayload(rep *report.Report) map[string]any {
-	s := rep.Summary
+func digestStatusPayload(d *report.Digest) map[string]any {
 	return map[string]any{
 		"status":            "scrubbed",
-		"matches":           s.TotalMatches,
-		"by_label":          s.MatchesByLabel,
-		"passthrough":       s.FilesPassthrough,
-		"passthrough_paths": s.Passthroughs,
-		"files_done":        s.FilesTotal,
-		"output_key":        rep.OutputKey,
-		"bytes_in":          rep.BytesIn,
-		"bytes_out":         rep.BytesOut,
+		"matches":           d.Matches,
+		"by_label":          d.ByLabel,
+		"passthrough":       d.Passthrough,
+		"passthrough_paths": d.Passthroughs,
+		"files_done":        d.FilesTotal,
+		"output_key":        d.OutputKey,
+		"bytes_in":          d.BytesIn,
+		"bytes_out":         d.BytesOut,
 		"from":              "storage",
 	}
 }
@@ -363,8 +388,8 @@ func (s *Server) apiDownload(w http.ResponseWriter, r *http.Request) {
 	outKey := key
 	if j, ok := s.d.Jobs.Get(key); ok && j.OutputKey != "" {
 		outKey = j.OutputKey
-	} else if rep, ok := s.reportFor(r.Context(), key); ok && rep.OutputKey != "" {
-		outKey = rep.OutputKey
+	} else if d, ok := s.digestFor(r.Context(), key); ok && d.OutputKey != "" {
+		outKey = d.OutputKey
 	}
 	url, err := s.d.Presigner.PresignGet(r.Context(), s.d.OutputBucket, outKey, s.d.UploadExpiry)
 	if err != nil {
