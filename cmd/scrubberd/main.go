@@ -14,6 +14,7 @@ import (
 	"os/signal"
 	"strconv"
 	"strings"
+	"sync"
 	"syscall"
 	"time"
 
@@ -130,7 +131,15 @@ func realMain(log *slog.Logger) error {
 	wk := worker.New(st, reg, m, jobs, wcfg, log)
 
 	// --- control + browser API server ---
-	ready := func() bool { return st.Healthy(ctx, inputBucket) }
+	// Readiness is checked every few seconds by the kubelet. Probing MinIO on
+	// every call with no deadline means a slow backend makes the probe hang, the
+	// pod drop out of the Route, and in-flight browser polls fail — so the result
+	// is cached briefly and the check is given its own timeout.
+	ready := cachedReady(func() bool {
+		cctx, cancel := context.WithTimeout(ctx, readyProbeTimeout)
+		defer cancel()
+		return st.Healthy(cctx, inputBucket)
+	}, readyCacheTTL)
 	srv := &http.Server{
 		Addr: ":" + envDefault("PORT", "8080"),
 		Handler: server.New(server.Deps{
@@ -166,6 +175,35 @@ func realMain(log *slog.Logger) error {
 	shutCtx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
 	defer cancel()
 	return srv.Shutdown(shutCtx)
+}
+
+const (
+	// readyProbeTimeout bounds a single backend reachability check.
+	readyProbeTimeout = 3 * time.Second
+	// readyCacheTTL is how long a readiness result is reused across probes.
+	readyCacheTTL = 5 * time.Second
+)
+
+// cachedReady wraps a readiness check so concurrent probes share one in-flight
+// call and the result is reused for ttl.
+func cachedReady(check func() bool, ttl time.Duration) func() bool {
+	var (
+		mu       sync.Mutex
+		last     time.Time
+		lastOK   bool
+		hasValue bool
+	)
+	return func() bool {
+		mu.Lock()
+		defer mu.Unlock()
+		if hasValue && time.Since(last) < ttl {
+			return lastOK
+		}
+		lastOK = check()
+		last = time.Now()
+		hasValue = true
+		return lastOK
+	}
 }
 
 // watchPolicies hot-reloads the policy registry when the mounted ConfigMap changes.

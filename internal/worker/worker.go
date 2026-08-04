@@ -62,6 +62,31 @@ type Worker struct {
 	jobs     *metrics.JobLog
 	cfg      Config
 	log      *slog.Logger
+
+	// deferUntil holds back objects whose finalization failed. Without it a key
+	// that cannot be moved out of the input bucket is re-scrubbed on every poll
+	// forever, burning CPU, rewriting the same output, and churning the job ring
+	// so unrelated records are evicted.
+	mu         sync.Mutex
+	deferUntil map[string]time.Time
+	attempts   map[string]int
+}
+
+// finalizeBackoff returns how long to hold an object back after n consecutive
+// failures to mark it processed, capped so it still retries occasionally.
+func finalizeBackoff(n int) time.Duration {
+	d := time.Duration(1<<min(n, 6)) * time.Second // 2s .. 64s
+	if d > time.Minute {
+		d = time.Minute
+	}
+	return d
+}
+
+func min(a, b int) int {
+	if a < b {
+		return a
+	}
+	return b
 }
 
 // New constructs a Worker.
@@ -75,7 +100,11 @@ func New(s store.ObjectStore, p *policy.Registry, m *metrics.Metrics, jl *metric
 	if cfg.MaxObjectBytes <= 0 {
 		cfg.MaxObjectBytes = 512 << 20 // never 0/unbounded: the read cap prevents OOM
 	}
-	return &Worker{store: s, policies: p, metrics: m, jobs: jl, cfg: cfg, log: log}
+	return &Worker{
+		store: s, policies: p, metrics: m, jobs: jl, cfg: cfg, log: log,
+		deferUntil: map[string]time.Time{},
+		attempts:   map[string]int{},
+	}
 }
 
 // Run polls until ctx is cancelled.
@@ -131,9 +160,32 @@ func (w *Worker) eligible(o store.Object) bool {
 	if strings.HasPrefix(o.Key, w.cfg.ProcessedPrefix) {
 		return false
 	}
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	if until, held := w.deferUntil[o.Key]; held && time.Now().Before(until) {
+		return false // finalization failed recently; wait out the backoff
+	}
 	// Size is enforced in processObject via a bounded read (GetLimited), so an
 	// object whose listed size is unknown or wrong still can't OOM the pod.
 	return true
+}
+
+// noteFinalized clears any backoff state for a key that completed cleanly.
+func (w *Worker) noteFinalized(key string) {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	delete(w.deferUntil, key)
+	delete(w.attempts, key)
+}
+
+// noteFinalizeFailed records a failure and returns the backoff applied.
+func (w *Worker) noteFinalizeFailed(key string) time.Duration {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	w.attempts[key]++
+	d := finalizeBackoff(w.attempts[key])
+	w.deferUntil[key] = time.Now().Add(d)
+	return d
 }
 
 func (w *Worker) processObject(ctx context.Context, o store.Object) {
@@ -197,7 +249,11 @@ func (w *Worker) processObject(ctx context.Context, o store.Object) {
 			record(job)
 			w.log.Warn("object too large; skipping", "key", o.Key, "limit", w.cfg.MaxObjectBytes)
 			if ferr := w.finish(ctx, o.Key); ferr != nil {
-				w.log.Warn("move oversized input aside", "key", o.Key, "err", ferr)
+				d := w.noteFinalizeFailed(o.Key)
+				w.log.Warn("could not move oversized input aside; deferring retry",
+					"key", o.Key, "err", ferr, "retry_in", d)
+			} else {
+				w.noteFinalized(o.Key)
 			}
 			return
 		}
@@ -280,9 +336,15 @@ func (w *Worker) processObject(ctx context.Context, o store.Object) {
 	} else {
 		w.log.Warn("render report", "key", o.Key, "err", jerr)
 	}
-	// Mark input processed.
+	// Mark input processed. If this fails the object is still sitting in the input
+	// bucket and would otherwise be re-scrubbed on every poll forever, so hold it
+	// back with an increasing backoff instead of spinning.
 	if err := w.finish(ctx, o.Key); err != nil {
-		w.log.Warn("finalize input", "key", o.Key, "err", err)
+		d := w.noteFinalizeFailed(o.Key)
+		w.log.Warn("could not mark input processed; deferring retry",
+			"key", o.Key, "err", err, "retry_in", d)
+	} else {
+		w.noteFinalized(o.Key)
 	}
 	// Consume the override sidecar if it existed.
 	if len(overrideTerms) > 0 {

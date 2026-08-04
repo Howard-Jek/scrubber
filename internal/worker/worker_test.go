@@ -3,6 +3,7 @@ package worker
 import (
 	"bytes"
 	"context"
+	"errors"
 	"io"
 	"log/slog"
 	"os"
@@ -310,5 +311,78 @@ func TestWorkerReportsUnscrubbedFiles(t *testing.T) {
 	}
 	if len(j.PassthroughPaths) == 0 {
 		t.Error("passthrough paths should name the uninspected file")
+	}
+}
+
+// failMoveStore fails Move a fixed number of times, then succeeds.
+type failMoveStore struct {
+	*memStore
+	failures int
+	calls    int
+}
+
+func (f *failMoveStore) Move(ctx context.Context, bucket, src, dst string) error {
+	f.calls++
+	if f.calls <= f.failures {
+		return errors.New("simulated copy failure")
+	}
+	return f.memStore.Move(ctx, bucket, src, dst)
+}
+
+// TestFinalizeFailureBacksOff covers the re-processing loop: when an input
+// cannot be moved to processed/ it stays in the input bucket, so the next poll
+// picks it up again. Unbounded, that re-scrubs the same object forever, rewrites
+// the same output, and churns the job ring so unrelated records are evicted.
+func TestFinalizeFailureBacksOff(t *testing.T) {
+	ms := newMemStore("input", "output", "reports")
+	ms.Put(context.Background(), "input", "stuck.log", []byte("AcmeCorp\n"), "")
+
+	fs := &failMoveStore{memStore: ms, failures: 99} // never succeeds
+	w := newTestWorker(t, ms)
+	w.store = fs
+
+	w.pollOnce(context.Background())
+	if fs.calls != 1 {
+		t.Fatalf("first poll should attempt the move once, got %d", fs.calls)
+	}
+
+	// Immediately polling again must NOT re-process: the key is in backoff.
+	w.pollOnce(context.Background())
+	if fs.calls != 1 {
+		t.Errorf("object was re-processed during backoff (move attempts = %d)", fs.calls)
+	}
+
+	// Once the backoff expires it is retried rather than abandoned.
+	w.mu.Lock()
+	w.deferUntil["stuck.log"] = time.Now().Add(-time.Second)
+	w.mu.Unlock()
+	w.pollOnce(context.Background())
+	if fs.calls != 2 {
+		t.Errorf("object should be retried after backoff, move attempts = %d", fs.calls)
+	}
+}
+
+// TestFinalizeSuccessClearsBackoff checks the backoff state does not leak for
+// keys that eventually succeed.
+func TestFinalizeSuccessClearsBackoff(t *testing.T) {
+	ms := newMemStore("input", "output", "reports")
+	ms.Put(context.Background(), "input", "ok.log", []byte("AcmeCorp\n"), "")
+
+	fs := &failMoveStore{memStore: ms, failures: 1}
+	w := newTestWorker(t, ms)
+	w.store = fs
+
+	w.pollOnce(context.Background()) // fails, backs off
+	w.mu.Lock()
+	w.deferUntil["ok.log"] = time.Now().Add(-time.Second)
+	w.mu.Unlock()
+	w.pollOnce(context.Background()) // succeeds
+
+	w.mu.Lock()
+	_, held := w.deferUntil["ok.log"]
+	_, tried := w.attempts["ok.log"]
+	w.mu.Unlock()
+	if held || tried {
+		t.Error("backoff state should be cleared once the object finalizes")
 	}
 }
