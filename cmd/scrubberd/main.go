@@ -99,20 +99,26 @@ func realMain(log *slog.Logger) error {
 	jobs := metrics.NewJobLog(envInt("JOBS_HISTORY", 200))
 
 	wcfg := worker.Config{
-		InputBucket:    inputBucket,
-		OutputBucket:   mustEnv("OUTPUT_BUCKET"),
-		ReportsBucket:  mustEnv("REPORTS_BUCKET"),
-		InputPrefix:    os.Getenv("INPUT_PREFIX"),
+		InputBucket:     inputBucket,
+		OutputBucket:    mustEnv("OUTPUT_BUCKET"),
+		ReportsBucket:   mustEnv("REPORTS_BUCKET"),
+		InputPrefix:     os.Getenv("INPUT_PREFIX"),
 		ProcessedPrefix: envDefault("PROCESSED_PREFIX", "processed/"),
-		Action:         worker.ProcessedAction(envDefault("PROCESSED_ACTION", "move")),
-		PollInterval:   envDuration("POLL_INTERVAL", 15*time.Second),
-		Workers:        envInt("WORKERS", 4),
-		MaxObjectBytes: envInt64("MAX_OBJECT_BYTES", 256<<20),
+		Action:          worker.ProcessedAction(envDefault("PROCESSED_ACTION", "move")),
+		PollInterval:    envDuration("POLL_INTERVAL", 15*time.Second),
+		// Clamped to 1 by worker.New. Read from the environment anyway so an
+		// operator who set it higher gets told it is being ignored.
+		Workers:  envInt("WORKERS", 1),
+		QueueMax: envInt("QUEUE_MAX", 10000),
+		// Defaults match the shipped manifest. They used to disagree with it and
+		// with the README, which made the startup memory arithmetic unverifiable.
+		MaxObjectBytes: envInt64("MAX_OBJECT_BYTES", 64<<20),
+		FinalizeGrace:  envDuration("FINALIZE_GRACE", 15*time.Second),
 		RedactReports:  envBool("REDACT_REPORTS", false),
 		ScrubNames:     envBool("SCRUB_FILENAMES", true),
 		Limits: pipeline.Limits{
 			MaxDepth:      envInt("MAX_DEPTH", 16),
-			MaxTotalBytes: envInt64("MAX_EXPAND_BYTES", 256<<20),
+			MaxTotalBytes: envInt64("MAX_EXPAND_BYTES", 512<<20),
 			MaxMembers:    envInt("MAX_MEMBERS", 100000),
 		},
 	}
@@ -123,12 +129,19 @@ func realMain(log *slog.Logger) error {
 			"it emitted the object UNSCRUBBED. Memory is now bounded by MAX_EXPAND_BYTES, " +
 			"enforced while decompressing.")
 	}
+	// Objects are scrubbed one at a time, so the resident worst case is a single
+	// object: its compressed bytes plus everything it decompresses. Check this
+	// against the container's memory limit after changing either cap.
 	log.Info("resource limits",
 		"max_object_bytes", wcfg.MaxObjectBytes,
 		"max_expand_bytes", wcfg.Limits.MaxTotalBytes,
-		"workers", wcfg.Workers,
-		"worst_case_resident_bytes", int64(wcfg.Workers)*(wcfg.MaxObjectBytes+wcfg.Limits.MaxTotalBytes))
+		"queue_concurrency", 1,
+		"queue_max", wcfg.QueueMax,
+		"worst_case_resident_bytes", wcfg.MaxObjectBytes+wcfg.Limits.MaxTotalBytes)
 	wk := worker.New(st, reg, m, jobs, wcfg, log)
+	metrics.RegisterQueue(promReg,
+		func() float64 { return float64(wk.Queue().Depth()) },
+		func() float64 { return float64(wk.Queue().Inflight()) })
 
 	// --- control + browser API server ---
 	// Readiness is checked every few seconds by the kubelet. Probing MinIO on
@@ -149,6 +162,8 @@ func realMain(log *slog.Logger) error {
 			Ready:         ready,
 			Presigner:     st,
 			Archive:       st,
+			Queue:         wk,
+			Nudge:         wk.Nudge,
 			DefaultPolicy: os.Getenv("DEFAULT_POLICY"),
 			AllowEdit:     envBool("ALLOW_POLICY_EDIT", true),
 			InputBucket:   inputBucket,
@@ -169,12 +184,26 @@ func realMain(log *slog.Logger) error {
 	}()
 
 	// --- run worker until signal ---
-	go wk.Run(ctx)
+	workerDone := make(chan struct{})
+	go func() { defer close(workerDone); wk.Run(ctx) }()
+
 	<-ctx.Done()
 	log.Info("shutting down")
-	shutCtx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+	shutCtx, cancel := context.WithTimeout(context.Background(), shutdownTimeout)
 	defer cancel()
-	return srv.Shutdown(shutCtx)
+	err = srv.Shutdown(shutCtx)
+
+	// Wait for the worker rather than exiting out from under it. On cancellation it
+	// stops taking new work immediately, and an object that has already finished
+	// scrubbing persists its output on a detached context, so this is bounded by
+	// FinalizeGrace rather than by however long a large bundle takes.
+	select {
+	case <-workerDone:
+	case <-shutCtx.Done():
+		log.Warn("worker did not stop within the shutdown budget; exiting anyway",
+			"budget", shutdownTimeout)
+	}
+	return err
 }
 
 const (
@@ -182,6 +211,10 @@ const (
 	readyProbeTimeout = 3 * time.Second
 	// readyCacheTTL is how long a readiness result is reused across probes.
 	readyCacheTTL = 5 * time.Second
+	// shutdownTimeout bounds the whole graceful stop: draining HTTP plus letting
+	// the worker persist whatever it had finished. Keep it inside the pod's
+	// terminationGracePeriodSeconds, or the kubelet kills the process first.
+	shutdownTimeout = 30 * time.Second
 )
 
 // cachedReady wraps a readiness check so concurrent probes share one in-flight

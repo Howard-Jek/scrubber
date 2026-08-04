@@ -208,16 +208,57 @@ to a `processed/` prefix (or deleted).
 - **Control plane (Route-exposed, data-free):** `/healthz`, `/readyz`, `/metrics`
   (Prometheus), `/policies`, `/jobs`. Safe to expose externally even without app auth.
 
-**Sizing.** Each concurrent worker can hold roughly `MAX_OBJECT_BYTES` (the compressed
-input) plus `MAX_EXPAND_BYTES` (everything it decompresses), plus transient copies while
-repacking. Keep `WORKERS × (MAX_OBJECT_BYTES + MAX_EXPAND_BYTES)` under ~60% of the
-container memory limit and set `GOMEMLIMIT` below that limit. The service logs
+### Queueing and ordering
+
+Objects are scrubbed **one at a time, in the order they arrived**. Uploads land in one
+bucket regardless of who sent them, so five people uploading five bundles each get a
+single queue served first-come-first-serve — no upload can be starved by arriving
+alongside a larger batch, and none of them compete for the pod's single CPU.
+
+- **Order is by upload *completion*, not upload start.** The queue sorts on the
+  object's `LastModified` (the moment its PUT committed, from MinIO's own clock, so
+  there is no client skew), tie-broken by key. A large upload that starts first and
+  finishes last is served last — there is nothing to queue until the object exists.
+- **The bucket is the durable queue.** The in-memory pending set is a derived view:
+  after a restart the first listing rebuilds the same order, and nothing is lost.
+- **Retries rejoin at the back.** An object whose move to `processed/` fails has the
+  oldest `LastModified` in the bucket, so it is re-ordered on the time its backoff
+  expires instead. Otherwise one object that can never be finalized would re-scrub
+  itself at the head of the queue every minute, forever, ahead of real uploads.
+- **`POLL_INTERVAL` governs discovery, not drain rate.** The consumer takes the next
+  object the instant it finishes one. The interval only bounds how long a *new*
+  upload waits to be noticed — and even that is short-circuited: the browser starts
+  polling `/api/status` as soon as its upload lands, and that first poll nudges a
+  listing. Note that listing covers the whole input bucket including `processed/`, so
+  prune that prefix (a lifecycle rule, or `PROCESSED_ACTION=delete`) rather than
+  shortening the interval.
+- **The queue is per-pod**, which is the other reason `replicas: 1` is load-bearing.
+  The Deployment uses `strategy: Recreate` on purpose: with `replicas: 1` the default
+  RollingUpdate starts the new pod before stopping the old one, and two scrubberds
+  polling the same bucket would double-process.
+- **Upload a `<key>.terms.json` sidecar *before* its bundle.** The override is read
+  when the bundle is processed, so a bundle that reaches the front first will miss a
+  sidecar still in flight.
+
+`/api/status` reports `queue_position` and `queue_depth` while an object waits, and
+`/api/queue` shows the in-flight key plus the head of the pending list.
+
+**Sizing.** Because objects are processed one at a time, the resident worst case is a
+single object: roughly `MAX_OBJECT_BYTES` (the compressed input) plus
+`MAX_EXPAND_BYTES` (everything it decompresses), plus transient copies while
+repacking. Keep `MAX_OBJECT_BYTES + MAX_EXPAND_BYTES` under ~60% of the container
+memory limit and set `GOMEMLIMIT` below that limit. The service logs
 `worst_case_resident_bytes` at startup so the configured budget is visible.
 
-These three values and `resources.limits.memory` move together — changing one alone is
-how you get an OOM. The shipped manifests use 2 workers × (64 MiB + 512 MiB) = 1152 MiB
-against a 2 GiB limit. If 2 GiB is not available, drop `WORKERS` to `1` and keep the
-limit at 1 GiB; that halves throughput but not per-object capacity.
+These values and `resources.limits.memory` move together — changing one alone is how
+you get an OOM. The shipped manifests use 64 MiB + 512 MiB = 576 MiB against a 2 GiB
+limit (28%), which leaves real headroom for repack copies and GC. A 1 GiB limit also
+satisfies the rule (576 MiB = 56% of 1 GiB) if quota is tight; drop `GOMEMLIMIT` to
+about 800 MiB alongside it.
+
+`WORKERS` is retained for configuration compatibility but is **clamped to 1**; a
+higher value is ignored with a warning. Concurrent scrubs on a single CPU do not add
+throughput, and they multiply the memory budget above.
 
 > A `.tar.gz` draws on `MAX_EXPAND_BYTES` **twice** — once for the decompressed tar and
 > once for the member bodies copied out of it, which really are two live copies. Budget
@@ -237,7 +278,9 @@ Resolution per object, highest precedence first:
 **Config (env / ConfigMap + Secret):** `MINIO_ENDPOINT`, `MINIO_ACCESS_KEY`/
 `MINIO_SECRET_KEY`, `MINIO_USE_TLS`, `MINIO_CA_CERT`, `INPUT_BUCKET`, `OUTPUT_BUCKET`,
 `REPORTS_BUCKET`, `INPUT_PREFIX`, `DEFAULT_POLICY`, `PREFIX_POLICY_MAP` (JSON),
-`PROCESSED_ACTION` (`move`|`delete`), `POLL_INTERVAL`, `WORKERS`, `MAX_OBJECT_BYTES`,
+`PROCESSED_ACTION` (`move`|`delete`), `POLL_INTERVAL` (default `15s`; discovery only),
+`WORKERS` (clamped to 1), `QUEUE_MAX` (default `10000`), `FINALIZE_GRACE` (default `15s`),
+`MAX_OBJECT_BYTES` (default 64Mi), `MAX_EXPAND_BYTES` (default 512Mi),
 `REDACT_REPORTS` (default `false`), `SCRUB_FILENAMES` (default `true`), `PORT` (default `8080`).
 
 **Filenames & paths** are scrubbed by default (`SCRUB_FILENAMES=true`): archive member
@@ -247,7 +290,7 @@ if only contents were cleaned. Replacements can't introduce a path separator, so
 traversal-safe. Set `SCRUB_FILENAMES=false` to keep exact names (CLI: `--scrub-names=false`).
 
 **Large objects & memory.** The service processes each object in memory, so it caps the read
-at `MAX_OBJECT_BYTES` (default 512Mi) via a bounded fetch: an object larger than the cap is
+at `MAX_OBJECT_BYTES` (default 64Mi) via a bounded fetch: an object larger than the cap is
 **skipped and moved aside**, never downloaded whole — so a huge upload can't OOM-kill the
 pod. Keep `MAX_OBJECT_BYTES` (and the decompression cap) comfortably below the pod's
 `limits.memory`. Genuinely large archives (multi-GB) are out of scope for this in-memory
@@ -284,7 +327,52 @@ should stay on a trusted network (see the auth caveat below).
 
 The image runs as an arbitrary non-root UID (group 0), `readOnlyRootFilesystem` with
 an emptyDir `/work` for temp, drops all capabilities, and ships with `replicas: 1`
-(single-writer; horizontal scale-out is a documented follow-up).
+and `strategy: Recreate` (single-writer, single queue; horizontal scale-out needs a
+distributed object claim and is a documented follow-up).
+
+### Metrics
+
+`/metrics` exposes, alongside the per-object counters (`scrubber_objects_total{status}`,
+`scrubber_matches_total`, `scrubber_passthrough_total`, `scrubber_errors_total`,
+`scrubber_bytes_in_total`, `scrubber_bytes_out_total`, `scrubber_process_seconds`):
+
+| Metric | Meaning |
+| --- | --- |
+| `scrubber_queue_depth` | objects waiting, plus the one in flight |
+| `scrubber_inflight_objects` | objects being scrubbed right now (0 or 1) |
+| `scrubber_queue_wait_seconds` | arrival → start of scrubbing |
+| `scrubber_object_latency_seconds` | arrival → finished; what a user actually waits |
+
+`scrubber_process_seconds` starts counting only once an object reaches the front of
+the queue, so it cannot show what someone behind a backlog experiences —
+`scrubber_object_latency_seconds` is the number to watch for that.
+
+### Benchmarking
+
+```sh
+go test ./internal/queue ./internal/scrub ./internal/pipeline -bench=. -benchmem
+go test ./internal/worker -bench=DrainSerialVsFanOut -cpu=1   # -cpu=1 models the pod
+./scripts/bench-queue.sh                                      # end-to-end, needs Docker
+```
+
+`scripts/bench-queue.sh` uploads N objects at once, drains them, and reports total
+wall clock, time to the first completion, per-object latency and peak container
+memory. Point it at two images to compare a change honestly:
+
+```sh
+git stash && docker build -q -f deploy/Containerfile -t scrubberd:baseline . && git stash pop
+docker build -q -f deploy/Containerfile -t scrubberd:queue .
+IMAGE=scrubberd:baseline ./scripts/bench-queue.sh
+IMAGE=scrubberd:queue    ./scripts/bench-queue.sh
+```
+
+Serialising does **not** buy raw throughput — on one CPU the same bytes have to be
+scrubbed either way, and `BenchmarkDrainSerialVsFanOut` measures the old fan-out as
+roughly 8% faster on total drain time. What it buys is a halved memory budget
+(576 MiB instead of 1152 MiB) and arrival-ordered completion, so the first upload
+finishes early instead of every upload finishing late together. `-cpu=1` matters:
+unpinned on a multi-core box the fan-out looks twice as fast, which is true of
+hardware the pod does not have, so the benchmark skips rather than print it.
 
 ### Web front page
 
@@ -309,10 +397,21 @@ working even when filename scrubbing renamed the output.
 While a job is in flight the status response carries real progress (`files_done`,
 `current_file`, `phase`) rather than a client-side animation.
 
+**While an object is waiting**, `/api/status` returns `phase: "queued"` with
+`queue_position` and `queue_depth`, and the UI shows "Queued — 3 of 7". That answer
+comes from the in-memory queue and touches no storage: a queued key has no report
+yet, so falling through to the reports bucket would cost two failed object reads per
+client poll — with a full queue and second-scale polling, dozens of pointless MinIO
+round-trips per second for the whole drain. The progress bar deliberately does *not*
+advance while queued; a bar creeping toward full while an object sits twentieth in
+line reads as "almost done" when nothing has happened.
+
 - `GET /api/history?n=N` — the last N completed runs, rebuilt from the reports bucket
   and shown in the **Recent scrubs** panel. Survives a page refresh and a pod restart.
   N is settable in the UI and capped by `HISTORY_MAX`.
 - `GET /api/report?key=…` — the full stored report for one run.
+- `GET /api/queue` — the object being scrubbed plus the head of the pending list, in
+  order. Keys only.
 
 A run that contains files the pipeline could not inspect is shown as an amber
 **"N files NOT scrubbed"** state naming each file and why — never a green check.
@@ -403,6 +502,10 @@ There are three ways to change what gets scrubbed, from most transient to most p
   files contain NUL bytes and are therefore treated as binary and passed through.
 - Processing is in-memory, bounded by the cumulative `--max-expand-bytes` budget
   for a whole input (nested streams and archive members draw from the same budget).
+- The service scrubs one object at a time in arrival order. That is strict FCFS with
+  no per-tenant fairness: a single user who uploads a large batch does hold up the
+  users behind them until it drains. Round-robin between uploaders would need a
+  tenant identity, which the service does not have (there is no app auth).
 - Shelling out to a system `7z`/`xz`, and length-preserving / hashing replacement
   modes, are intentionally out of scope for v1.
 

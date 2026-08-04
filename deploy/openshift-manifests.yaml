@@ -30,18 +30,38 @@ data:
   # Map an input key prefix to a named policy (JSON object), highest-specificity wins:
   PREFIX_POLICY_MAP: '{"secure/":"strict"}'
   PROCESSED_ACTION: "move"        # move (to processed/) or delete
+  # How often the input bucket is listed for NEW work. It does NOT govern the drain
+  # rate: the queue hands the next object to the consumer the instant it finishes
+  # one. The API also nudges a listing when a browser starts polling a key the
+  # worker has not seen yet, so a fresh upload is picked up within a second or two
+  # without polling harder. Listing covers the whole input bucket including
+  # processed/, so shortening this gets more expensive as that prefix grows.
   POLL_INTERVAL: "15s"
-  # Memory budget. Each concurrent worker can hold roughly
-  # MAX_OBJECT_BYTES (the compressed input) + MAX_EXPAND_BYTES (everything it
-  # decompresses) plus transient copies while repacking. Size WORKERS against
-  # limits.memory below:
-  #     WORKERS * (MAX_OBJECT_BYTES + MAX_EXPAND_BYTES) <= ~60% of limits.memory
-  # With 2 * (64Mi + 512Mi) = 1152Mi against the 2Gi limit below (56%) there is
-  # headroom for repack copies and GC. The service logs worst_case_resident_bytes
-  # at startup -- check it against limits.memory after changing any of these.
-  # If you cannot allocate 2Gi, drop WORKERS to 1 and keep limits.memory at 1Gi
-  # (1 * 576Mi = 56% of 1Gi); that halves throughput but not capacity per object.
-  WORKERS: "2"
+  # Memory budget. Objects are scrubbed ONE AT A TIME, in bucket-arrival order, so
+  # the resident worst case is a single object: MAX_OBJECT_BYTES (the compressed
+  # input) + MAX_EXPAND_BYTES (everything it decompresses), plus transient copies
+  # while repacking.
+  #     MAX_OBJECT_BYTES + MAX_EXPAND_BYTES <= ~60% of limits.memory
+  # 64Mi + 512Mi = 576Mi against the 2Gi limit below is 28%, leaving real headroom
+  # for repack copies and GC. (The previous 2-worker configuration budgeted 1152Mi,
+  # i.e. 56%.) The service logs worst_case_resident_bytes at startup -- check it
+  # against limits.memory after changing either cap.
+  # A 1Gi limit also satisfies the rule (576Mi = 56% of 1Gi) if quota is tight;
+  # drop GOMEMLIMIT to ~800MiB alongside it.
+  WORKERS: "1"                    # queue concurrency. Kept for config compatibility
+                                  # and CLAMPED to 1 -- a higher value is ignored
+                                  # (with a warning) because concurrent scrubs on a
+                                  # single CPU only slow each other down and would
+                                  # multiply the memory budget above.
+  QUEUE_MAX: "10000"              # cap on the in-memory pending set. Anything beyond
+                                  # it stays in the bucket and is picked up later;
+                                  # the service warns when it truncates.
+  FINALIZE_GRACE: "15s"           # on shutdown, how long an object that has already
+                                  # finished scrubbing may keep writing its output,
+                                  # report and digest. Without this a SIGTERM lands
+                                  # mid-object and discards a completed scrub, which
+                                  # then has to be redone after the restart. Keep it
+                                  # inside terminationGracePeriodSeconds below.
   MAX_OBJECT_BYTES: "67108864"    # 64Mi compressed input; larger objects are
                                   # skipped without being downloaded whole.
   MAX_EXPAND_BYTES: "536870912"   # 512Mi cumulative decompressed bytes per object.
@@ -87,13 +107,26 @@ metadata:
   name: scrubberd
   labels: { app: scrubberd }
 spec:
-  replicas: 1            # single replica in v1 (no distributed object-claim yet)
+  replicas: 1            # single replica: the FCFS queue is per-pod, and there is no
+                         # distributed object-claim, so two pods would both list the
+                         # same bucket and double-process objects.
+  # Recreate, NOT the default RollingUpdate. With replicas: 1 the defaults work out
+  # to maxSurge=1 / maxUnavailable=0, so a rollout starts the new pod BEFORE
+  # terminating the old one -- two scrubberds polling the same input bucket, each
+  # with its own queue, for the length of the rollout. Recreate stops the old pod
+  # first, at the cost of a short gap in service.
+  strategy:
+    type: Recreate
   selector:
     matchLabels: { app: scrubberd }
   template:
     metadata:
       labels: { app: scrubberd }
     spec:
+      # Long enough for the HTTP drain plus FINALIZE_GRACE, so an object that has
+      # finished scrubbing gets its result persisted instead of being killed and
+      # redone. The default 30s leaves no room once the server drain is counted.
+      terminationGracePeriodSeconds: 60
       imagePullSecrets:
         - name: artifactory-pull   # only if pulling from a private Artifactory repo
       containers:
@@ -133,9 +166,14 @@ spec:
             timeoutSeconds: 5
             failureThreshold: 6
           resources:
-            # Sized from the MAX_OBJECT_BYTES / MAX_EXPAND_BYTES / WORKERS budget
-            # in the ConfigMap above -- change them together, never one alone.
-            requests: { cpu: 100m, memory: 512Mi }
+            # Sized from the MAX_OBJECT_BYTES + MAX_EXPAND_BYTES budget in the
+            # ConfigMap above (one object at a time) -- change them together, never
+            # one alone.
+            # The CPU request matters more than it used to: with a single consumer,
+            # the queue's drain rate IS the CPU share this pod gets when the node is
+            # contended. 100m was conservative when work was spread over several
+            # goroutines; now it directly throttles every upload in the queue.
+            requests: { cpu: 500m, memory: 512Mi }
             limits:   { cpu: "1",  memory: 2Gi }
           securityContext:
             runAsNonRoot: true

@@ -7,6 +7,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"os"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -21,7 +22,22 @@ type fakeArchive struct {
 	objs map[string]map[string][]byte // bucket -> key -> body
 	at   map[string]time.Time         // key -> LastModified
 	err  error
+	// gets counts object reads so a test can assert a path did no storage I/O.
+	// Atomic because apiHistory reads digests through a bounded goroutine fan-out.
+	gets atomic.Int64
 }
+
+// fakeQueue is a fixed QueueView answer.
+type fakeQueue struct {
+	pos, depth int
+	ok         bool
+	inflight   []string
+	pending    []string
+}
+
+func (f fakeQueue) Position(string) (int, int, bool)  { return f.pos, f.depth, f.ok }
+func (f fakeQueue) Snapshot(int) ([]string, []string) { return f.inflight, f.pending }
+func (f fakeQueue) Depth() int                        { return f.depth }
 
 func newArchive() *fakeArchive {
 	return &fakeArchive{objs: map[string]map[string][]byte{}, at: map[string]time.Time{}}
@@ -47,6 +63,7 @@ func (f *fakeArchive) List(_ context.Context, bucket, prefix string) ([]store.Ob
 }
 
 func (f *fakeArchive) Get(_ context.Context, bucket, key string) ([]byte, error) {
+	f.gets.Add(1)
 	b, ok := f.objs[bucket][key]
 	if !ok {
 		return nil, os.ErrNotExist
@@ -112,12 +129,19 @@ func storedReport(t *testing.T, inKey, outKey string, matches, passthrough int) 
 }
 
 func newTestServer(jobs *metrics.JobLog, arc Archive) http.Handler {
+	return newTestServerQ(jobs, arc, nil, nil)
+}
+
+// newTestServerQ is newTestServer with the queue and nudge hooks wired.
+func newTestServerQ(jobs *metrics.JobLog, arc Archive, q QueueView, nudge func()) http.Handler {
 	return New(Deps{
 		Policies:      nil,
 		Jobs:          jobs,
 		Prom:          prometheus.NewRegistry(),
 		Presigner:     fakePresigner{},
 		Archive:       arc,
+		Queue:         q,
+		Nudge:         nudge,
 		InputBucket:   "input",
 		OutputBucket:  "output",
 		ReportsBucket: "reports",
@@ -419,5 +443,156 @@ func TestHistoryIgnoresFullReports(t *testing.T) {
 	first, _ := runs[0].(map[string]any)
 	if first["key"] != "x.log" {
 		t.Errorf("key = %v, want x.log", first["key"])
+	}
+}
+
+// --- queue-aware status ---
+
+func TestStatusReportsQueuePosition(t *testing.T) {
+	arc := newArchive()
+	arc.put("input", "waiting.tar.gz", []byte("x"), time.Now())
+	h := newTestServerQ(metrics.NewJobLog(10), arc, fakeQueue{pos: 3, depth: 7, ok: true}, nil)
+
+	code, body := getJSON(t, h, "/api/status?key=waiting.tar.gz")
+	if code != 200 {
+		t.Fatalf("status = %d, want 200", code)
+	}
+	if body["status"] != "processing" || body["phase"] != "queued" {
+		t.Fatalf("payload = %v, want processing/queued", body)
+	}
+	if got := body["queue_position"]; got != float64(3) {
+		t.Errorf("queue_position = %v, want 3", got)
+	}
+	if got := body["queue_depth"]; got != float64(7) {
+		t.Errorf("queue_depth = %v, want 7", got)
+	}
+}
+
+// TestStatusQueuedAnswerSkipsStorage is a load guard, not a correctness check. A
+// queued key has no digest yet, so falling through to storage costs two failed
+// object reads per client poll — with a full queue and second-scale polling that is
+// dozens of pointless MinIO round-trips per second for the whole drain.
+func TestStatusQueuedAnswerSkipsStorage(t *testing.T) {
+	arc := newArchive()
+	arc.put("input", "waiting.log", []byte("x"), time.Now())
+	arc.put("reports", "waiting.log.summary.json", storedDigest(t, "waiting.log", "waiting.log", 1, 0), time.Now())
+	h := newTestServerQ(metrics.NewJobLog(10), arc, fakeQueue{pos: 1, depth: 4, ok: true}, nil)
+
+	if _, body := getJSON(t, h, "/api/status?key=waiting.log"); body["phase"] != "queued" {
+		t.Fatalf("payload = %v, want phase queued", body)
+	}
+	if n := arc.gets.Load(); n != 0 {
+		t.Errorf("queued status did %d object reads, want 0", n)
+	}
+}
+
+// TestStatusTerminalJobBeatsQueuePosition pins the fall-through order. An object
+// whose finalize failed is queued again for a retry, but its output already exists,
+// so the client must be told it finished rather than sent back to waiting.
+func TestStatusTerminalJobBeatsQueuePosition(t *testing.T) {
+	jobs := metrics.NewJobLog(10)
+	jobs.Upsert(metrics.Job{Key: "done.log", Status: "scrubbed", Matches: 2, Timestamp: time.Now()})
+	h := newTestServerQ(jobs, newArchive(), fakeQueue{pos: 2, depth: 5, ok: true}, nil)
+
+	_, body := getJSON(t, h, "/api/status?key=done.log")
+	if body["status"] != "scrubbed" {
+		t.Errorf("status = %v, want scrubbed", body["status"])
+	}
+	if _, present := body["queue_position"]; present {
+		t.Error("a finished object should not report a queue position")
+	}
+}
+
+func TestStatusWithoutQueueUnchanged(t *testing.T) {
+	arc := newArchive()
+	arc.put("input", "pending.log", []byte("x"), time.Now())
+	h := newTestServer(metrics.NewJobLog(10), arc) // nil Queue and nil Nudge
+
+	code, body := getJSON(t, h, "/api/status?key=pending.log")
+	if code != 200 || body["status"] != "processing" || body["phase"] != "queued" {
+		t.Fatalf("payload = %d %v, want 200 processing/queued", code, body)
+	}
+	if _, present := body["queue_position"]; present {
+		t.Error("no queue wired: position must be omitted rather than reported as 0")
+	}
+}
+
+// TestStatusNudgesOnUnseenUpload covers the discovery shortcut: the browser starts
+// polling the moment its upload lands, so this request is the signal that new work
+// exists. Without it a single upload into an idle bucket waits out a whole poll
+// interval before anything happens.
+func TestStatusNudgesOnUnseenUpload(t *testing.T) {
+	arc := newArchive()
+	arc.put("input", "fresh.log", []byte("x"), time.Now())
+	var nudged int
+	h := newTestServerQ(metrics.NewJobLog(10), arc, fakeQueue{ok: false}, func() { nudged++ })
+
+	if _, body := getJSON(t, h, "/api/status?key=fresh.log"); body["phase"] != "queued" {
+		t.Fatalf("payload = %v, want phase queued", body)
+	}
+	if nudged != 1 {
+		t.Errorf("nudged %d times, want 1", nudged)
+	}
+}
+
+// TestStatusDoesNotNudgeForKnownKeys guards against a nudge storm: every client
+// poll for an already-tracked key must not ask the worker to re-list.
+func TestStatusDoesNotNudgeForKnownKeys(t *testing.T) {
+	jobs := metrics.NewJobLog(10)
+	jobs.Upsert(metrics.Job{Key: "done.log", Status: "scrubbed", Timestamp: time.Now()})
+	arc := newArchive()
+	arc.put("input", "queued.log", []byte("x"), time.Now())
+
+	var nudged int
+	h := newTestServerQ(jobs, arc, fakeQueue{pos: 1, depth: 2, ok: true}, func() { nudged++ })
+
+	getJSON(t, h, "/api/status?key=done.log")   // terminal
+	getJSON(t, h, "/api/status?key=queued.log") // queued
+	if nudged != 0 {
+		t.Errorf("nudged %d times for known keys, want 0", nudged)
+	}
+}
+
+// TestStatusUnknownKeyStillReportsUnknown checks the nudge did not swallow the
+// "we have lost track of this" answer that stops the UI polling forever.
+func TestStatusUnknownKeyStillReportsUnknown(t *testing.T) {
+	var nudged int
+	h := newTestServerQ(metrics.NewJobLog(10), newArchive(), fakeQueue{ok: false}, func() { nudged++ })
+
+	_, body := getJSON(t, h, "/api/status?key=ghost.log")
+	if body["status"] != "unknown" {
+		t.Errorf("status = %v, want unknown", body["status"])
+	}
+	if nudged != 0 {
+		t.Errorf("nudged %d times for a key with no object, want 0", nudged)
+	}
+}
+
+func TestQueueEndpoint(t *testing.T) {
+	q := fakeQueue{depth: 3, inflight: []string{"running.log"}, pending: []string{"a.log", "b.log"}}
+	h := newTestServerQ(metrics.NewJobLog(10), newArchive(), q, nil)
+
+	code, body := getJSON(t, h, "/api/queue")
+	if code != 200 {
+		t.Fatalf("status = %d, want 200", code)
+	}
+	if got := body["depth"]; got != float64(3) {
+		t.Errorf("depth = %v, want 3", got)
+	}
+	inflight, _ := body["inflight"].([]any)
+	if len(inflight) != 1 || inflight[0] != "running.log" {
+		t.Errorf("inflight = %v, want [running.log]", body["inflight"])
+	}
+	pending, _ := body["pending"].([]any)
+	if len(pending) != 2 {
+		t.Errorf("pending = %v, want 2 entries", body["pending"])
+	}
+}
+
+func TestQueueEndpointWithoutQueue(t *testing.T) {
+	h := newTestServer(metrics.NewJobLog(10), newArchive())
+	code, body := getJSON(t, h, "/api/queue")
+	if code != 200 || body["depth"] != float64(0) {
+		t.Errorf("code=%d body=%v, want 200 with depth 0", code, body)
 	}
 }

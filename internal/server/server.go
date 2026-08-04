@@ -42,14 +42,33 @@ type Archive interface {
 	Stat(ctx context.Context, bucket, key string) (store.Object, bool, error)
 }
 
+// QueueView is the read-only view of the scrub queue the API needs. It is declared
+// here rather than imported so the server keeps no dependency on the worker.
+type QueueView interface {
+	// Position reports a key's 1-based place in line and the queue's depth. ok is
+	// false for a key that is already being scrubbed or is not queued at all — the
+	// job log owns those, because it carries live per-file progress.
+	Position(key string) (pos, depth int, ok bool)
+	// Snapshot returns the in-flight keys and up to limit pending keys, in order.
+	Snapshot(limit int) (inflight, pending []string)
+	Depth() int
+}
+
 // Deps are the server's dependencies.
 type Deps struct {
-	Policies      *policy.Registry
-	Jobs          *metrics.JobLog
-	Prom          *prometheus.Registry
-	Ready         func() bool
-	Presigner     Presigner
-	Archive       Archive
+	Policies  *policy.Registry
+	Jobs      *metrics.JobLog
+	Prom      *prometheus.Registry
+	Ready     func() bool
+	Presigner Presigner
+	Archive   Archive
+	// Queue answers "where in line is this key?" from memory. Optional: when nil
+	// the status endpoint behaves exactly as it did before the queue existed.
+	Queue QueueView
+	// Nudge tells the worker that new work may have landed, so an object uploaded
+	// moments ago is discovered on the next second rather than the next poll
+	// interval. Optional; must be non-blocking and safe from any goroutine.
+	Nudge         func()
 	DefaultPolicy string // policy shown/edited in the UI
 	AllowEdit     bool   // permit PUT /api/policy from the UI
 	InputBucket   string
@@ -64,6 +83,10 @@ type Deps struct {
 // the API also consults storage. It bounds how long a client can wait on a
 // record whose worker died or is re-processing the same object in a loop.
 const staleAfter = 30 * time.Second
+
+// queueSnapshotMax caps how many pending keys /api/queue lists, so an operator
+// poking at a large backlog cannot pull a megabyte of key names.
+const queueSnapshotMax = 50
 
 // Server holds the dependencies for the endpoints.
 type Server struct{ d Deps }
@@ -95,6 +118,7 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("/api/downloads", s.apiDownload)
 	mux.HandleFunc("/api/history", s.apiHistory)
 	mux.HandleFunc("/api/report", s.apiReport)
+	mux.HandleFunc("/api/queue", s.apiQueue)
 	// Static front page.
 	mux.HandleFunc("/", s.index)
 	return mux
@@ -196,6 +220,22 @@ func (s *Server) apiStatus(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, jobStatusPayload(j))
 		return
 	}
+
+	// A queued object is answered from the queue, before any storage access. This
+	// is both the only place the real position is known and a load guard: a queued
+	// key has no digest yet, so letting it fall through would cost two failed
+	// object reads per client poll — with a full queue and second-scale polling
+	// that is dozens of pointless MinIO round-trips per second for the whole drain.
+	// It is checked before the freshness test below because a key still waiting in
+	// line has not been processed in this process's lifetime, so any non-terminal
+	// job record for it belongs to an earlier attempt.
+	if s.d.Queue != nil {
+		if pos, depth, ok := s.d.Queue.Position(key); ok {
+			writeJSON(w, queuedPayload(pos, depth))
+			return
+		}
+	}
+
 	// A job this process is actively working on answers from memory: it has live
 	// progress and storage has nothing yet. Consulting storage on every poll would
 	// mean a failed object read per client per second for the whole run.
@@ -228,7 +268,43 @@ func (s *Server) apiStatus(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 	}
-	writeJSON(w, map[string]any{"status": "processing", "phase": "queued"})
+
+	// The object is sitting in the input bucket and nothing knows about it yet, so
+	// the worker has not listed since it landed. This request is a reliable signal
+	// that new work exists — the browser starts polling the moment its upload
+	// completes — which is what keeps a single upload into an idle bucket from
+	// waiting out a whole poll interval. The worker coalesces and rate-limits these.
+	if s.d.Nudge != nil {
+		s.d.Nudge()
+	}
+	writeJSON(w, queuedPayload(0, 0))
+}
+
+// queuedPayload renders an object that is waiting its turn. Position and depth are
+// omitted when the queue cannot place the key, so the UI falls back to a plain
+// "Queued…" rather than rendering a meaningless "0 of 0".
+func queuedPayload(pos, depth int) map[string]any {
+	m := map[string]any{"status": "processing", "phase": "queued", "files_done": 0}
+	if pos > 0 {
+		m["queue_position"] = pos
+		m["queue_depth"] = depth
+	}
+	return m
+}
+
+// apiQueue reports the current queue for operators. Keys only — no object contents
+// and no policy detail.
+func (s *Server) apiQueue(w http.ResponseWriter, r *http.Request) {
+	if s.d.Queue == nil {
+		writeJSON(w, map[string]any{"depth": 0, "inflight": []string{}, "pending": []string{}})
+		return
+	}
+	inflight, pending := s.d.Queue.Snapshot(queueSnapshotMax)
+	writeJSON(w, map[string]any{
+		"depth":    s.d.Queue.Depth(),
+		"inflight": inflight,
+		"pending":  pending,
+	})
 }
 
 // digestFor fetches the compact durable record for an input key.

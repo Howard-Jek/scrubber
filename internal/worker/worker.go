@@ -2,6 +2,14 @@
 // each new object with its resolved policy, write the scrubbed bundle + report to
 // the output/reports buckets, and mark the input processed. Every object is
 // isolated — one failure is recorded and skipped, never crashing the loop.
+//
+// Scheduling is split in two. A producer lists the bucket on a ticker and hands the
+// eligible objects to an arrival-ordered queue; a single consumer takes them one at
+// a time. That serialization is deliberate: the pod has one CPU and a memory budget
+// sized for one object, so running several scrubs at once trades throughput for
+// nothing and pushes resident memory toward the container limit. The poll interval
+// governs how quickly *new* work is discovered, not how fast the queue drains — the
+// consumer takes the next object the instant it finishes one.
 package worker
 
 import (
@@ -20,6 +28,7 @@ import (
 	"github.com/howard/scrubber/internal/metrics"
 	"github.com/howard/scrubber/internal/pipeline"
 	"github.com/howard/scrubber/internal/policy"
+	"github.com/howard/scrubber/internal/queue"
 	"github.com/howard/scrubber/internal/report"
 	"github.com/howard/scrubber/internal/store"
 )
@@ -34,15 +43,28 @@ const (
 
 // Config configures the worker loop.
 type Config struct {
-	InputBucket   string
-	OutputBucket  string
-	ReportsBucket string
-	InputPrefix   string
+	InputBucket     string
+	OutputBucket    string
+	ReportsBucket   string
+	InputPrefix     string
 	ProcessedPrefix string // where moved inputs land (default "processed/")
-	Action        ProcessedAction
-	PollInterval  time.Duration
-	Workers       int
+	Action          ProcessedAction
+	// PollInterval is how often the input bucket is listed for *new* work. It does
+	// not bound the drain rate: the consumer takes the next queued object as soon
+	// as it finishes one.
+	PollInterval time.Duration
+	// Workers is retained for configuration compatibility and is clamped to 1.
+	// Objects are processed one at a time, in arrival order; a higher value would
+	// restore exactly the contention this queue exists to remove.
+	Workers int
+	// QueueMax bounds the in-memory pending set. Anything beyond it is still in the
+	// bucket and is picked up by a later poll.
+	QueueMax       int
 	MaxObjectBytes int64
+	// FinalizeGrace bounds the writes that persist a finished object's result when
+	// the process is already shutting down. Keep it inside the pod's
+	// terminationGracePeriodSeconds.
+	FinalizeGrace time.Duration
 	RedactReports bool
 	ScrubNames    bool // also scrub archive member names/paths and the output object key
 	Limits        pipeline.Limits
@@ -55,14 +77,20 @@ const termsSuffix = ".terms.json"
 // the reports bucket.
 const reportSuffix = report.ObjectSuffix
 
-// Worker ties together the store, policy registry, metrics and config.
+// Worker ties together the store, policy registry, metrics, queue and config.
 type Worker struct {
 	store    store.ObjectStore
 	policies *policy.Registry
 	metrics  *metrics.Metrics
 	jobs     *metrics.JobLog
+	q        *queue.Queue
 	cfg      Config
 	log      *slog.Logger
+
+	// nudge asks the producer to list immediately instead of waiting out the
+	// ticker. Buffered to 1 and never blocking, so it is safe to signal from an
+	// HTTP handler on every client poll.
+	nudge chan struct{}
 
 	// deferUntil holds back objects whose finalization failed. Without it a key
 	// that cannot be moved out of the input bucket is re-scrubbed on every poll
@@ -95,66 +123,219 @@ func New(s store.ObjectStore, p *policy.Registry, m *metrics.Metrics, jl *metric
 	if cfg.ProcessedPrefix == "" {
 		cfg.ProcessedPrefix = "processed/"
 	}
-	if cfg.Workers <= 0 {
-		cfg.Workers = 4
+	// Clamped rather than defaulted. Honouring a larger value would let a single
+	// config line reintroduce concurrent scrubs behind a queue that claims to have
+	// removed them, and the pod's memory budget only covers one object.
+	if cfg.Workers != 1 {
+		if cfg.Workers > 1 {
+			log.Warn("WORKERS is clamped to 1: objects are scrubbed one at a time in arrival order",
+				"requested", cfg.Workers)
+		}
+		cfg.Workers = 1
 	}
 	if cfg.MaxObjectBytes <= 0 {
 		cfg.MaxObjectBytes = 512 << 20 // never 0/unbounded: the read cap prevents OOM
 	}
+	if cfg.FinalizeGrace <= 0 {
+		cfg.FinalizeGrace = 15 * time.Second
+	}
 	return &Worker{
 		store: s, policies: p, metrics: m, jobs: jl, cfg: cfg, log: log,
+		q:          queue.New(cfg.QueueMax),
+		nudge:      make(chan struct{}, 1),
 		deferUntil: map[string]time.Time{},
 		attempts:   map[string]int{},
 	}
 }
 
-// Run polls until ctx is cancelled.
+// Queue exposes the pending set (used for metrics gauges).
+func (w *Worker) Queue() *queue.Queue { return w.q }
+
+// Nudge asks the producer to list the input bucket now rather than at the next
+// tick. Non-blocking and coalescing, so an HTTP handler can call it freely.
+//
+// This is what keeps a single upload into an empty bucket from waiting out a whole
+// poll interval: the browser starts polling for status the moment its PUT lands,
+// and that first poll is a reliable "new work exists" signal.
+func (w *Worker) Nudge() {
+	select {
+	case w.nudge <- struct{}{}:
+	default:
+	}
+}
+
+// Position reports a key's 1-based place in the queue and the queue's depth. ok is
+// false unless the key is waiting — an object already being scrubbed is reported
+// through the job log, which has live per-file progress the queue does not.
+//
+// Position, Depth and Snapshot together satisfy the API's queue view. They live on
+// the Worker rather than being the queue's own methods so the boolean the HTTP layer
+// wants does not flatten queue.State, which the queue's own tests rely on.
+func (w *Worker) Position(key string) (pos, depth int, ok bool) {
+	pos, depth, state := w.q.Position(key)
+	return pos, depth, state == queue.StateQueued
+}
+
+// Depth is the number of objects waiting plus the one in flight.
+func (w *Worker) Depth() int { return w.q.Depth() }
+
+// Snapshot returns the in-flight keys and up to limit pending keys, in queue order.
+func (w *Worker) Snapshot(limit int) (inflight, pending []string) { return w.q.Snapshot(limit) }
+
+// Run starts the producer and the single consumer and returns once both have
+// stopped, which happens after ctx is cancelled. Callers should wait for it during
+// shutdown so the process does not exit while an object is mid-flight.
 func (w *Worker) Run(ctx context.Context) {
+	var wg sync.WaitGroup
+	wg.Add(2)
+	go func() { defer wg.Done(); w.discover(ctx) }()
+	go func() { defer wg.Done(); w.consume(ctx) }()
+	wg.Wait()
+	w.log.Info("worker stopped")
+}
+
+// minListInterval floors how often a nudge can trigger a listing. Without it, every
+// browser polling /api/status for an undiscovered key would cause its own LIST.
+const minListInterval = time.Second
+
+// discover is the producer: list the input bucket, filter it, and hand the result to
+// the queue. It runs on a ticker and on demand via Nudge.
+func (w *Worker) discover(ctx context.Context) {
 	ticker := time.NewTicker(w.cfg.PollInterval)
 	defer ticker.Stop()
-	w.pollOnce(ctx) // process immediately on startup
+
+	var last time.Time
+	list := func(reason string) {
+		if time.Since(last) < minListInterval {
+			return
+		}
+		last = time.Now()
+		w.discoverOnce(ctx, reason)
+	}
+
+	list("startup")
 	for {
 		select {
 		case <-ctx.Done():
-			w.log.Info("worker stopping")
+			w.log.Info("worker discovery stopping")
 			return
 		case <-ticker.C:
-			w.pollOnce(ctx)
+			list("poll")
+		case <-w.nudge:
+			list("nudge")
 		}
 	}
 }
 
-// pollOnce lists the input bucket and processes each eligible object with a
-// bounded pool of workers.
-func (w *Worker) pollOnce(ctx context.Context) {
+// discoverOnce lists the input bucket once and syncs the queue to it.
+func (w *Worker) discoverOnce(ctx context.Context, reason string) {
 	objs, err := w.store.List(ctx, w.cfg.InputBucket, w.cfg.InputPrefix)
 	if err != nil {
-		w.log.Error("list input bucket", "err", err)
+		if ctx.Err() == nil {
+			w.log.Error("list input bucket", "err", err)
+		}
 		return
 	}
-	sem := make(chan struct{}, w.cfg.Workers)
-	var wg sync.WaitGroup
+
+	now := time.Now()
+	present := make(map[string]struct{}, len(objs))
+	items := make([]queue.Item, 0, len(objs))
 	for _, o := range objs {
-		if !w.eligible(o) {
+		present[o.Key] = struct{}{}
+		if !w.eligible(o, now) {
 			continue
 		}
-		if ctx.Err() != nil {
-			break
-		}
-		obj := o
-		sem <- struct{}{}
-		wg.Add(1)
-		go func() {
-			defer wg.Done()
-			defer func() { <-sem }()
-			w.processObject(ctx, obj)
-		}()
+		items = append(items, queue.Item{Key: o.Key, Size: o.Size, At: w.orderKey(o, now)})
 	}
-	wg.Wait()
+	w.sweepDeferrals(present)
+
+	if dropped := w.q.Sync(items); dropped > 0 {
+		// Never let a capped queue read as "everything is queued": the dropped keys
+		// are still in the bucket and will be picked up, but an operator watching
+		// depth needs to know the number is a floor.
+		w.log.Warn("input backlog exceeds the queue cap; the remainder is picked up on a later poll",
+			"queued", w.q.Depth(), "deferred_to_next_poll", dropped)
+	}
+	w.log.Debug("discovered input objects", "reason", reason, "listed", len(objs), "queued", w.q.Depth())
+}
+
+// orderKey returns the value the queue sorts on.
+//
+// Normally that is the object's arrival time. For a key being retried after a failed
+// finalize it is the moment the backoff expires instead. Using LastModified for a
+// retry would sort it to the *head* of the queue — its upload is by definition the
+// oldest still in the bucket — so one object that can never be moved out would
+// re-scrub itself ahead of everyone else on every backoff expiry, forever.
+func (w *Worker) orderKey(o store.Object, now time.Time) time.Time {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	if w.attempts[o.Key] > 0 {
+		if until, held := w.deferUntil[o.Key]; held {
+			return until
+		}
+		return now
+	}
+	return o.LastModified
+}
+
+// sweepDeferrals drops backoff state for keys that are no longer in the bucket.
+// Without it the maps grow for the life of the process, and a key that reappears
+// later would inherit a stale attempt count and be ordered as a retry.
+func (w *Worker) sweepDeferrals(present map[string]struct{}) {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	for k := range w.deferUntil {
+		if _, ok := present[k]; !ok {
+			delete(w.deferUntil, k)
+			delete(w.attempts, k)
+		}
+	}
+	for k := range w.attempts {
+		if _, ok := present[k]; !ok {
+			delete(w.attempts, k)
+		}
+	}
+}
+
+// consume is the single consumer: take the head of the queue, scrub it to
+// completion, repeat. On cancellation it stops taking new work, which is what keeps
+// the process from starting a minute-long object moments before it is killed.
+func (w *Worker) consume(ctx context.Context) {
+	for {
+		it, ok := w.q.Next(ctx)
+		if !ok {
+			w.log.Info("worker consumer stopping")
+			return
+		}
+		w.handle(ctx, it)
+	}
+}
+
+// handle processes one queued item and releases its queue slot.
+func (w *Worker) handle(ctx context.Context, it queue.Item) {
+	defer w.q.Done(it.Key)
+	w.metrics.QueueWait.Observe(metrics.SinceClamped(it.At).Seconds())
+	w.processObject(ctx, store.Object{Key: it.Key, Size: it.Size, LastModified: it.At})
+	w.metrics.Latency.Observe(metrics.SinceClamped(it.At).Seconds())
+}
+
+// runOnce lists the input bucket and drains the queue synchronously.
+//
+// Run does not use it: it is the seam that lets tests exercise discovery and
+// execution together, deterministically, without racing the ticker.
+func (w *Worker) runOnce(ctx context.Context) {
+	w.discoverOnce(ctx, "once")
+	for {
+		it, ok := w.q.TryNext()
+		if !ok {
+			return
+		}
+		w.handle(ctx, it)
+	}
 }
 
 // eligible filters out override sidecar files and already-processed keys.
-func (w *Worker) eligible(o store.Object) bool {
+func (w *Worker) eligible(o store.Object, now time.Time) bool {
 	if strings.HasSuffix(o.Key, termsSuffix) {
 		return false // sidecar, consumed alongside its bundle
 	}
@@ -163,7 +344,7 @@ func (w *Worker) eligible(o store.Object) bool {
 	}
 	w.mu.Lock()
 	defer w.mu.Unlock()
-	if until, held := w.deferUntil[o.Key]; held && time.Now().Before(until) {
+	if until, held := w.deferUntil[o.Key]; held && now.Before(until) {
 		return false // finalization failed recently; wait out the backoff
 	}
 	// Size is enforced in processObject via a bounded read (GetLimited), so an
@@ -320,6 +501,19 @@ func (w *Worker) processObject(ctx context.Context, o store.Object) {
 	job.Phase = "writing"
 	job.FilesDone = filesDone
 	w.jobs.Upsert(job)
+
+	// The scrub is done; only bookkeeping remains. If the process is already
+	// shutting down, finish that bookkeeping on a detached context rather than
+	// letting the cancellation throw away work that is complete — otherwise a
+	// SIGTERM landing here costs the whole object, which has to be scrubbed again
+	// after the restart. Bounded so it cannot outlive the pod's grace period.
+	if ctx.Err() != nil {
+		var cancel context.CancelFunc
+		ctx, cancel = context.WithTimeout(context.WithoutCancel(ctx), w.cfg.FinalizeGrace)
+		defer cancel()
+		w.log.Info("shutting down mid-object; persisting the finished result",
+			"key", o.Key, "grace", w.cfg.FinalizeGrace)
+	}
 
 	// Write scrubbed output under the (possibly scrubbed) key.
 	if err := w.store.Put(ctx, w.cfg.OutputBucket, outKey, out, ""); err != nil {
