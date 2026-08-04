@@ -65,6 +65,9 @@ type Config struct {
 	// the process is already shutting down. Keep it inside the pod's
 	// terminationGracePeriodSeconds.
 	FinalizeGrace time.Duration
+	// Audit is how much per-match detail the stored report retains. See
+	// ParseAuditLevel: this is a memory setting as much as a disclosure one.
+	Audit         report.AuditLevel
 	RedactReports bool
 	ScrubNames    bool // also scrub archive member names/paths and the output object key
 	Limits        pipeline.Limits
@@ -467,7 +470,7 @@ func (w *Worker) processObject(ctx context.Context, o store.Object) {
 	}
 	job.OutputKey = outKey
 
-	rep := report.New(o.Key, path.Join(w.cfg.OutputBucket, outKey), auditLevel(w.cfg.RedactReports), w.cfg.RedactReports, "scrubber")
+	rep := report.New(o.Key, path.Join(w.cfg.OutputBucket, outKey), w.cfg.Audit, w.cfg.RedactReports, "scrubber")
 	rep.InputKey = o.Key
 	rep.OutputKey = outKey
 	rep.StartedAt = start
@@ -601,8 +604,10 @@ func (w *Worker) finish(ctx context.Context, key string) error {
 	}
 }
 
-func auditLevel(redact bool) report.AuditLevel {
-	// Reports always keep per-match locations; redaction hashes the original value.
-	_ = redact
-	return report.AuditFull
-}
+// Audit detail is configured through report.ParseAuditLevel (shared with the CLI's
+// --audit flag) and carried on Config.Audit. The service defaults to counts rather
+// than full: full retains every match's original value and replacement, so report
+// memory grows with match count rather than input size, and MAX_EXPAND_BYTES does
+// not bound it — a small, repetitive log can hit millions of terms. Counts keeps the
+// rule and location, which is what an operator needs to verify a scrub, without
+// holding the matched text.

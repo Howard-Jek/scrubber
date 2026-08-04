@@ -46,23 +46,46 @@ data:
   # at the same instant -- every member's scrubbed output alongside its input, the
   # repacked archive, and heap the Go GC has not returned yet.
   #
-  # Measured with a match-dense .tar.gz, GOMEMLIMIT 1600MiB:
-  #     241Mi budget drawn  ->  1587Mi peak RSS
-  #     407Mi budget drawn  ->  1889Mi peak RSS   (92% of a 2Gi limit)
-  # i.e. roughly 4-6x the budget. MAX_EXPAND_BYTES was 512Mi there and that does NOT
-  # fit a 2Gi pod: a perfectly legal object came within ~160Mi of the limit.
+  # The multiplier is not a constant: it depends on the SHAPE of the object, not just
+  # its size. `go test ./internal/pipeline -run TestMemoryMatrix` measures peak heap
+  # across container formats, member counts, match densities and compressibility.
+  # Worst is NOT the few-large-members bundle most people reach for when testing by
+  # hand -- it is many *tiny* members in a .tar.gz, where per-member overhead
+  # dominates:
   #
-  # THE VALUES BELOW ARE MEASURED, NOT ESTIMATED. With MAX_EXPAND_BYTES=256Mi and
-  # GOMEMLIMIT=1200MiB, an object drawing the full budget scrubbed cleanly (0
-  # passthrough) at a peak of 1394Mi -- 68% of this 2Gi limit, ~650Mi of headroom.
+  #     targz / 20000 tiny members / dense    11.6x content   <- worst
+  #     targz / 8 large members / dense        8.3x
+  #     targz / sparse / incompressible        6.0x
+  #     bare tar / dense                       4.7x
+  #     zip / dense                            4.4x
   #
-  # Size limits.memory against ~4.5x (MAX_OBJECT_BYTES + MAX_EXPAND_BYTES), not
-  # against the sum itself. The service logs both budget_bytes and est_peak_rss_bytes
+  # Measured end to end on that worst shape (./scripts/memory-matrix.sh), all with the
+  # same 3.8M-match fixture:
+  #
+  #     512Mi cap                    ->  1889Mi peak RSS   (92% of 2Gi -- shipped value, unsafe)
+  #     192Mi cap, 163Mi drawn       ->  1244Mi            (61%)
+  #     160Mi cap, 152Mi drawn       ->  1390Mi            (68%) -- before the report was bounded
+  #     160Mi cap, 152Mi drawn       ->   775Mi            (38%) -- CURRENT
+  #
+  # The last two rows are the same workload. The 615Mi difference is entirely the
+  # report: it retained every one of those 3.8M matches, which no expansion cap could
+  # touch. See report.maxMatchesPerReport.
+  #
+  # Note the headroom that leaves. 775Mi against a 60% target of 1228Mi means this cap
+  # could be raised — roughly 224Mi looks reachable — but do not do it on arithmetic
+  # alone. Re-run ./scripts/memory-matrix.sh with the new value and let it decide.
+  #
+  # Size limits.memory against MAX_OBJECT_BYTES + ~5x MAX_EXPAND_BYTES, not against
+  # the plain sum. The service logs both budget_bytes and est_peak_rss_bytes
   # at startup -- check est_peak_rss_bytes against limits.memory, not budget_bytes.
-  # (On these values it reads 1440Mi vs the 1394Mi measured, so it errs high.)
   #
-  # Raising MAX_EXPAND_BYTES back to 512Mi needs limits.memory 4Gi and GOMEMLIMIT
-  # ~3000MiB. If this pod is fixed at 2Gi, do NOT raise it -- see the 1889Mi row.
+  # Verify any change with ./scripts/memory-matrix.sh, which runs the worst shape end
+  # to end and fails if peak RSS exceeds 60% of the limit OR if the object comes back
+  # with a passthrough (a cap set too low stops bounding memory and starts silently
+  # emitting unscrubbed files instead).
+  #
+  # Raising MAX_EXPAND_BYTES needs limits.memory raised with it. If this pod is fixed
+  # at 2Gi, do NOT raise it.
   WORKERS: "1"                    # queue concurrency. Kept for config compatibility
                                   # and CLAMPED to 1 -- a higher value is ignored
                                   # (with a warning) because concurrent scrubs on a
@@ -78,19 +101,33 @@ data:
                                   # then has to be redone after the restart. Keep it
                                   # inside terminationGracePeriodSeconds below.
   MAX_OBJECT_BYTES: "67108864"    # 64Mi compressed input; larger objects are
-                                  # skipped without being downloaded whole.
-  MAX_EXPAND_BYTES: "268435456"   # 256Mi cumulative decompressed bytes per object.
+                                  # skipped without being downloaded whole and
+                                  # counted in scrubber_objects_total{status=
+                                  # "too_large"}. Watch that counter: it is how you
+                                  # find out real uploads are being turned away.
+  MAX_EXPAND_BYTES: "167772160"   # 160Mi cumulative decompressed bytes per object.
                                   # Enforced *while* reading, so this is a real
                                   # budget rather than a ratio heuristic -- but see
                                   # the memory note above: it bounds bytes READ, not
-                                  # resident memory, which runs ~4-6x higher.
-                                  # Lowered from 512Mi, which measured 1889Mi peak
-                                  # RSS against this 2Gi limit.
+                                  # resident memory, which runs ~5x higher on the
+                                  # worst shape. Lowered from 512Mi, which does not
+                                  # fit this pod.
                                   # NOTE: a .tar.gz draws on this budget twice --
                                   # once for the decompressed tar, once for the
                                   # member bodies copied out of it (they really
                                   # are two copies in memory). Effective capacity
-                                  # for a tar.gz is therefore ~128Mi of content.
+                                  # for a tar.gz is therefore ~80Mi of content.
+                                  #
+                                  # THE PRACTICAL CEILING: with these values a
+                                  # bundle above roughly 80Mi of expanded content is
+                                  # rejected. Raising the cap buys some of that back
+                                  # (see the headroom note above), but not an order
+                                  # of magnitude: the pipeline holds the input, the
+                                  # decompressed container, every member body, every
+                                  # scrubbed body and the repacked archive at once,
+                                  # so a ~500Mi bundle cannot fit a 2Gi pod at any
+                                  # cap. That needs members spilled to disk (/work is
+                                  # already mounted for exactly this kind of use).
   SCRUB_FILENAMES: "true"         # also scrub archive member names/paths + output key
   # Reports live in an internal bucket for operators to verify the scrub, so they
   # show the actual original values by default. Set "true" to store salted hashes
@@ -110,11 +147,12 @@ data:
   # rather than being OOM-killed. Keep this below limits.memory.
   #
   # This is a soft target the GC grows the heap *toward*, so it sets the steady-state
-  # RSS as much as it caps it: measured runs settled just under the previous 1600MiB
-  # regardless of how much of the expansion budget the object actually used. At
-  # 1600MiB against a 2Gi limit there was only ~450Mi of slack for non-heap memory,
-  # which is not enough margin. 1200MiB leaves ~850Mi.
-  GOMEMLIMIT: "1200MiB"
+  # RSS as much as it caps it: the same object measured 1587Mi peak under a 1600MiB
+  # target and 1394Mi under a 1200MiB one. It only holds while the LIVE set fits
+  # underneath -- at MAX_EXPAND_BYTES=512Mi the live set exceeded 1600MiB, the GC
+  # could not keep up, and RSS overran to 1889Mi. Move it together with the expansion
+  # cap, never alone.
+  GOMEMLIMIT: "900MiB"
   # Web UI: browser uploads straight to MinIO via presigned URLs, so the browser
   # must be able to reach MinIO. Set these to MinIO's externally reachable host.
   # (MinIO also needs CORS allowing the scrubber Route origin.)

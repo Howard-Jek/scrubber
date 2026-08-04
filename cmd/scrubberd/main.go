@@ -8,6 +8,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"log/slog"
 	"net/http"
 	"os"
@@ -22,6 +23,7 @@ import (
 	"github.com/howard/scrubber/internal/metrics"
 	"github.com/howard/scrubber/internal/pipeline"
 	"github.com/howard/scrubber/internal/policy"
+	"github.com/howard/scrubber/internal/report"
 	"github.com/howard/scrubber/internal/server"
 	"github.com/howard/scrubber/internal/store"
 	"github.com/howard/scrubber/internal/worker"
@@ -98,6 +100,14 @@ func realMain(log *slog.Logger) error {
 	m := metrics.New(promReg)
 	jobs := metrics.NewJobLog(envInt("JOBS_HISTORY", 200))
 
+	// Fail fast on a bad AUDIT_LEVEL rather than silently picking a default: the
+	// setting governs how much sensitive matched text the stored report retains, so
+	// a typo quietly resolving to "full" is exactly the wrong failure mode.
+	audit, err := report.ParseAuditLevel(envDefault("AUDIT_LEVEL", "counts"))
+	if err != nil {
+		return fmt.Errorf("AUDIT_LEVEL: %w", err)
+	}
+
 	wcfg := worker.Config{
 		InputBucket:     inputBucket,
 		OutputBucket:    mustEnv("OUTPUT_BUCKET"),
@@ -114,16 +124,18 @@ func realMain(log *slog.Logger) error {
 		// with the README, which made the startup memory arithmetic unverifiable.
 		MaxObjectBytes: envInt64("MAX_OBJECT_BYTES", 64<<20),
 		FinalizeGrace:  envDuration("FINALIZE_GRACE", 15*time.Second),
+		Audit:          audit,
 		RedactReports:  envBool("REDACT_REPORTS", false),
 		ScrubNames:     envBool("SCRUB_FILENAMES", true),
 		Limits: pipeline.Limits{
 			MaxDepth: envInt("MAX_DEPTH", 16),
-			// 256Mi, not 512Mi. Measured: a match-dense .tar.gz drawing 407Mi of a
-			// 512Mi budget peaked at 1889Mi RSS — 92% of the 2Gi pod. The same shape
-			// drawing 241Mi peaked at 1587Mi. The expansion budget counts bytes read;
-			// resident memory is several times that, so a 512Mi budget does not fit
-			// the pod it was sized for.
-			MaxTotalBytes: envInt64("MAX_EXPAND_BYTES", 256<<20),
+			// 160Mi, not the 512Mi this shipped with. The expansion budget counts
+			// bytes read; resident memory runs several times that, and 512Mi measured
+			// 1889Mi peak RSS — 92% of the 2Gi pod it was supposedly sized for. At
+			// 160Mi the worst shape the memory matrix finds peaks at 775Mi (38%).
+			// See deploy/openshift-manifests.yaml for the full measurement table and
+			// scripts/memory-matrix.sh for how to re-derive it after any change.
+			MaxTotalBytes: envInt64("MAX_EXPAND_BYTES", 160<<20),
 			MaxMembers:    envInt("MAX_MEMBERS", 100000),
 		},
 	}
@@ -144,17 +156,25 @@ func realMain(log *slog.Logger) error {
 	//                   larger. The budget counts bytes read; resident memory also
 	//                   holds each member's scrubbed output, the repacked archive,
 	//                   and GC slack that Go does not return promptly. Measured at
-	//                   ~4.6x the budget drawn for a match-dense .tar.gz.
+	//                   ~5x the expansion budget on the worst shape the memory matrix
+	//                   finds: many tiny members in a .tar.gz, where per-member
+	//                   overhead dominates rather than per-byte cost.
 	//
 	// Size limits.memory against est_peak_rss, not against budget_bytes.
+	//
+	// The multiplier applies to the *expansion* budget only. The compressed input is
+	// resident once and does not get copied, scrubbed and repacked the way member
+	// bodies do, so folding it into the multiplied term would overstate the estimate
+	// by hundreds of MiB and push an operator toward a larger pod than they need.
 	budget := wcfg.MaxObjectBytes + wcfg.Limits.MaxTotalBytes
+	estPeak := wcfg.MaxObjectBytes + int64(float64(wcfg.Limits.MaxTotalBytes)*peakRSSFactor)
 	log.Info("resource limits",
 		"max_object_bytes", wcfg.MaxObjectBytes,
 		"max_expand_bytes", wcfg.Limits.MaxTotalBytes,
 		"queue_concurrency", 1,
 		"queue_max", wcfg.QueueMax,
 		"budget_bytes", budget,
-		"est_peak_rss_bytes", int64(float64(budget)*peakRSSFactor))
+		"est_peak_rss_bytes", estPeak)
 	wk := worker.New(st, reg, m, jobs, wcfg, log)
 	metrics.RegisterQueue(promReg,
 		func() float64 { return float64(wk.Queue().Depth()) },
@@ -239,10 +259,13 @@ const (
 	// decompressed out of it. Resident memory holds considerably more at the same
 	// instant: each archive member's scrubbed output alongside its input, the
 	// repacked archive being assembled, and heap the Go GC has not yet returned.
-	// Measured at ~4.6x on a match-dense .tar.gz (a 407MiB budget draw peaked at
-	// 1889MiB RSS), so this is rounded down slightly rather than up — it is an
-	// estimate to size a pod from, not a guarantee.
-	peakRSSFactor = 4.5
+	// Derived from the worst shape `go test ./internal/pipeline -run TestMemoryMatrix`
+	// finds — many tiny members in a .tar.gz — confirmed end to end by
+	// scripts/memory-matrix.sh: a 152MiB expansion draw peaked at 775MiB RSS, i.e.
+	// ~5.1x. Rounded up slightly, because an estimate an operator sizes a pod from
+	// should err high. It is an estimate, not a guarantee: re-run the script after
+	// changing any cap rather than trusting this number alone.
+	peakRSSFactor = 5.5
 )
 
 // cachedReady wraps a readiness check so concurrent probes share one in-flight

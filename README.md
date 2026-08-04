@@ -168,6 +168,20 @@ the (possibly nested) bundle:
 }
 ```
 
+**Match lists are capped; counts never are.** Every retained match holds its rule,
+original value and replacement, so the report grows with match *count* rather than
+input size — a 1 MiB log that hits a term on every line builds a report far larger
+than the file itself, and the expansion budget does not check it (that bounds bytes
+read, not the report assembled from them). So the itemised list is capped per file and
+across the whole report. When that bites, the entry carries `"matches_truncated": true`
+alongside an exact `"match_count"`, and `summary.total_matches` plus the by-rule and
+by-label breakdowns stay exact regardless. Truncation is always flagged: a short list
+that looked complete would invite the conclusion that a bundle was barely touched when
+it was in fact rewritten millions of times.
+
+The service defaults to `AUDIT_LEVEL=counts`, which keeps the rule and location for
+each retained match but not the matched text. The CLI still defaults to `--audit full`.
+
 Per-file `status` is one of `scrubbed`, `unchanged`, `binary-skipped`,
 `passthrough-error`, `unsupported-format`, or `guard-tripped`.
 
@@ -248,40 +262,65 @@ alongside a larger batch, and none of them compete for the pod's single CPU.
 is how you get OOM-killed.
 
 `MAX_OBJECT_BYTES + MAX_EXPAND_BYTES` bounds the bytes *read*: the compressed object
-plus everything decompressed out of it. Actual RSS holds considerably more at the
-same instant — each archive member's scrubbed output alongside its input, the
-repacked archive being assembled, and heap the Go GC has not yet returned. Measured
-with a match-dense `.tar.gz`:
+plus everything decompressed out of it. Actual RSS holds considerably more at the same
+instant — each archive member's scrubbed output alongside its input, the repacked
+archive being assembled, and heap the Go GC has not yet returned.
 
-| budget drawn | peak RSS | against a 2 GiB limit |
+**The multiplier depends on the shape of the object, not just its size.**
+`go test ./internal/pipeline -run TestMemoryMatrix` measures peak heap across
+container formats, member counts, match densities and compressibility. The worst case
+is not the few-large-members bundle most people reach for when testing by hand — it is
+**many tiny members in a `.tar.gz`**, where per-member overhead dominates:
+
+| shape | peak heap / content |
+| --- | --- |
+| `.tar.gz`, 20000 tiny members, dense matches | **11.6×** |
+| `.tar.gz`, 8 large members, dense | 8.3× |
+| `.tar.gz`, sparse matches, incompressible | 6.0× |
+| bare `.tar`, dense | 4.7× |
+| `.zip`, dense | 4.4× |
+
+`scripts/memory-matrix.sh` then confirms that worst shape end to end against real
+RSS — which is what the kubelet OOM-kills on, and what the heap figures above cannot
+tell you. Measured there, all on the same 3.8M-match fixture:
+
+| config | peak RSS | of 2 GiB |
 | --- | --- | --- |
-| 241 MiB | 1587 MiB | 78% |
-| 407 MiB | 1889 MiB | **92%** |
+| `MAX_EXPAND_BYTES=512Mi` (the value this shipped with) | 1889 MiB | **92%** |
+| `192Mi` | 1244 MiB | 61% |
+| `160Mi`, before report memory was bounded | 1390 MiB | 68% |
+| **`160Mi` + `GOMEMLIMIT=900MiB` — shipped** | **775 MiB** | **38%** |
 
-That is roughly **4–6× the budget**. Note the second row: with `MAX_EXPAND_BYTES` at
-512 MiB a perfectly legal object came within ~160 MiB of the container limit.
+The last two rows are the same workload. The 615 MiB between them is entirely the
+run report, which retained every one of those 3.8M matches — see
+`report.maxMatchesPerReport`. No expansion cap could have touched it.
 
-**The shipped configuration is measured, not estimated.** With `MAX_EXPAND_BYTES` at
-256 MiB and `GOMEMLIMIT` at 1200 MiB, an object drawing the full budget scrubs
-cleanly (0 passthrough) at a peak of **1394 MiB — 68% of the 2 GiB limit, leaving
-~650 MiB of headroom**. That is the configuration in `deploy/openshift-manifests.yaml`.
+So size `resources.limits.memory` against `MAX_OBJECT_BYTES + ~5 × MAX_EXPAND_BYTES`,
+not against the plain sum. The service logs both `budget_bytes` and
+`est_peak_rss_bytes` at startup — compare `est_peak_rss_bytes` with the limit.
 
-So size `resources.limits.memory` against `~4.5 × (MAX_OBJECT_BYTES + MAX_EXPAND_BYTES)`,
-not against the sum. The service logs both `budget_bytes` and `est_peak_rss_bytes` at
-startup — compare `est_peak_rss_bytes` with the limit. On the shipped config that
-estimate reads 1440 MiB against a measured 1394 MiB, so it errs slightly high, which
-is the direction you want.
+`GOMEMLIMIT` is the lever that actually holds the ceiling. It is a soft target the GC
+grows the heap *toward*, so it sets steady-state RSS as much as it caps it: the same
+object peaked at 1587 MiB under a 1600 MiB target and 1394 MiB under 1200 MiB. It only
+holds while the *live* set fits beneath it — at `MAX_EXPAND_BYTES=512Mi` the live set
+exceeded 1600 MiB, the GC could not keep up, and RSS overran to 1889 MiB. Move both
+caps together, never one alone.
 
-`GOMEMLIMIT` is the lever that actually holds the ceiling, and it deserves care. It is
-a soft target the GC grows the heap *toward*, so it sets steady-state RSS as much as
-it caps it — the same object peaked at 1587 MiB under a 1600 MiB limit and 1394 MiB
-under a 1200 MiB one. It only holds while the *live* set fits beneath it: at
-`MAX_EXPAND_BYTES=512Mi` the live set exceeded 1600 MiB, the GC could not keep up, and
-RSS overran to 1889 MiB. Both caps have to move together.
+**Changing either cap means re-running `scripts/memory-matrix.sh`.** It fails if peak
+RSS exceeds 60% of the limit *or* if the object comes back with a passthrough — a cap
+set too low stops bounding memory and starts silently emitting unscrubbed files
+instead, which looks like a pass if you only watch RSS.
 
-Raising `MAX_EXPAND_BYTES` back to 512 MiB requires `limits.memory` of 4 GiB and
-`GOMEMLIMIT` around 3000 MiB. **If the pod is fixed at 2 GiB, do not raise it** — the
-measured overrun above is what happens.
+> **Capacity ceiling.** At the shipped caps a bundle above roughly 80 MiB of expanded
+> content is rejected as `skipped (too large)`. The 775 MiB measurement leaves real
+> headroom, so the cap can be raised (around 224 MiB looks reachable) — but derive it
+> from a run of the script, not from arithmetic. What no cap will fix is a bundle of a
+> few hundred MiB: the pipeline holds the input, the decompressed container, every
+> member body, every scrubbed body and the repacked archive at once, so that shape
+> does not fit a 2 GiB pod at any setting. Lifting it needs archive members spilled to
+> disk (`/work` is already mounted for exactly this kind of use) rather than a bigger
+> number here. Watch `scrubber_objects_total{status="too_large"}` to find out whether
+> real uploads are being turned away.
 
 `WORKERS` is retained for configuration compatibility but is **clamped to 1**; a
 higher value is ignored with a warning. Concurrent scrubs on a single CPU do not add
@@ -307,7 +346,8 @@ Resolution per object, highest precedence first:
 `REPORTS_BUCKET`, `INPUT_PREFIX`, `DEFAULT_POLICY`, `PREFIX_POLICY_MAP` (JSON),
 `PROCESSED_ACTION` (`move`|`delete`), `POLL_INTERVAL` (default `15s`; discovery only),
 `WORKERS` (clamped to 1), `QUEUE_MAX` (default `10000`), `FINALIZE_GRACE` (default `15s`),
-`MAX_OBJECT_BYTES` (default 64Mi), `MAX_EXPAND_BYTES` (default 256Mi),
+`MAX_OBJECT_BYTES` (default 64Mi), `MAX_EXPAND_BYTES` (default 160Mi),
+`AUDIT_LEVEL` (`full`|`counts`|`off`, default `counts`),
 `REDACT_REPORTS` (default `false`), `SCRUB_FILENAMES` (default `true`), `PORT` (default `8080`).
 
 **Filenames & paths** are scrubbed by default (`SCRUB_FILENAMES=true`): archive member
