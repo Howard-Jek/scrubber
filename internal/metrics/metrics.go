@@ -65,12 +65,33 @@ type Job struct {
 	Passthrough int `json:"passthrough"`
 	// PassthroughPaths names those files and why, for display.
 	PassthroughPaths []report.PassthroughNote `json:"passthrough_paths,omitempty"`
+
+	// FilesDone and CurrentFile give live progress while Status is "processing",
+	// so the UI can report what is actually happening instead of animating a bar
+	// on a timer.
+	FilesDone   int    `json:"files_done"`
+	CurrentFile string `json:"current_file,omitempty"`
+	// Phase is a coarse label for the current stage: "reading", "scrubbing",
+	// "writing". Empty once the job is finished.
+	Phase string `json:"phase,omitempty"`
 }
 
-// JobLog is a fixed-size ring buffer of recent jobs.
+// Done reports whether the job reached a terminal state.
+func (j Job) Done() bool {
+	return j.Status == "scrubbed" || j.Status == "error" || j.Status == "skipped"
+}
+
+// JobLog is a fixed-size ring of recent jobs, keyed by input object key so an
+// in-flight job can be updated in place as it progresses.
+//
+// This is a cache, not the record of truth: it is per-process and does not
+// survive a restart. The API falls back to object storage when a key is missing
+// here, which is what keeps a client from waiting forever on a job whose record
+// was lost.
 type JobLog struct {
 	mu   sync.Mutex
 	buf  []Job
+	idx  map[string]int // Key -> index into buf
 	size int
 }
 
@@ -79,16 +100,55 @@ func NewJobLog(size int) *JobLog {
 	if size <= 0 {
 		size = 100
 	}
-	return &JobLog{size: size}
+	return &JobLog{size: size, idx: map[string]int{}}
 }
 
 // Add appends a job, evicting the oldest when full.
 func (l *JobLog) Add(j Job) {
 	l.mu.Lock()
 	defer l.mu.Unlock()
+	l.appendLocked(j)
+}
+
+// Upsert replaces the entry for j.Key if present, otherwise appends. Used to
+// publish a "processing" record before work starts and refine it as the job
+// advances, so a client polling mid-flight sees real progress rather than an
+// indistinguishable "not found".
+func (l *JobLog) Upsert(j Job) {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	if i, ok := l.idx[j.Key]; ok {
+		l.buf[i] = j
+		return
+	}
+	l.appendLocked(j)
+}
+
+// Get returns the recorded job for key.
+func (l *JobLog) Get(key string) (Job, bool) {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	i, ok := l.idx[key]
+	if !ok {
+		return Job{}, false
+	}
+	return l.buf[i], true
+}
+
+func (l *JobLog) appendLocked(j Job) {
 	l.buf = append(l.buf, j)
 	if len(l.buf) > l.size {
 		l.buf = l.buf[len(l.buf)-l.size:]
+		l.reindexLocked()
+		return
+	}
+	l.idx[j.Key] = len(l.buf) - 1
+}
+
+func (l *JobLog) reindexLocked() {
+	l.idx = make(map[string]int, len(l.buf))
+	for i, j := range l.buf {
+		l.idx[j.Key] = i
 	}
 }
 

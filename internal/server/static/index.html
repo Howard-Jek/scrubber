@@ -100,6 +100,23 @@
 
   </div>
 </div>
+
+<div class="frame" style="margin-top:16px;">
+  <div style="display:flex; align-items:center; gap:10px; flex-wrap:wrap;">
+    <i class="ti ti-history" style="font-size:18px; color:var(--color-text-secondary);" aria-hidden="true"></i>
+    <div>
+      <div style="font-size:14px; font-weight:500;">Recent scrubs</div>
+      <div style="font-size:12px; color:var(--color-text-tertiary);">Read back from storage — survives a refresh</div>
+    </div>
+    <div style="margin-left:auto; display:flex; align-items:center; gap:8px;">
+      <label for="histN" style="font-size:12px; color:var(--color-text-secondary);">Show</label>
+      <input id="histN" type="number" min="1" step="1" value="10"
+        style="width:64px; font-family:inherit; font-size:13px; padding:6px 8px; border-radius:var(--border-radius-md); border:0.5px solid var(--color-border-secondary); background:var(--color-background-primary); color:var(--color-text-primary);" />
+      <button id="histRefresh" title="Refresh"><i class="ti ti-refresh" style="font-size:15px; vertical-align:-2px;" aria-hidden="true"></i></button>
+    </div>
+  </div>
+  <div id="history" style="margin-top:12px;"></div>
+</div>
 </div>
 
 <script>
@@ -178,12 +195,37 @@
         xhr.send(file);
       }).catch(function(){ fail('could not start upload'); });
 
+    // Poll until the server gives a terminal answer. Every non-terminal status is
+    // handled explicitly; anything unrecognised stops the loop rather than
+    // spinning forever, and network errors are retried a bounded number of times
+    // and then surfaced. The previous version treated "anything but scrubbed" as
+    // "keep waiting", so a lost record or a skipped object hung indefinitely.
+    var netErrs=0, MAX_NET_ERRS=8;
     function poll(key,creep){
       fetch('/api/status?key='+encodeURIComponent(key)).then(function(r){return r.json();}).then(function(s){
-        if(s.status==='scrubbed'){ setp(100); finish(s,key); }
-        else if(s.status==='error'){ fail(s.error||'processing error'); }
-        else { creep=Math.min(95,creep+4); setp(creep); if(isArch&&creep>75) st.textContent='Repacking…'; setTimeout(function(){poll(key,creep);},1200); }
-      }).catch(function(){ setTimeout(function(){poll(key,creep);},1500); });
+        netErrs=0;
+        if(s.status==='scrubbed'){ setp(100); finish(s,key); return; }
+        if(s.status==='error'){ fail(s.error||'processing error'); return; }
+        if(s.status==='skipped'){ fail(s.error||'skipped (too large to process)'); return; }
+        if(s.status==='unknown'){ fail(s.error||'no result recorded for this upload'); return; }
+        if(s.status!=='processing'){ fail('unexpected status: '+s.status); return; }
+
+        // Real progress when the server has it; fall back to a slow creep only
+        // while the object is still queued.
+        if(s.files_done>0){
+          creep=Math.max(creep,Math.min(95,60+Math.log(1+s.files_done)*8));
+          st.textContent=(s.phase==='writing'?'Writing… ':'Scrubbing… ')+s.files_done+' file'+(s.files_done===1?'':'s');
+          if(s.current_file) st.title=s.current_file;
+        } else {
+          creep=Math.min(95,creep+2);
+          st.textContent=s.phase==='queued'?'Queued…':(isArch?'Unpacking…':'Scrubbing…');
+        }
+        setp(creep);
+        setTimeout(function(){poll(key,creep);},1200);
+      }).catch(function(){
+        if(++netErrs>=MAX_NET_ERRS){ fail('lost contact with the service'); return; }
+        setTimeout(function(){poll(key,creep);},1500);
+      });
     }
 
     function finish(s,key){
@@ -227,11 +269,8 @@
         +'<div style="font-size:12px; color:var(--color-text-secondary); margin:12px 0 8px;">Replacements by rule</div>'
         +'<div style="display:flex; flex-wrap:wrap; gap:6px;">'+(chips||'<span style="font-size:12px;color:var(--color-text-tertiary)">no matches</span>')+'</div></div>';
       done.querySelector('.rp').onclick=function(){ var p=done.querySelector('.panel'); p.style.display=p.style.display==='block'?'none':'block'; };
-      done.querySelector('.dl').onclick=function(){
-        fetch('/api/downloads?key='+encodeURIComponent(key)).then(function(r){return r.json();}).then(function(d){
-          var a=document.createElement('a'); a.href=d.url; a.download=''; document.body.appendChild(a); a.click(); a.remove();
-        });
-      };
+      done.querySelector('.dl').onclick=function(){ download(key); };
+      loadHistory(); // the run is now durable — reflect it in the list
     }
   }
 
@@ -271,7 +310,78 @@
       editbtn.innerHTML='<i class="ti ti-x" style="font-size:14px; vertical-align:-2px; margin-right:5px;" aria-hidden="true"></i>Close editor'; applyPolicy(); });
     policyfile.value=''; };
 
+  // ---- history: the durable view, rebuilt from the reports bucket ----
+  var histEl=document.getElementById('history'), histN=document.getElementById('histN'),
+      histRefresh=document.getElementById('histRefresh');
+
+  function fmtBytes(n){
+    if(!n) return '0 B';
+    var u=['B','KB','MB','GB'], i=0;
+    while(n>=1024 && i<u.length-1){ n/=1024; i++; }
+    return (i?n.toFixed(1):n)+' '+u[i];
+  }
+  function fmtWhen(iso){
+    if(!iso) return '';
+    var d=new Date(iso); if(isNaN(d)) return '';
+    return d.toLocaleString();
+  }
+
+  function renderHistory(runs){
+    if(!runs || !runs.length){
+      histEl.innerHTML='<div style="font-size:12px; color:var(--color-text-tertiary); padding:8px 0;">Nothing scrubbed yet.</div>';
+      return;
+    }
+    histEl.innerHTML=runs.map(function(r){
+      var pt=r.passthrough||0;
+      var badge = r.status==='unreadable'
+        ? '<span style="font-size:11px; color:var(--color-text-danger);">report unreadable</span>'
+        : (pt>0
+          ? '<span style="font-size:11px; color:var(--color-text-warning); background:var(--color-background-warning); padding:2px 8px; border-radius:999px; white-space:nowrap;">'+pt+' not scrubbed</span>'
+          : '<span style="font-size:11px; color:var(--color-text-success); background:var(--color-background-success); padding:2px 8px; border-radius:999px; white-space:nowrap;">'+(r.matches||0)+' redacted</span>');
+      return '<div style="display:flex; align-items:center; gap:10px; padding:9px 0; border-top:0.5px solid var(--color-border-tertiary);">'
+        +'<i class="ti ti-file-check" style="font-size:17px; color:var(--color-text-tertiary);" aria-hidden="true"></i>'
+        +'<div style="min-width:0; flex:1;">'
+        +'<div style="font-family:var(--font-mono); font-size:12px; overflow:hidden; text-overflow:ellipsis; white-space:nowrap;">'+esc(r.key)+'</div>'
+        +'<div style="font-size:11px; color:var(--color-text-tertiary);">'+esc(fmtWhen(r.at))
+        +(r.bytes_in?' · '+fmtBytes(r.bytes_in)+' → '+fmtBytes(r.bytes_out):'')+'</div></div>'
+        +badge
+        +'<button class="hdl" data-key="'+esc(r.key)+'" title="Download scrubbed" style="padding:5px 9px;"><i class="ti ti-download" style="font-size:14px;" aria-hidden="true"></i></button>'
+        +'</div>';
+    }).join('');
+    histEl.querySelectorAll('.hdl').forEach(function(b){
+      b.onclick=function(){ download(b.getAttribute('data-key')); };
+    });
+  }
+
+  function download(key){
+    fetch('/api/downloads?key='+encodeURIComponent(key)).then(function(r){return r.json();}).then(function(d){
+      if(!d.url) return;
+      var a=document.createElement('a'); a.href=d.url; a.download=''; document.body.appendChild(a); a.click(); a.remove();
+    });
+  }
+
+  function loadHistory(){
+    var n=parseInt(histN.value,10);
+    if(!(n>0)){ n=10; histN.value=10; }
+    try{ localStorage.setItem('scrubber.historyN',String(n)); }catch(e){}
+    histEl.innerHTML='<div style="font-size:12px; color:var(--color-text-tertiary); padding:8px 0;">Loading…</div>';
+    fetch('/api/history?n='+n).then(function(r){return r.json();}).then(function(d){
+      if(d.max && n>d.max) histN.value=d.max;
+      renderHistory(d.runs);
+    }).catch(function(){
+      histEl.innerHTML='<div style="font-size:12px; color:var(--color-text-danger); padding:8px 0;">Could not load history.</div>';
+    });
+  }
+
+  try{
+    var savedN=localStorage.getItem('scrubber.historyN');
+    if(savedN) histN.value=savedN;
+  }catch(e){}
+  histRefresh.onclick=loadHistory;
+  histN.onchange=loadHistory;
+
   loadPolicy();
+  loadHistory();
 })();
 </script>
 </body>

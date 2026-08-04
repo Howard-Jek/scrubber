@@ -50,6 +50,10 @@ type Config struct {
 // termsSuffix marks a per-object override file: "<key>.terms.json".
 const termsSuffix = ".terms.json"
 
+// reportSuffix is appended to the *input* key to form the report object's key in
+// the reports bucket.
+const reportSuffix = report.ObjectSuffix
+
 // Worker ties together the store, policy registry, metrics and config.
 type Worker struct {
 	store    store.ObjectStore
@@ -144,8 +148,17 @@ func (w *Worker) processObject(ctx context.Context, o store.Object) {
 			return
 		}
 		recorded = true
-		w.jobs.Add(j)
+		w.jobs.Upsert(j)
 	}
+
+	// Publish the job as in-flight *before* any work. Previously the record was
+	// written last, after the output object had already been stored, so a client
+	// polling in that window — or after a restart that lost the record — saw
+	// "not found" and waited forever while the finished object sat in the bucket.
+	job.Status = "processing"
+	job.Phase = "reading"
+	w.jobs.Upsert(job)
+	w.log.Info("processing object", "key", o.Key, "size", o.Size)
 
 	// A panic in the pipeline must cost one object, not the whole service: without
 	// this the goroutine takes the process down, every in-flight upload is orphaned,
@@ -217,19 +230,55 @@ func (w *Worker) processObject(ctx context.Context, o store.Object) {
 	job.OutputKey = outKey
 
 	rep := report.New(o.Key, path.Join(w.cfg.OutputBucket, outKey), auditLevel(w.cfg.RedactReports), w.cfg.RedactReports, "scrubber")
+	rep.InputKey = o.Key
+	rep.OutputKey = outKey
+	rep.StartedAt = start
+
+	// Stream per-file progress: log every file as it is handled and keep the job
+	// record current so a polling client sees real movement through the bundle.
+	job.Phase = "scrubbing"
+	filesDone := 0
+	rep.OnFile(func(f report.FileEntry) {
+		filesDone++
+		w.log.Debug("scrubbed file", "key", o.Key, "path", f.Path, "status", f.Status,
+			"bytes_in", f.BytesIn, "bytes_out", f.BytesOut, "detail", f.Detail)
+		if f.Status != report.StatusScrubbed && f.Status != report.StatusUnchanged {
+			// Anything the pipeline could not fully handle is worth a line at info
+			// even when debug logging is off.
+			w.log.Info("file not scrubbed", "key", o.Key, "path", f.Path,
+				"status", f.Status, "detail", f.Detail)
+		}
+		j := job
+		j.FilesDone = filesDone
+		j.CurrentFile = f.Path
+		w.jobs.Upsert(j)
+	})
+
 	eng := &pipeline.Engine{Matcher: res.Matcher, Report: rep, Limits: w.cfg.Limits, ScrubNames: w.cfg.ScrubNames}
 	out := eng.Process(o.Key, data, 0)
+	rep.EndedAt = time.Now()
+	rep.BytesIn = len(data)
+	rep.BytesOut = len(out)
+
+	job.Phase = "writing"
+	job.FilesDone = filesDone
+	w.jobs.Upsert(job)
 
 	// Write scrubbed output under the (possibly scrubbed) key.
 	if err := w.store.Put(ctx, w.cfg.OutputBucket, outKey, out, ""); err != nil {
 		fail(fmt.Errorf("put output: %w", err))
 		return
 	}
-	// Write report (best-effort: a report failure must not lose the scrubbed output).
+	// Write the report under the *input* key. The client only ever knows the key
+	// it uploaded; keying reports by the (possibly scrubbed) output name made them
+	// unfindable from that side, which is why status could not be recovered from
+	// storage. The report itself records where the output landed.
 	if reportBytes, jerr := rep.JSON(); jerr == nil {
-		if err := w.store.Put(ctx, w.cfg.ReportsBucket, outKey+".report.json", reportBytes, "application/json"); err != nil {
+		if err := w.store.Put(ctx, w.cfg.ReportsBucket, o.Key+reportSuffix, reportBytes, "application/json"); err != nil {
 			w.log.Warn("put report", "key", o.Key, "err", err)
 		}
+	} else {
+		w.log.Warn("render report", "key", o.Key, "err", jerr)
 	}
 	// Mark input processed.
 	if err := w.finish(ctx, o.Key); err != nil {
@@ -250,6 +299,9 @@ func (w *Worker) processObject(ctx context.Context, o store.Object) {
 	w.metrics.Duration.Observe(time.Since(start).Seconds())
 
 	job.Status = "scrubbed"
+	job.Phase = ""
+	job.CurrentFile = ""
+	job.FilesDone = filesDone
 	job.Matches = sum.TotalMatches
 	job.BytesIn = len(data)
 	job.BytesOut = len(out)

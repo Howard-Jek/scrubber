@@ -13,9 +13,16 @@ import (
 	"sort"
 	"strings"
 	"sync"
+	"time"
 
 	"github.com/howard/scrubber/internal/scrub"
 )
+
+// ObjectSuffix is appended to an *input* object key to form the key its run
+// report is stored under. Keying reports by input means a client that knows only
+// the key it uploaded can always locate the outcome, even when filename scrubbing
+// renamed the output.
+const ObjectSuffix = ".report.json"
 
 // Status describes the outcome for a single file within the bundle.
 type Status string
@@ -102,10 +109,33 @@ type Report struct {
 	Files   []FileEntry `json:"files"`
 	Summary Summary     `json:"summary"`
 
+	// InputKey and OutputKey are the object keys this run read from and wrote to.
+	// They are recorded explicitly so the report is self-describing: given only
+	// the key a client uploaded, the service can find the report and learn where
+	// the scrubbed object landed, even after a restart lost its in-memory state.
+	InputKey  string    `json:"input_key,omitempty"`
+	OutputKey string    `json:"output_key,omitempty"`
+	StartedAt time.Time `json:"started_at,omitempty"`
+	EndedAt   time.Time `json:"ended_at,omitempty"`
+	// BytesIn/BytesOut are the top-level object sizes, recorded so a stored report
+	// can reconstruct the full status view without the live job record.
+	BytesIn  int `json:"bytes_in,omitempty"`
+	BytesOut int `json:"bytes_out,omitempty"`
+
 	mu     sync.Mutex
 	audit  AuditLevel
 	redact bool
 	salt   []byte
+	onFile func(FileEntry)
+}
+
+// OnFile registers a callback invoked for each file as it is recorded, so a
+// caller can stream progress instead of waiting for the run to finish. It runs
+// while the report lock is held: keep it cheap and non-blocking.
+func (r *Report) OnFile(fn func(FileEntry)) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	r.onFile = fn
 }
 
 // New constructs a Report with the given transparency settings.
@@ -166,6 +196,15 @@ func (r *Report) Record(path string, status Status, detail string, bytesIn, byte
 		r.Summary.TotalMatches++
 		r.Summary.MatchesByRule[m.RuleID]++
 		r.Summary.MatchesByLabel[m.Replacement]++
+	}
+
+	if r.onFile != nil {
+		// Hand out the summary fields only; per-match detail can contain cleartext
+		// originals and progress callbacks feed browser-facing surfaces.
+		r.onFile(FileEntry{
+			Path: entry.Path, Status: entry.Status, Detail: entry.Detail,
+			BytesIn: entry.BytesIn, BytesOut: entry.BytesOut,
+		})
 	}
 }
 

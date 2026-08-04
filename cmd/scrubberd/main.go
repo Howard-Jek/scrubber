@@ -13,6 +13,7 @@ import (
 	"os"
 	"os/signal"
 	"strconv"
+	"strings"
 	"syscall"
 	"time"
 
@@ -27,10 +28,26 @@ import (
 )
 
 func main() {
-	log := slog.New(slog.NewJSONHandler(os.Stdout, &slog.HandlerOptions{Level: slog.LevelInfo}))
+	log := slog.New(slog.NewJSONHandler(os.Stdout, &slog.HandlerOptions{Level: logLevel()}))
 	if err := realMain(log); err != nil {
 		log.Error("fatal", "err", err)
 		os.Exit(1)
+	}
+}
+
+// logLevel reads LOG_LEVEL (debug|info|warn|error). Debug emits a line per file
+// inside every bundle, which is how an operator sees what is being scrubbed as
+// it happens rather than only a single line once the object completes.
+func logLevel() slog.Level {
+	switch strings.ToLower(os.Getenv("LOG_LEVEL")) {
+	case "debug":
+		return slog.LevelDebug
+	case "warn", "warning":
+		return slog.LevelWarn
+	case "error":
+		return slog.LevelError
+	default:
+		return slog.LevelInfo
 	}
 }
 
@@ -122,11 +139,14 @@ func realMain(log *slog.Logger) error {
 			Prom:          promReg,
 			Ready:         ready,
 			Presigner:     st,
+			Archive:       st,
 			DefaultPolicy: os.Getenv("DEFAULT_POLICY"),
 			AllowEdit:     envBool("ALLOW_POLICY_EDIT", true),
 			InputBucket:   inputBucket,
 			OutputBucket:  mustEnv("OUTPUT_BUCKET"),
+			ReportsBucket: mustEnv("REPORTS_BUCKET"),
 			UploadExpiry:  envDuration("UPLOAD_EXPIRY", 15*time.Minute),
+			HistoryMax:    envInt("HISTORY_MAX", 100),
 		}).Handler(),
 		ReadHeaderTimeout: 10 * time.Second,
 	}
