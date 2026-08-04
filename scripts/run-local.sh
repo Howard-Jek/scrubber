@@ -29,9 +29,20 @@ docker build -q -f "$ROOT/deploy/Containerfile" -t "$IMAGE" "$ROOT" >/dev/null
 POL="$(mktemp -d)"
 cp "$ROOT"/deploy/policies/*.json "$POL"/
 
+# Docker resolves bind-mount sources on the *host*. Under Git Bash / MSYS on
+# Windows, mktemp hands back an MSYS path like /tmp/tmp.XXXX, which Docker
+# Desktop reads as a path inside its own Linux VM -- the mount silently comes up
+# empty and the service exits with "no policies found". Translate it, and stop
+# MSYS rewriting the container-side path in the -v argument.
+MOUNT_SRC="$POL"
+if command -v cygpath >/dev/null 2>&1; then
+  MOUNT_SRC="$(cygpath -w "$POL")"
+  export MSYS_NO_PATHCONV=1
+fi
+
 echo "Starting scrubberd..."
 docker run -d --name scrubberd --network "$NET" -p 8080:8080 \
-  -v "$POL":/etc/scrubber/policies:ro \
+  -v "$MOUNT_SRC":/etc/scrubber/policies:ro \
   -e MINIO_ENDPOINT=scrubber-minio:9000 \
   -e MINIO_PUBLIC_ENDPOINT=localhost:19000 -e MINIO_PUBLIC_TLS=false \
   -e MINIO_ACCESS_KEY=minioadmin -e MINIO_SECRET_KEY=minioadmin -e MINIO_USE_TLS=false \

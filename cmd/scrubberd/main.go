@@ -13,6 +13,8 @@ import (
 	"os"
 	"os/signal"
 	"strconv"
+	"strings"
+	"sync"
 	"syscall"
 	"time"
 
@@ -27,10 +29,26 @@ import (
 )
 
 func main() {
-	log := slog.New(slog.NewJSONHandler(os.Stdout, &slog.HandlerOptions{Level: slog.LevelInfo}))
+	log := slog.New(slog.NewJSONHandler(os.Stdout, &slog.HandlerOptions{Level: logLevel()}))
 	if err := realMain(log); err != nil {
 		log.Error("fatal", "err", err)
 		os.Exit(1)
+	}
+}
+
+// logLevel reads LOG_LEVEL (debug|info|warn|error). Debug emits a line per file
+// inside every bundle, which is how an operator sees what is being scrubbed as
+// it happens rather than only a single line once the object completes.
+func logLevel() slog.Level {
+	switch strings.ToLower(os.Getenv("LOG_LEVEL")) {
+	case "debug":
+		return slog.LevelDebug
+	case "warn", "warning":
+		return slog.LevelWarn
+	case "error":
+		return slog.LevelError
+	default:
+		return slog.LevelInfo
 	}
 }
 
@@ -89,20 +107,39 @@ func realMain(log *slog.Logger) error {
 		Action:         worker.ProcessedAction(envDefault("PROCESSED_ACTION", "move")),
 		PollInterval:   envDuration("POLL_INTERVAL", 15*time.Second),
 		Workers:        envInt("WORKERS", 4),
-		MaxObjectBytes: int64(envInt("MAX_OBJECT_BYTES", 512<<20)),
+		MaxObjectBytes: envInt64("MAX_OBJECT_BYTES", 256<<20),
 		RedactReports:  envBool("REDACT_REPORTS", false),
 		ScrubNames:     envBool("SCRUB_FILENAMES", true),
 		Limits: pipeline.Limits{
 			MaxDepth:      envInt("MAX_DEPTH", 16),
-			MaxRatio:      envInt("MAX_RATIO", 200),
-			MaxTotalBytes: 2 << 30,
-			MaxMembers:    100000,
+			MaxTotalBytes: envInt64("MAX_EXPAND_BYTES", 256<<20),
+			MaxMembers:    envInt("MAX_MEMBERS", 100000),
 		},
 	}
+	if os.Getenv("MAX_RATIO") != "" {
+		log.Warn("MAX_RATIO is ignored and can be removed from the config. " +
+			"An expansion-ratio limit cannot distinguish a decompression bomb from an " +
+			"ordinary log file (logs routinely compress 200:1 and beyond), and tripping " +
+			"it emitted the object UNSCRUBBED. Memory is now bounded by MAX_EXPAND_BYTES, " +
+			"enforced while decompressing.")
+	}
+	log.Info("resource limits",
+		"max_object_bytes", wcfg.MaxObjectBytes,
+		"max_expand_bytes", wcfg.Limits.MaxTotalBytes,
+		"workers", wcfg.Workers,
+		"worst_case_resident_bytes", int64(wcfg.Workers)*(wcfg.MaxObjectBytes+wcfg.Limits.MaxTotalBytes))
 	wk := worker.New(st, reg, m, jobs, wcfg, log)
 
 	// --- control + browser API server ---
-	ready := func() bool { return st.Healthy(ctx, inputBucket) }
+	// Readiness is checked every few seconds by the kubelet. Probing MinIO on
+	// every call with no deadline means a slow backend makes the probe hang, the
+	// pod drop out of the Route, and in-flight browser polls fail — so the result
+	// is cached briefly and the check is given its own timeout.
+	ready := cachedReady(func() bool {
+		cctx, cancel := context.WithTimeout(ctx, readyProbeTimeout)
+		defer cancel()
+		return st.Healthy(cctx, inputBucket)
+	}, readyCacheTTL)
 	srv := &http.Server{
 		Addr: ":" + envDefault("PORT", "8080"),
 		Handler: server.New(server.Deps{
@@ -111,11 +148,14 @@ func realMain(log *slog.Logger) error {
 			Prom:          promReg,
 			Ready:         ready,
 			Presigner:     st,
+			Archive:       st,
 			DefaultPolicy: os.Getenv("DEFAULT_POLICY"),
 			AllowEdit:     envBool("ALLOW_POLICY_EDIT", true),
 			InputBucket:   inputBucket,
 			OutputBucket:  mustEnv("OUTPUT_BUCKET"),
+			ReportsBucket: mustEnv("REPORTS_BUCKET"),
 			UploadExpiry:  envDuration("UPLOAD_EXPIRY", 15*time.Minute),
+			HistoryMax:    envInt("HISTORY_MAX", 100),
 		}).Handler(),
 		ReadHeaderTimeout: 10 * time.Second,
 	}
@@ -135,6 +175,35 @@ func realMain(log *slog.Logger) error {
 	shutCtx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
 	defer cancel()
 	return srv.Shutdown(shutCtx)
+}
+
+const (
+	// readyProbeTimeout bounds a single backend reachability check.
+	readyProbeTimeout = 3 * time.Second
+	// readyCacheTTL is how long a readiness result is reused across probes.
+	readyCacheTTL = 5 * time.Second
+)
+
+// cachedReady wraps a readiness check so concurrent probes share one in-flight
+// call and the result is reused for ttl.
+func cachedReady(check func() bool, ttl time.Duration) func() bool {
+	var (
+		mu       sync.Mutex
+		last     time.Time
+		lastOK   bool
+		hasValue bool
+	)
+	return func() bool {
+		mu.Lock()
+		defer mu.Unlock()
+		if hasValue && time.Since(last) < ttl {
+			return lastOK
+		}
+		lastOK = check()
+		last = time.Now()
+		hasValue = true
+		return lastOK
+	}
 }
 
 // watchPolicies hot-reloads the policy registry when the mounted ConfigMap changes.
@@ -207,6 +276,15 @@ func envBool(k string, def bool) bool {
 func envInt(k string, def int) int {
 	if v := os.Getenv(k); v != "" {
 		if n, err := strconv.Atoi(v); err == nil {
+			return n
+		}
+	}
+	return def
+}
+
+func envInt64(k string, def int64) int64 {
+	if v := os.Getenv(k); v != "" {
+		if n, err := strconv.ParseInt(v, 10, 64); err == nil {
 			return n
 		}
 	}

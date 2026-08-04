@@ -27,8 +27,9 @@ var ErrTooLarge = errors.New("object exceeds size limit")
 
 // Object is a listed object's identity.
 type Object struct {
-	Key  string
-	Size int64
+	Key          string
+	Size         int64
+	LastModified time.Time
 }
 
 // ObjectStore is the subset of behavior the worker depends on (mockable in tests).
@@ -142,7 +143,7 @@ func (c *Client) List(ctx context.Context, bucket, prefix string) ([]Object, err
 		if strings.HasSuffix(info.Key, "/") {
 			continue
 		}
-		out = append(out, Object{Key: info.Key, Size: info.Size})
+		out = append(out, Object{Key: info.Key, Size: info.Size, LastModified: info.LastModified})
 	}
 	return out, nil
 }
@@ -180,6 +181,21 @@ func (c *Client) GetLimited(ctx context.Context, bucket, key string, max int64) 
 		return nil, ErrTooLarge
 	}
 	return buf.Bytes(), nil
+}
+
+// Stat reports whether key exists without transferring its contents. The API
+// uses it to answer "is this object finished?" from durable storage rather than
+// from the process's in-memory job history, which does not survive a restart.
+func (c *Client) Stat(ctx context.Context, bucket, key string) (Object, bool, error) {
+	info, err := c.mc.StatObject(ctx, bucket, key, minio.StatObjectOptions{})
+	if err != nil {
+		resp := minio.ToErrorResponse(err)
+		if resp.Code == "NoSuchKey" || resp.StatusCode == http.StatusNotFound {
+			return Object{}, false, nil
+		}
+		return Object{}, false, err
+	}
+	return Object{Key: key, Size: info.Size, LastModified: info.LastModified}, true, nil
 }
 
 // Exists reports whether key exists and, if so, returns its contents.

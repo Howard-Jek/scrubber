@@ -14,13 +14,20 @@ corrupted or half-scrubbed bundle:
 - **Fail-fast on bad config.** A malformed terms file, an uncompilable regex, or an
   unknown preset aborts the run with a clear message **before any input is touched**
   (exit code `2`). You can never get a partially-scrubbed bundle from a broken config.
-- **Fail-safe passthrough.** Any file that can't be opened — corrupted, truncated,
-  encrypted, or in a format we can read but not rewrite — is emitted **byte-for-byte
-  unchanged** and flagged in the report, never half-processed.
+- **Fail-safe passthrough, and it is never silent.** Any file that can't be opened —
+  corrupted, truncated, encrypted, or in a format we can read but not rewrite — is
+  emitted **byte-for-byte unchanged**. It is also *named* in the report, called out
+  in the end-of-run banner, and surfaced in the UI as a warning rather than a
+  success, because a bundle containing files the pipeline never inspected is not a
+  clean result. `--fail-on-unscrubbed` turns it into a non-zero exit for pipelines.
 - **Binaries are left alone.** Files are classified by *content*, not extension;
   binary files pass through untouched so byte-substitution can't break their format.
-- **Bomb/quine resistant.** Recursion depth, expansion ratio, decompressed size, and
-  archive member count are all capped.
+- **Bomb/quine resistant, without false positives.** Memory is bounded by a
+  cumulative expansion budget enforced *while* decompressing, alongside caps on
+  recursion depth and archive member count. There is deliberately **no
+  expansion-ratio limit**: ratio cannot separate a bomb from an ordinary log (real
+  logs compress 200:1 to 1000:1), so any threshold low enough to catch a bomb also
+  rejects the tool's primary input — and a rejected file is emitted unscrubbed.
 - **Atomic writes.** Output is written to a temp file and renamed into place, so a
   crash mid-write can't leave a corrupt file.
 - **Full transparency.** Every replacement is recorded (rule, location, original →
@@ -132,7 +139,9 @@ rules could match the same span, the earlier one wins.
 | `--redact-report` | `false` | Store salted hashes instead of cleartext original values in the report. |
 | `--salt` | `scrubber` | Salt used by `--redact-report`. |
 | `--max-depth` | `16` | Maximum container nesting depth. |
-| `--max-ratio` | `200` | Maximum decompression expansion ratio per stream. |
+| `--max-expand-bytes` | `2147483648` | Cumulative decompressed bytes held in memory per input. Enforced while reading, so it is a real memory bound. |
+| `--max-ratio` | — | **Deprecated and ignored** (warns if set). See the bomb-resistance note under [Safety guarantees](#safety-guarantees). |
+| `--fail-on-unscrubbed` | `false` | Exit `3` if any file was emitted unscrubbed. |
 | `--verbose` | `false` | Print the per-rule breakdown to stderr. |
 
 ## The report (transparency)
@@ -198,6 +207,13 @@ to a `processed/` prefix (or deleted).
   boundary through the service.
 - **Control plane (Route-exposed, data-free):** `/healthz`, `/readyz`, `/metrics`
   (Prometheus), `/policies`, `/jobs`. Safe to expose externally even without app auth.
+
+**Sizing.** Each concurrent worker can hold roughly `MAX_OBJECT_BYTES` (the compressed
+input) plus `MAX_EXPAND_BYTES` (everything it decompresses), plus transient copies while
+repacking. Keep `WORKERS × (MAX_OBJECT_BYTES + MAX_EXPAND_BYTES)` under ~60% of the
+container memory limit and set `GOMEMLIMIT` below that limit. The service logs
+`worst_case_resident_bytes` at startup so the configured budget is visible. Defaults
+(2 workers, 64 MiB + 192 MiB) fit the 1 GiB limit in the shipped manifests.
 
 **Policies ("both"):** named policy files (same schema as the terms file) are mounted
 from a ConfigMap at `/etc/scrubber/policies/*.json` and hot-reloaded on change.
@@ -269,6 +285,25 @@ Flow: browser `POST /api/uploads {name}` → gets a presigned PUT + object key �
 file directly to the input bucket → polls `GET /api/status?key=…` until `scrubbed` → gets
 the label-only match breakdown for the "active policy" panel → `GET /api/downloads?key=…`
 for a presigned GET of the scrubbed output.
+
+**Status is answered from storage, not just memory.** Recent job outcomes are cached in
+a per-process ring, but that cache is lost on restart and can evict entries under load.
+When it has no terminal answer for a key, `/api/status` reads the stored run report
+instead, so a client is never told "processing" forever for an object that finished.
+Reports are keyed by the **input** key (`<key>.report.json` in the reports bucket) —
+the only key a client knows — and record where the output landed, so downloads keep
+working even when filename scrubbing renamed the output.
+
+While a job is in flight the status response carries real progress (`files_done`,
+`current_file`, `phase`) rather than a client-side animation.
+
+- `GET /api/history?n=N` — the last N completed runs, rebuilt from the reports bucket
+  and shown in the **Recent scrubs** panel. Survives a page refresh and a pod restart.
+  N is settable in the UI and capped by `HISTORY_MAX`.
+- `GET /api/report?key=…` — the full stored report for one run.
+
+A run that contains files the pipeline could not inspect is shown as an amber
+**"N files NOT scrubbed"** state naming each file and why — never a green check.
 
 The tool is operated by people **inside** your trust boundary who are preparing logs to
 send out, so the UI deliberately shows the full policy — the literal terms, patterns, and
@@ -348,12 +383,23 @@ There are three ways to change what gets scrubbed, from most transient to most p
 | `0` | Success. |
 | `1` | Fatal I/O error (e.g. input unreadable). Output may not have been written. |
 | `2` | Invalid usage or invalid terms file. **No input was touched.** |
+| `3` | Completed, but some files were emitted unscrubbed (only with `--fail-on-unscrubbed`). |
 
 ## Notes & limitations (v1)
 
 - Text is handled as UTF-8 (with or without BOM) and ASCII/Latin-1. UTF-16/UTF-32
   files contain NUL bytes and are therefore treated as binary and passed through.
-- Processing is in-memory per stream, bounded by `--max-ratio` and a 2 GiB
-  decompressed-size cap per stream.
+- Processing is in-memory, bounded by the cumulative `--max-expand-bytes` budget
+  for a whole input (nested streams and archive members draw from the same budget).
 - Shelling out to a system `7z`/`xz`, and length-preserving / hashing replacement
   modes, are intentionally out of scope for v1.
+
+## License
+
+MIT — see [LICENSE](LICENSE). Third-party dependencies and their licenses are
+listed in [THIRD-PARTY-NOTICES.md](THIRD-PARTY-NOTICES.md), regenerated with
+`scripts/gen-notices.sh`. All current dependencies are permissively licensed
+(MIT, BSD-2/3-Clause, Apache-2.0).
+
+The web UI has no external assets — icons are an inline SVG sprite and there are
+no CDN, font, or script fetches — so it renders in an air-gapped cluster.

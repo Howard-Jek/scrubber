@@ -12,11 +12,17 @@ import (
 	"encoding/json"
 	"io"
 	"net/http"
+	"sort"
+	"strconv"
+	"strings"
+	"sync"
 	"time"
 
 	"github.com/howard/scrubber/internal/metrics"
 	"github.com/howard/scrubber/internal/policy"
+	"github.com/howard/scrubber/internal/report"
 	"github.com/howard/scrubber/internal/scrub"
+	"github.com/howard/scrubber/internal/store"
 	"github.com/prometheus/client_golang/prometheus"
 	"github.com/prometheus/client_golang/prometheus/promhttp"
 )
@@ -27,19 +33,37 @@ type Presigner interface {
 	PresignGet(ctx context.Context, bucket, key string, expiry time.Duration) (string, error)
 }
 
+// Archive is the read-only object access the API needs to answer questions the
+// in-memory job log cannot: whether an object finished, and what the last N runs
+// were. Object storage is the durable record; the job log is only a cache.
+type Archive interface {
+	List(ctx context.Context, bucket, prefix string) ([]store.Object, error)
+	Get(ctx context.Context, bucket, key string) ([]byte, error)
+	Stat(ctx context.Context, bucket, key string) (store.Object, bool, error)
+}
+
 // Deps are the server's dependencies.
 type Deps struct {
-	Policies     *policy.Registry
-	Jobs         *metrics.JobLog
-	Prom         *prometheus.Registry
-	Ready        func() bool
+	Policies      *policy.Registry
+	Jobs          *metrics.JobLog
+	Prom          *prometheus.Registry
+	Ready         func() bool
 	Presigner     Presigner
+	Archive       Archive
 	DefaultPolicy string // policy shown/edited in the UI
 	AllowEdit     bool   // permit PUT /api/policy from the UI
 	InputBucket   string
 	OutputBucket  string
+	ReportsBucket string
 	UploadExpiry  time.Duration
+	// HistoryMax caps the N a caller may request from /api/history.
+	HistoryMax int
 }
+
+// staleAfter is how long an in-flight job record is trusted on its own before
+// the API also consults storage. It bounds how long a client can wait on a
+// record whose worker died or is re-processing the same object in a loop.
+const staleAfter = 30 * time.Second
 
 // Server holds the dependencies for the endpoints.
 type Server struct{ d Deps }
@@ -48,6 +72,9 @@ type Server struct{ d Deps }
 func New(d Deps) *Server {
 	if d.UploadExpiry == 0 {
 		d.UploadExpiry = 15 * time.Minute
+	}
+	if d.HistoryMax <= 0 {
+		d.HistoryMax = 100
 	}
 	return &Server{d: d}
 }
@@ -66,6 +93,8 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("/api/uploads", s.apiUpload)
 	mux.HandleFunc("/api/status", s.apiStatus)
 	mux.HandleFunc("/api/downloads", s.apiDownload)
+	mux.HandleFunc("/api/history", s.apiHistory)
+	mux.HandleFunc("/api/report", s.apiReport)
 	// Static front page.
 	mux.HandleFunc("/", s.index)
 	return mux
@@ -150,22 +179,200 @@ func (s *Server) apiUpload(w http.ResponseWriter, r *http.Request) {
 }
 
 // apiStatus reports the outcome of a previously uploaded key (browser-safe fields).
+//
+// The in-memory job log is consulted first because it carries live progress, but
+// it is only a cache: it is per-process and lost on restart. When it has no
+// terminal answer the durable record in object storage is consulted, so a client
+// is never told "processing" forever for an object that actually finished.
 func (s *Server) apiStatus(w http.ResponseWriter, r *http.Request) {
 	key := r.URL.Query().Get("key")
 	if key == "" {
 		http.Error(w, "missing key", http.StatusBadRequest)
 		return
 	}
-	for _, j := range s.d.Jobs.Recent() {
-		if j.Key == key {
+
+	j, known := s.d.Jobs.Get(key)
+	if known && j.Done() {
+		writeJSON(w, jobStatusPayload(j))
+		return
+	}
+	// A job this process is actively working on answers from memory: it has live
+	// progress and storage has nothing yet. Consulting storage on every poll would
+	// mean a failed object read per client per second for the whole run.
+	if known && time.Since(j.Timestamp) < staleAfter {
+		writeJSON(w, jobStatusPayload(j))
+		return
+	}
+
+	// Either this process has no record (restarted, or the entry was evicted) or
+	// its record has been in-flight implausibly long (a wedged or re-looping
+	// object). Storage is authoritative — check it before reporting in-flight, so
+	// a client is never stranded on an object that actually completed.
+	if d, ok := s.digestFor(r.Context(), key); ok {
+		writeJSON(w, digestStatusPayload(d))
+		return
+	}
+	if known {
+		writeJSON(w, jobStatusPayload(j)) // still working, just slow
+		return
+	}
+
+	// No record anywhere. Distinguish "still queued" from "we have lost track of
+	// it" so the UI can stop waiting instead of polling indefinitely.
+	if s.d.Archive != nil {
+		if _, found, err := s.d.Archive.Stat(r.Context(), s.d.InputBucket, key); err == nil && !found {
 			writeJSON(w, map[string]any{
-				"status": j.Status, "policy": j.Policy, "matches": j.Matches,
-				"bytes_in": j.BytesIn, "bytes_out": j.BytesOut, "by_label": j.ByLabel, "error": j.Error,
+				"status": "unknown",
+				"error":  "no result recorded for this key; it may have expired or never been uploaded",
 			})
 			return
 		}
 	}
-	writeJSON(w, map[string]any{"status": "processing"})
+	writeJSON(w, map[string]any{"status": "processing", "phase": "queued"})
+}
+
+// digestFor fetches the compact durable record for an input key.
+//
+// It prefers the small digest object and only falls back to the full report,
+// which carries every match and can be megabytes, when the digest is absent —
+// e.g. for runs recorded before digests existed.
+func (s *Server) digestFor(ctx context.Context, key string) (*report.Digest, bool) {
+	if s.d.Archive == nil || s.d.ReportsBucket == "" {
+		return nil, false
+	}
+	if raw, err := s.d.Archive.Get(ctx, s.d.ReportsBucket, key+report.DigestSuffix); err == nil {
+		var d report.Digest
+		if json.Unmarshal(raw, &d) == nil {
+			return &d, true
+		}
+	}
+	rep, ok := s.reportFor(ctx, key)
+	if !ok {
+		return nil, false
+	}
+	d := rep.Digest()
+	return &d, true
+}
+
+// reportFor fetches and decodes the full durable run report for an input key.
+func (s *Server) reportFor(ctx context.Context, key string) (*report.Report, bool) {
+	if s.d.Archive == nil || s.d.ReportsBucket == "" {
+		return nil, false
+	}
+	raw, err := s.d.Archive.Get(ctx, s.d.ReportsBucket, key+report.ObjectSuffix)
+	if err != nil {
+		return nil, false
+	}
+	var rep report.Report
+	if err := json.Unmarshal(raw, &rep); err != nil {
+		return nil, false
+	}
+	return &rep, true
+}
+
+// apiHistory lists the most recent completed runs, newest first, reconstructed
+// from the reports bucket. This is what survives a page refresh or a restart.
+func (s *Server) apiHistory(w http.ResponseWriter, r *http.Request) {
+	if s.d.Archive == nil || s.d.ReportsBucket == "" {
+		writeJSON(w, map[string]any{"runs": []any{}})
+		return
+	}
+	n := s.d.HistoryMax
+	if v := r.URL.Query().Get("n"); v != "" {
+		parsed, err := strconv.Atoi(v)
+		if err != nil || parsed <= 0 {
+			http.Error(w, "n must be a positive integer", http.StatusBadRequest)
+			return
+		}
+		if parsed < n {
+			n = parsed
+		}
+	}
+
+	objs, err := s.d.Archive.List(r.Context(), s.d.ReportsBucket, "")
+	if err != nil {
+		writeJSONStatus(w, http.StatusBadGateway, map[string]any{"error": "could not list reports"})
+		return
+	}
+	// List by digest, never by full report: the full report grows with match count
+	// and reading N of them to render a list would mean parsing hundreds of
+	// megabytes of audit detail per page load.
+	digests := objs[:0]
+	for _, o := range objs {
+		if strings.HasSuffix(o.Key, report.DigestSuffix) {
+			digests = append(digests, o)
+		}
+	}
+	sort.Slice(digests, func(i, j int) bool { return digests[i].LastModified.After(digests[j].LastModified) })
+	if len(digests) > n {
+		digests = digests[:n]
+	}
+
+	runs := make([]map[string]any, len(digests))
+	var wg sync.WaitGroup
+	sem := make(chan struct{}, 8) // bounded fan-out
+	for i, o := range digests {
+		wg.Add(1)
+		go func(i int, o store.Object) {
+			defer wg.Done()
+			sem <- struct{}{}
+			defer func() { <-sem }()
+
+			key := strings.TrimSuffix(o.Key, report.DigestSuffix)
+			entry := map[string]any{"key": key, "at": o.LastModified}
+			raw, err := s.d.Archive.Get(r.Context(), s.d.ReportsBucket, o.Key)
+			if err != nil {
+				entry["status"] = "unreadable"
+				runs[i] = entry
+				return
+			}
+			var d report.Digest
+			if err := json.Unmarshal(raw, &d); err != nil {
+				entry["status"] = "unreadable"
+				runs[i] = entry
+				return
+			}
+			for k, v := range digestStatusPayload(&d) {
+				entry[k] = v
+			}
+			runs[i] = entry
+		}(i, o)
+	}
+	wg.Wait()
+
+	writeJSON(w, map[string]any{"runs": runs, "n": n, "max": s.d.HistoryMax})
+}
+
+// apiReport returns the full stored report for a key, for the detail view.
+func (s *Server) apiReport(w http.ResponseWriter, r *http.Request) {
+	key := r.URL.Query().Get("key")
+	if key == "" {
+		http.Error(w, "missing key", http.StatusBadRequest)
+		return
+	}
+	rep, ok := s.reportFor(r.Context(), key)
+	if !ok {
+		writeJSONStatus(w, http.StatusNotFound, map[string]any{"error": "no report stored for this key"})
+		return
+	}
+	writeJSON(w, rep)
+}
+
+// digestStatusPayload renders a stored digest in the same shape as a live job so
+// the UI can consume either without branching.
+func digestStatusPayload(d *report.Digest) map[string]any {
+	return map[string]any{
+		"status":            "scrubbed",
+		"matches":           d.Matches,
+		"by_label":          d.ByLabel,
+		"passthrough":       d.Passthrough,
+		"passthrough_paths": d.Passthroughs,
+		"files_done":        d.FilesTotal,
+		"output_key":        d.OutputKey,
+		"bytes_in":          d.BytesIn,
+		"bytes_out":         d.BytesOut,
+		"from":              "storage",
+	}
 }
 
 // apiDownload mints a presigned GET URL for the scrubbed output object.
@@ -176,13 +383,13 @@ func (s *Server) apiDownload(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	// The scrubbed output may live under a different key if filename scrubbing
-	// renamed it — resolve via the job record.
+	// renamed it. Resolve via the live job record, falling back to the stored
+	// report so a download still works after a restart cleared the job log.
 	outKey := key
-	for _, j := range s.d.Jobs.Recent() {
-		if j.Key == key && j.OutputKey != "" {
-			outKey = j.OutputKey
-			break
-		}
+	if j, ok := s.d.Jobs.Get(key); ok && j.OutputKey != "" {
+		outKey = j.OutputKey
+	} else if d, ok := s.digestFor(r.Context(), key); ok && d.OutputKey != "" {
+		outKey = d.OutputKey
 	}
 	url, err := s.d.Presigner.PresignGet(r.Context(), s.d.OutputBucket, outKey, s.d.UploadExpiry)
 	if err != nil {
@@ -199,6 +406,27 @@ func (s *Server) index(w http.ResponseWriter, r *http.Request) {
 	}
 	w.Header().Set("Content-Type", "text/html; charset=utf-8")
 	_, _ = w.Write(indexHTML)
+}
+
+// jobStatusPayload renders a job for the browser. It always includes the
+// passthrough fields so the UI can distinguish a fully scrubbed bundle from one
+// that contains files the pipeline never inspected.
+func jobStatusPayload(j metrics.Job) map[string]any {
+	return map[string]any{
+		"status":            j.Status,
+		"policy":            j.Policy,
+		"matches":           j.Matches,
+		"bytes_in":          j.BytesIn,
+		"bytes_out":         j.BytesOut,
+		"by_label":          j.ByLabel,
+		"error":             j.Error,
+		"passthrough":       j.Passthrough,
+		"passthrough_paths": j.PassthroughPaths,
+		"files_done":        j.FilesDone,
+		"current_file":      j.CurrentFile,
+		"phase":             j.Phase,
+		"output_key":        j.OutputKey,
+	}
 }
 
 func writeJSON(w http.ResponseWriter, v any) {

@@ -3,6 +3,7 @@ package worker
 import (
 	"bytes"
 	"context"
+	"errors"
 	"io"
 	"log/slog"
 	"os"
@@ -242,5 +243,146 @@ func TestWorkerSkipsCorruptWithoutCrashing(t *testing.T) {
 	}
 	if string(out) != "PK\x03\x04nope" {
 		t.Errorf("corrupt object should pass through byte-identical, got %q", out)
+	}
+}
+
+// panicStore wraps a memStore and panics on Put, simulating a bug anywhere in
+// the per-object path.
+type panicStore struct {
+	*memStore
+	panicOn string
+}
+
+func (p *panicStore) Put(ctx context.Context, bucket, key string, data []byte, ct string) error {
+	if bucket == p.panicOn {
+		panic("simulated bug in the object path")
+	}
+	return p.memStore.Put(ctx, bucket, key, data, ct)
+}
+
+// TestWorkerSurvivesPanic checks that a panic costs one object rather than the
+// whole service. Without recovery the goroutine takes the process down, which
+// orphans every in-flight upload and wipes the in-memory job history — the
+// failure mode behind "stuck forever while MinIO shows the object finished".
+func TestWorkerSurvivesPanic(t *testing.T) {
+	ms := newMemStore("input", "output", "reports")
+	ms.Put(context.Background(), "input", "boom.log", []byte("AcmeCorp\n"), "")
+	ms.Put(context.Background(), "input", "fine.log", []byte("AcmeCorp\n"), "")
+
+	ps := &panicStore{memStore: ms, panicOn: "output"}
+	w := newTestWorker(t, ms)
+	w.store = ps
+
+	// Must return normally rather than taking the test process down.
+	w.pollOnce(context.Background())
+
+	var sawError bool
+	for _, j := range w.jobs.Recent() {
+		if j.Status == "error" && strings.Contains(j.Error, "panic") {
+			sawError = true
+		}
+	}
+	if !sawError {
+		t.Error("panic should be recorded as a job error so the UI stops waiting")
+	}
+}
+
+// TestWorkerReportsUnscrubbedFiles checks that an object containing a member the
+// pipeline could not inspect is reported with a non-zero passthrough count, so
+// the UI can warn instead of showing a green check.
+func TestWorkerReportsUnscrubbedFiles(t *testing.T) {
+	ms := newMemStore("input", "output", "reports")
+	sevenZip := append([]byte{'7', 'z', 0xbc, 0xaf, 0x27, 0x1c}, bytes.Repeat([]byte{1}, 64)...)
+	ms.Put(context.Background(), "input", "vendor.7z", sevenZip, "")
+
+	w := newTestWorker(t, ms)
+	w.pollOnce(context.Background())
+
+	jobs := w.jobs.Recent()
+	if len(jobs) == 0 {
+		t.Fatal("no job recorded")
+	}
+	j := jobs[len(jobs)-1]
+	if j.Status != "scrubbed" {
+		t.Fatalf("status = %q, want scrubbed", j.Status)
+	}
+	if j.Passthrough == 0 {
+		t.Error("passthrough count should be non-zero for an uninspectable container")
+	}
+	if len(j.PassthroughPaths) == 0 {
+		t.Error("passthrough paths should name the uninspected file")
+	}
+}
+
+// failMoveStore fails Move a fixed number of times, then succeeds.
+type failMoveStore struct {
+	*memStore
+	failures int
+	calls    int
+}
+
+func (f *failMoveStore) Move(ctx context.Context, bucket, src, dst string) error {
+	f.calls++
+	if f.calls <= f.failures {
+		return errors.New("simulated copy failure")
+	}
+	return f.memStore.Move(ctx, bucket, src, dst)
+}
+
+// TestFinalizeFailureBacksOff covers the re-processing loop: when an input
+// cannot be moved to processed/ it stays in the input bucket, so the next poll
+// picks it up again. Unbounded, that re-scrubs the same object forever, rewrites
+// the same output, and churns the job ring so unrelated records are evicted.
+func TestFinalizeFailureBacksOff(t *testing.T) {
+	ms := newMemStore("input", "output", "reports")
+	ms.Put(context.Background(), "input", "stuck.log", []byte("AcmeCorp\n"), "")
+
+	fs := &failMoveStore{memStore: ms, failures: 99} // never succeeds
+	w := newTestWorker(t, ms)
+	w.store = fs
+
+	w.pollOnce(context.Background())
+	if fs.calls != 1 {
+		t.Fatalf("first poll should attempt the move once, got %d", fs.calls)
+	}
+
+	// Immediately polling again must NOT re-process: the key is in backoff.
+	w.pollOnce(context.Background())
+	if fs.calls != 1 {
+		t.Errorf("object was re-processed during backoff (move attempts = %d)", fs.calls)
+	}
+
+	// Once the backoff expires it is retried rather than abandoned.
+	w.mu.Lock()
+	w.deferUntil["stuck.log"] = time.Now().Add(-time.Second)
+	w.mu.Unlock()
+	w.pollOnce(context.Background())
+	if fs.calls != 2 {
+		t.Errorf("object should be retried after backoff, move attempts = %d", fs.calls)
+	}
+}
+
+// TestFinalizeSuccessClearsBackoff checks the backoff state does not leak for
+// keys that eventually succeed.
+func TestFinalizeSuccessClearsBackoff(t *testing.T) {
+	ms := newMemStore("input", "output", "reports")
+	ms.Put(context.Background(), "input", "ok.log", []byte("AcmeCorp\n"), "")
+
+	fs := &failMoveStore{memStore: ms, failures: 1}
+	w := newTestWorker(t, ms)
+	w.store = fs
+
+	w.pollOnce(context.Background()) // fails, backs off
+	w.mu.Lock()
+	w.deferUntil["ok.log"] = time.Now().Add(-time.Second)
+	w.mu.Unlock()
+	w.pollOnce(context.Background()) // succeeds
+
+	w.mu.Lock()
+	_, held := w.deferUntil["ok.log"]
+	_, tried := w.attempts["ok.log"]
+	w.mu.Unlock()
+	if held || tried {
+		t.Error("backoff state should be cleared once the object finalizes")
 	}
 }

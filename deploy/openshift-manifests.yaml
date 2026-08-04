@@ -31,17 +31,37 @@ data:
   PREFIX_POLICY_MAP: '{"secure/":"strict"}'
   PROCESSED_ACTION: "move"        # move (to processed/) or delete
   POLL_INTERVAL: "15s"
-  WORKERS: "4"
-  MAX_OBJECT_BYTES: "536870912"   # 512Mi; objects larger than this are skipped, not
-                                  # downloaded whole. Keep it below limits.memory.
+  # Memory budget. Each concurrent worker can hold roughly
+  # MAX_OBJECT_BYTES (the compressed input) + MAX_EXPAND_BYTES (everything it
+  # decompresses) plus transient copies while repacking. Size WORKERS against
+  # limits.memory below:
+  #     WORKERS * (MAX_OBJECT_BYTES + MAX_EXPAND_BYTES) <= ~60% of limits.memory
+  # With 2 * (64Mi + 192Mi) = 512Mi against a 1Gi limit there is headroom for
+  # repack copies and GC. The service logs worst_case_resident_bytes at startup.
+  WORKERS: "2"
+  MAX_OBJECT_BYTES: "67108864"    # 64Mi compressed input; larger objects are
+                                  # skipped without being downloaded whole.
+  MAX_EXPAND_BYTES: "201326592"   # 192Mi cumulative decompressed bytes per object.
+                                  # Enforced *while* reading, so this is a real
+                                  # memory bound rather than a ratio heuristic.
   SCRUB_FILENAMES: "true"         # also scrub archive member names/paths + output key
   # Reports live in an internal bucket for operators to verify the scrub, so they
   # show the actual original values by default. Set "true" to store salted hashes
   # instead if the reports bucket is less trusted than the operators.
   REDACT_REPORTS: "false"
   MAX_DEPTH: "16"
-  MAX_RATIO: "200"
+  MAX_MEMBERS: "100000"
+  # MAX_RATIO is gone. An expansion-ratio limit cannot tell a decompression bomb
+  # from an ordinary log file (logs routinely compress 200:1 and beyond), and
+  # tripping it emitted the object UNSCRUBBED. Use MAX_EXPAND_BYTES instead.
+  # Number of past runs the UI may request from /api/history.
+  HISTORY_MAX: "100"
+  # debug logs a line per file inside every bundle as it is scrubbed.
+  LOG_LEVEL: "info"
   PORT: "8080"
+  # Let the Go GC know the container ceiling so it collects harder as it nears it
+  # rather than being OOM-killed. Keep this below limits.memory.
+  GOMEMLIMIT: "800MiB"
   # Web UI: browser uploads straight to MinIO via presigned URLs, so the browser
   # must be able to reach MinIO. Set these to MinIO's externally reachable host.
   # (MinIO also needs CORS allowing the scrubber Route origin.)
@@ -85,14 +105,25 @@ spec:
             # - name: ca
             #   mountPath: /etc/scrubber/ca
             #   readOnly: true
+          # /readyz checks that MinIO is reachable (cached for a few seconds and
+          # given its own deadline in-process, so a slow backend cannot make the
+          # probe hang).
           readinessProbe:
             httpGet: { path: /readyz, port: 8080 }
             initialDelaySeconds: 5
             periodSeconds: 10
+            timeoutSeconds: 5
+            failureThreshold: 3
+          # /healthz is a pure liveness signal and does no I/O. The generous
+          # timeout and threshold matter: the default 1s timeout is easy to miss
+          # while the process is under GC pressure scrubbing a large bundle, and
+          # a restart there loses in-flight work.
           livenessProbe:
             httpGet: { path: /healthz, port: 8080 }
             initialDelaySeconds: 10
             periodSeconds: 20
+            timeoutSeconds: 5
+            failureThreshold: 6
           resources:
             requests: { cpu: 100m, memory: 256Mi }
             limits:   { cpu: "1",  memory: 1Gi }

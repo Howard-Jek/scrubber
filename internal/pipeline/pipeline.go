@@ -6,6 +6,7 @@ package pipeline
 
 import (
 	"bytes"
+	"errors"
 	"fmt"
 
 	"github.com/howard/scrubber/internal/archive"
@@ -15,25 +16,44 @@ import (
 )
 
 // Limits bounds resource use to defuse decompression bombs and quines.
+//
+// There is deliberately no expansion-ratio limit. Ratio cannot separate a bomb
+// from an ordinary log: real-world log files compress at 200:1 to 1000:1, so any
+// ratio threshold low enough to catch a bomb also rejects the tool's primary
+// input — and rejection means the file is emitted UNSCRUBBED. Memory is bounded
+// instead by MaxTotalBytes, enforced while reading, which is a true bound.
 type Limits struct {
-	MaxDepth      int   // maximum container nesting depth
-	MaxRatio      int   // maximum decompressed/compressed size ratio per stream
-	MaxTotalBytes int64 // absolute cap on a single decompressed stream
-	MaxMembers    int   // maximum entries in a single archive
+	MaxDepth int // maximum container nesting depth
+	// MaxTotalBytes is the cumulative expansion budget for one top-level object:
+	// the total decompressed bytes the engine will hold across every nested
+	// stream and archive member. Size it below the process memory limit.
+	MaxTotalBytes int64
+	MaxMembers    int // maximum entries in a single archive
 }
 
 // DefaultLimits returns conservative defaults.
 func DefaultLimits() Limits {
-	return Limits{MaxDepth: 16, MaxRatio: 200, MaxTotalBytes: 2 << 30, MaxMembers: 100000}
+	return Limits{MaxDepth: 16, MaxTotalBytes: 2 << 30, MaxMembers: 100000}
 }
 
 // Engine carries the compiled rules, the report sink, and the limits.
+//
+// An Engine is single-use per top-level object and is not safe for concurrent
+// Process calls; the expansion budget is engine state. The worker builds one per
+// object, and the CLI reuses one sequentially (the budget resets at depth 0).
 type Engine struct {
 	Matcher    *scrub.Matcher
 	Report     *report.Report
 	Limits     Limits
 	ScrubNames bool // also scrub archive member names / paths, not just contents
+
+	// budget is the remaining cumulative expansion allowance, reset on each
+	// depth-0 Process call.
+	budget int64
 }
+
+// take draws n bytes from the expansion budget.
+func (e *Engine) take(n int) { e.budget -= int64(n) }
 
 // scrubMemberName scrubs an archive entry's name (when enabled), records any hits,
 // and reports whether the name changed. origPath is the report label.
@@ -53,6 +73,12 @@ func (e *Engine) scrubMemberName(origPath, name string, inBytes int) (string, bo
 // returns an error: on any failure it records the event and returns the original
 // bytes unchanged.
 func (e *Engine) Process(path string, data []byte, depth int) []byte {
+	if depth == 0 {
+		e.budget = e.Limits.MaxTotalBytes
+		if e.budget <= 0 {
+			e.budget = DefaultLimits().MaxTotalBytes
+		}
+	}
 	if depth > e.Limits.MaxDepth {
 		e.Report.Record(path, report.StatusGuardTripped,
 			fmt.Sprintf("nesting depth exceeded %d", e.Limits.MaxDepth), len(data), len(data), nil)
@@ -99,23 +125,26 @@ func (e *Engine) handleLeaf(path string, data []byte) []byte {
 }
 
 func (e *Engine) handleCompressed(f detect.Format, path string, data []byte, depth int) []byte {
-	inner, err := archive.Decompress(f, data)
+	inner, meta, err := archive.Decompress(f, data, e.budget)
 	if err != nil {
+		if errors.Is(err, archive.ErrTooLarge) {
+			e.Report.Record(path, report.StatusGuardTripped,
+				fmt.Sprintf("decompressing %s would exceed the remaining %d-byte expansion budget", f, e.budget),
+				len(data), len(data), nil)
+			return data
+		}
 		e.Report.Record(path, report.StatusPassthrough,
 			fmt.Sprintf("could not decompress %s: %v", f, err), len(data), len(data), nil)
 		return data
 	}
-	if tripped, why := e.guard(len(data), inner); tripped {
-		e.Report.Record(path, report.StatusGuardTripped, why, len(data), len(data), nil)
-		return data
-	}
+	e.take(len(inner))
 
 	processed := e.Process(path, inner, depth+1)
 	if bytes.Equal(processed, inner) {
 		// Nothing changed inside; keep the original bytes for exact fidelity.
 		return data
 	}
-	recompressed, err := archive.Compress(f, processed)
+	recompressed, err := archive.Compress(f, processed, meta)
 	if err != nil {
 		// Read-only format (e.g. bzip2) or compressor error: pass original through.
 		e.Report.Record(path, report.StatusUnsupported,
@@ -126,16 +155,18 @@ func (e *Engine) handleCompressed(f detect.Format, path string, data []byte, dep
 }
 
 func (e *Engine) handleTar(path string, data []byte, depth int) []byte {
-	members, err := archive.ReadTar(data)
+	members, err := archive.ReadTar(data, e.budget, e.Limits.MaxMembers)
 	if err != nil {
+		if tripped, why := containerGuard(err, "tar", e.budget, e.Limits.MaxMembers); tripped {
+			e.Report.Record(path, report.StatusGuardTripped, why, len(data), len(data), nil)
+			return data
+		}
 		e.Report.Record(path, report.StatusPassthrough,
 			fmt.Sprintf("could not read tar: %v", err), len(data), len(data), nil)
 		return data
 	}
-	if len(members) > e.Limits.MaxMembers {
-		e.Report.Record(path, report.StatusGuardTripped,
-			fmt.Sprintf("member count %d exceeds %d", len(members), e.Limits.MaxMembers), len(data), len(data), nil)
-		return data
+	for i := range members {
+		e.take(len(members[i].Body))
 	}
 	changed := false
 	for i := range members {
@@ -167,16 +198,18 @@ func (e *Engine) handleTar(path string, data []byte, depth int) []byte {
 }
 
 func (e *Engine) handleZip(path string, data []byte, depth int) []byte {
-	members, err := archive.ReadZip(data)
+	members, err := archive.ReadZip(data, e.budget, e.Limits.MaxMembers)
 	if err != nil {
+		if tripped, why := containerGuard(err, "zip", e.budget, e.Limits.MaxMembers); tripped {
+			e.Report.Record(path, report.StatusGuardTripped, why, len(data), len(data), nil)
+			return data
+		}
 		e.Report.Record(path, report.StatusPassthrough,
 			fmt.Sprintf("could not read zip: %v", err), len(data), len(data), nil)
 		return data
 	}
-	if len(members) > e.Limits.MaxMembers {
-		e.Report.Record(path, report.StatusGuardTripped,
-			fmt.Sprintf("member count %d exceeds %d", len(members), e.Limits.MaxMembers), len(data), len(data), nil)
-		return data
+	for i := range members {
+		e.take(len(members[i].Body))
 	}
 	changed := false
 	for i := range members {
@@ -207,13 +240,15 @@ func (e *Engine) handleZip(path string, data []byte, depth int) []byte {
 	return rebuilt
 }
 
-// guard applies the decompression-bomb checks to a freshly decompressed stream.
-func (e *Engine) guard(compressed int, inner []byte) (bool, string) {
-	if int64(len(inner)) > e.Limits.MaxTotalBytes {
-		return true, fmt.Sprintf("decompressed size %d exceeds cap %d", len(inner), e.Limits.MaxTotalBytes)
-	}
-	if compressed > 0 && len(inner)/compressed > e.Limits.MaxRatio {
-		return true, fmt.Sprintf("expansion ratio %d exceeds %d", len(inner)/compressed, e.Limits.MaxRatio)
+// containerGuard translates an archive read failure into a guard-tripped reason
+// when it was a resource limit rather than a malformed container, so the two are
+// never conflated in the report.
+func containerGuard(err error, kind string, budget int64, maxMembers int) (bool, string) {
+	switch {
+	case errors.Is(err, archive.ErrTooLarge):
+		return true, fmt.Sprintf("%s members would exceed the remaining %d-byte expansion budget", kind, budget)
+	case errors.Is(err, archive.ErrTooManyMembers):
+		return true, fmt.Sprintf("%s member count exceeds %d", kind, maxMembers)
 	}
 	return false, ""
 }
