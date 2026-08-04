@@ -170,6 +170,74 @@ type Report struct {
 	redact bool
 	salt   []byte
 	onFile func(FileEntry)
+	// deltas runs parallel to Files and holds each entry's exact contribution to
+	// Summary, so a discarded subtree can be un-counted at any audit level (the
+	// retained per-match detail is trimmed or absent below AuditFull).
+	deltas []summaryDelta
+}
+
+// summaryDelta is one entry's contribution to the running Summary.
+type summaryDelta struct {
+	status      Status
+	matches     int
+	byRule      map[string]int
+	byLabel     map[string]int
+	passthrough bool // whether it appended a PassthroughNote
+}
+
+// Mark returns a checkpoint identifying the current end of the report.
+func (r *Report) Mark() int {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	return len(r.Files)
+}
+
+// Rollback discards everything recorded since mark and replaces it with a single
+// entry describing why the work was thrown away.
+//
+// The pipeline sometimes scrubs a subtree and then cannot use the result — a
+// container it can read but not rewrite, or a rebuild that fails. Those matches
+// were never applied to the output, so leaving them counted would tell an
+// operator that more was redacted than actually was. That is the one direction a
+// transparency report must never be wrong in.
+func (r *Report) Rollback(mark int, path string, status Status, detail string, bytesIn, bytesOut int) {
+	r.mu.Lock()
+	if mark < 0 || mark > len(r.Files) {
+		r.mu.Unlock()
+		return
+	}
+	for _, d := range r.deltas[mark:] {
+		r.Summary.FilesTotal--
+		switch d.status {
+		case StatusScrubbed:
+			r.Summary.FilesScrubbed--
+		case StatusUnchanged:
+			r.Summary.FilesUnchanged--
+		case StatusBinarySkip:
+			r.Summary.FilesBinarySkip--
+		case StatusPassthrough, StatusUnsupported, StatusGuardTripped:
+			r.Summary.FilesPassthrough--
+		}
+		if d.passthrough && len(r.Summary.Passthroughs) > 0 {
+			r.Summary.Passthroughs = r.Summary.Passthroughs[:len(r.Summary.Passthroughs)-1]
+		}
+		r.Summary.TotalMatches -= d.matches
+		for k, v := range d.byRule {
+			if r.Summary.MatchesByRule[k] -= v; r.Summary.MatchesByRule[k] <= 0 {
+				delete(r.Summary.MatchesByRule, k)
+			}
+		}
+		for k, v := range d.byLabel {
+			if r.Summary.MatchesByLabel[k] -= v; r.Summary.MatchesByLabel[k] <= 0 {
+				delete(r.Summary.MatchesByLabel, k)
+			}
+		}
+	}
+	r.Files = r.Files[:mark]
+	r.deltas = r.deltas[:mark]
+	r.mu.Unlock()
+
+	r.Record(path, status, detail, bytesIn, bytesOut, nil)
 }
 
 // OnFile registers a callback invoked for each file as it is recorded, so a
@@ -219,7 +287,8 @@ func (r *Report) Record(path string, status Status, detail string, bytesIn, byte
 
 	r.Files = append(r.Files, entry)
 
-	// Summary accounting.
+	// Summary accounting, mirrored into a delta so it can be undone exactly.
+	delta := summaryDelta{status: status}
 	r.Summary.FilesTotal++
 	switch status {
 	case StatusScrubbed:
@@ -233,13 +302,21 @@ func (r *Report) Record(path string, status Status, detail string, bytesIn, byte
 		if len(r.Summary.Passthroughs) < maxPassthroughNotes {
 			r.Summary.Passthroughs = append(r.Summary.Passthroughs,
 				PassthroughNote{Path: path, Status: status, Reason: detail})
+			delta.passthrough = true
 		}
 	}
 	for _, m := range matches {
 		r.Summary.TotalMatches++
 		r.Summary.MatchesByRule[m.RuleID]++
 		r.Summary.MatchesByLabel[m.Replacement]++
+		delta.matches++
+		if delta.byRule == nil {
+			delta.byRule, delta.byLabel = map[string]int{}, map[string]int{}
+		}
+		delta.byRule[m.RuleID]++
+		delta.byLabel[m.Replacement]++
 	}
+	r.deltas = append(r.deltas, delta)
 
 	if r.onFile != nil {
 		// Hand out the summary fields only; per-match detail can contain cleartext
