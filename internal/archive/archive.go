@@ -239,6 +239,19 @@ func Decompress(f detect.Format, data []byte, budget int64) ([]byte, *Meta, erro
 	}
 }
 
+// CanWrite reports whether this build can re-encode f. Formats we can read but
+// not write must not be descended into at all: the pipeline would decompress,
+// scrub, then have to throw the result away, wasting the work and — worse —
+// leaving the discarded matches counted as if they had been applied.
+func CanWrite(f detect.Format) bool {
+	switch f {
+	case detect.Gzip, detect.Zlib, detect.Xz, detect.Zstd:
+		return true
+	default:
+		return false
+	}
+}
+
 // Compress re-wraps data in the given single-stream format, restoring any
 // metadata captured by Decompress. Returns ErrNoWriter for formats we can read
 // but not write (bzip2 in this build).

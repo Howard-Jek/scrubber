@@ -125,6 +125,17 @@ func (e *Engine) handleLeaf(path string, data []byte) []byte {
 }
 
 func (e *Engine) handleCompressed(f detect.Format, path string, data []byte, depth int) []byte {
+	// Do not descend into a format we cannot re-encode. Scrubbing it would mean
+	// discarding the result at repack time, wasting the work and leaving those
+	// matches counted as redacted when they were never applied.
+	if !archive.CanWrite(f) {
+		e.Report.Record(path, report.StatusUnsupported,
+			fmt.Sprintf("%s can be read but not rewritten in this build; passed through unchanged and NOT scrubbed", f),
+			len(data), len(data), nil)
+		return data
+	}
+
+	mark := e.Report.Mark()
 	inner, meta, err := archive.Decompress(f, data, e.budget)
 	if err != nil {
 		if errors.Is(err, archive.ErrTooLarge) {
@@ -146,15 +157,18 @@ func (e *Engine) handleCompressed(f detect.Format, path string, data []byte, dep
 	}
 	recompressed, err := archive.Compress(f, processed, meta)
 	if err != nil {
-		// Read-only format (e.g. bzip2) or compressor error: pass original through.
-		e.Report.Record(path, report.StatusUnsupported,
-			fmt.Sprintf("cannot re-write %s (%v); passed through unchanged", f, err), len(data), len(data), nil)
+		// The scrubbed bytes cannot be repacked, so the original goes out instead.
+		// Roll the subtree's accounting back: those replacements never landed.
+		e.Report.Rollback(mark, path, report.StatusUnsupported,
+			fmt.Sprintf("cannot re-write %s (%v); passed through unchanged and NOT scrubbed", f, err),
+			len(data), len(data))
 		return data
 	}
 	return recompressed
 }
 
 func (e *Engine) handleTar(path string, data []byte, depth int) []byte {
+	mark := e.Report.Mark()
 	members, err := archive.ReadTar(data, e.budget, e.Limits.MaxMembers)
 	if err != nil {
 		if tripped, why := containerGuard(err, "tar", e.budget, e.Limits.MaxMembers); tripped {
@@ -190,14 +204,18 @@ func (e *Engine) handleTar(path string, data []byte, depth int) []byte {
 	}
 	rebuilt, err := archive.WriteTar(members)
 	if err != nil {
-		e.Report.Record(path, report.StatusPassthrough,
-			fmt.Sprintf("could not rebuild tar: %v", err), len(data), len(data), nil)
+		// The scrubbed members cannot be repacked, so the original archive goes
+		// out. Un-count them: none of those replacements reached the output.
+		e.Report.Rollback(mark, path, report.StatusPassthrough,
+			fmt.Sprintf("could not rebuild tar (%v); passed through unchanged and NOT scrubbed", err),
+			len(data), len(data))
 		return data
 	}
 	return rebuilt
 }
 
 func (e *Engine) handleZip(path string, data []byte, depth int) []byte {
+	mark := e.Report.Mark()
 	members, err := archive.ReadZip(data, e.budget, e.Limits.MaxMembers)
 	if err != nil {
 		if tripped, why := containerGuard(err, "zip", e.budget, e.Limits.MaxMembers); tripped {
@@ -233,8 +251,9 @@ func (e *Engine) handleZip(path string, data []byte, depth int) []byte {
 	}
 	rebuilt, err := archive.WriteZip(members)
 	if err != nil {
-		e.Report.Record(path, report.StatusPassthrough,
-			fmt.Sprintf("could not rebuild zip: %v", err), len(data), len(data), nil)
+		e.Report.Rollback(mark, path, report.StatusPassthrough,
+			fmt.Sprintf("could not rebuild zip (%v); passed through unchanged and NOT scrubbed", err),
+			len(data), len(data))
 		return data
 	}
 	return rebuilt
