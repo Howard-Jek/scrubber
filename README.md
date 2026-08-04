@@ -212,8 +212,20 @@ to a `processed/` prefix (or deleted).
 input) plus `MAX_EXPAND_BYTES` (everything it decompresses), plus transient copies while
 repacking. Keep `WORKERS × (MAX_OBJECT_BYTES + MAX_EXPAND_BYTES)` under ~60% of the
 container memory limit and set `GOMEMLIMIT` below that limit. The service logs
-`worst_case_resident_bytes` at startup so the configured budget is visible. Defaults
-(2 workers, 64 MiB + 192 MiB) fit the 1 GiB limit in the shipped manifests.
+`worst_case_resident_bytes` at startup so the configured budget is visible.
+
+These three values and `resources.limits.memory` move together — changing one alone is
+how you get an OOM. The shipped manifests use 2 workers × (64 MiB + 512 MiB) = 1152 MiB
+against a 2 GiB limit. If 2 GiB is not available, drop `WORKERS` to `1` and keep the
+limit at 1 GiB; that halves throughput but not per-object capacity.
+
+> A `.tar.gz` draws on `MAX_EXPAND_BYTES` **twice** — once for the decompressed tar and
+> once for the member bodies copied out of it, which really are two live copies. Budget
+> roughly half of `MAX_EXPAND_BYTES` as usable tar.gz content.
+
+`MAX_OBJECT_BYTES` is a separate ceiling on the *uploaded* (still compressed) object.
+An upload above it is skipped rather than downloaded, and reported as `skipped` — so it
+is usually the first limit a user hits, independent of `MAX_EXPAND_BYTES`.
 
 **Policies ("both"):** named policy files (same schema as the terms file) are mounted
 from a ConfigMap at `/etc/scrubber/policies/*.json` and hot-reloaded on change.
@@ -253,9 +265,9 @@ browser uploads:
 **Deploy on OpenShift:**
 ```sh
 # 1. build + push the image (air-gap: override BASE_*_IMAGE / GOPROXY to Artifactory mirrors)
-podman build -f deploy/Containerfile -t <artifactory>/docker-local/scrubberd:0.1.0 .
-podman push <artifactory>/docker-local/scrubberd:0.1.0
-#    (air-gapped: transfer dist/scrubberd-0.1.0.tar and `podman load -i` on the target)
+podman build -f deploy/Containerfile -t <artifactory>/docker-local/scrubberd:0.2.0 .
+podman push <artifactory>/docker-local/scrubberd:0.2.0
+#    (air-gapped: transfer dist/scrubberd-0.2.0.tar and `podman load -i` on the target)
 
 # 2. prereqs: MinIO creds Secret + named-policy ConfigMap
 oc create secret generic scrubber-secret \

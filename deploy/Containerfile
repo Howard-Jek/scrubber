@@ -6,7 +6,7 @@
 #     --build-arg BASE_BUILD_IMAGE=<artifactory>/docker-public/golang:1.25 \
 #     --build-arg BASE_RUNTIME_IMAGE=<artifactory>/docker-public/ubi9/ubi-micro:latest \
 #     --build-arg GOPROXY=https://<artifactory>/artifactory/api/go/go-remote \
-#     -t <artifactory>/docker-local/scrubberd:0.1.0 .
+#     -t <artifactory>/docker-local/scrubberd:0.2.0 .
 
 ARG BASE_BUILD_IMAGE=docker.io/library/golang:1.25
 ARG BASE_RUNTIME_IMAGE=registry.access.redhat.com/ubi9/ubi-micro:latest

@@ -36,14 +36,22 @@ data:
   # decompresses) plus transient copies while repacking. Size WORKERS against
   # limits.memory below:
   #     WORKERS * (MAX_OBJECT_BYTES + MAX_EXPAND_BYTES) <= ~60% of limits.memory
-  # With 2 * (64Mi + 192Mi) = 512Mi against a 1Gi limit there is headroom for
-  # repack copies and GC. The service logs worst_case_resident_bytes at startup.
+  # With 2 * (64Mi + 512Mi) = 1152Mi against the 2Gi limit below (56%) there is
+  # headroom for repack copies and GC. The service logs worst_case_resident_bytes
+  # at startup -- check it against limits.memory after changing any of these.
+  # If you cannot allocate 2Gi, drop WORKERS to 1 and keep limits.memory at 1Gi
+  # (1 * 576Mi = 56% of 1Gi); that halves throughput but not capacity per object.
   WORKERS: "2"
   MAX_OBJECT_BYTES: "67108864"    # 64Mi compressed input; larger objects are
                                   # skipped without being downloaded whole.
-  MAX_EXPAND_BYTES: "201326592"   # 192Mi cumulative decompressed bytes per object.
+  MAX_EXPAND_BYTES: "536870912"   # 512Mi cumulative decompressed bytes per object.
                                   # Enforced *while* reading, so this is a real
                                   # memory bound rather than a ratio heuristic.
+                                  # NOTE: a .tar.gz draws on this budget twice --
+                                  # once for the decompressed tar, once for the
+                                  # member bodies copied out of it (they really
+                                  # are two copies in memory). Effective capacity
+                                  # for a tar.gz is therefore ~256Mi of content.
   SCRUB_FILENAMES: "true"         # also scrub archive member names/paths + output key
   # Reports live in an internal bucket for operators to verify the scrub, so they
   # show the actual original values by default. Set "true" to store salted hashes
@@ -61,7 +69,7 @@ data:
   PORT: "8080"
   # Let the Go GC know the container ceiling so it collects harder as it nears it
   # rather than being OOM-killed. Keep this below limits.memory.
-  GOMEMLIMIT: "800MiB"
+  GOMEMLIMIT: "1600MiB"
   # Web UI: browser uploads straight to MinIO via presigned URLs, so the browser
   # must be able to reach MinIO. Set these to MinIO's externally reachable host.
   # (MinIO also needs CORS allowing the scrubber Route origin.)
@@ -90,7 +98,7 @@ spec:
         - name: artifactory-pull   # only if pulling from a private Artifactory repo
       containers:
         - name: scrubberd
-          image: <ARTIFACTORY_DOCKER_HOST>/docker-local/scrubberd:0.1.0
+          image: <ARTIFACTORY_DOCKER_HOST>/docker-local/scrubberd:0.2.0
           ports:
             - containerPort: 8080
           envFrom:
@@ -125,8 +133,10 @@ spec:
             timeoutSeconds: 5
             failureThreshold: 6
           resources:
-            requests: { cpu: 100m, memory: 256Mi }
-            limits:   { cpu: "1",  memory: 1Gi }
+            # Sized from the MAX_OBJECT_BYTES / MAX_EXPAND_BYTES / WORKERS budget
+            # in the ConfigMap above -- change them together, never one alone.
+            requests: { cpu: 100m, memory: 512Mi }
+            limits:   { cpu: "1",  memory: 2Gi }
           securityContext:
             runAsNonRoot: true
             allowPrivilegeEscalation: false
