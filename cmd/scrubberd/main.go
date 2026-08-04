@@ -89,16 +89,27 @@ func realMain(log *slog.Logger) error {
 		Action:         worker.ProcessedAction(envDefault("PROCESSED_ACTION", "move")),
 		PollInterval:   envDuration("POLL_INTERVAL", 15*time.Second),
 		Workers:        envInt("WORKERS", 4),
-		MaxObjectBytes: int64(envInt("MAX_OBJECT_BYTES", 512<<20)),
+		MaxObjectBytes: envInt64("MAX_OBJECT_BYTES", 256<<20),
 		RedactReports:  envBool("REDACT_REPORTS", false),
 		ScrubNames:     envBool("SCRUB_FILENAMES", true),
 		Limits: pipeline.Limits{
 			MaxDepth:      envInt("MAX_DEPTH", 16),
-			MaxRatio:      envInt("MAX_RATIO", 200),
-			MaxTotalBytes: 2 << 30,
-			MaxMembers:    100000,
+			MaxTotalBytes: envInt64("MAX_EXPAND_BYTES", 256<<20),
+			MaxMembers:    envInt("MAX_MEMBERS", 100000),
 		},
 	}
+	if os.Getenv("MAX_RATIO") != "" {
+		log.Warn("MAX_RATIO is ignored and can be removed from the config. " +
+			"An expansion-ratio limit cannot distinguish a decompression bomb from an " +
+			"ordinary log file (logs routinely compress 200:1 and beyond), and tripping " +
+			"it emitted the object UNSCRUBBED. Memory is now bounded by MAX_EXPAND_BYTES, " +
+			"enforced while decompressing.")
+	}
+	log.Info("resource limits",
+		"max_object_bytes", wcfg.MaxObjectBytes,
+		"max_expand_bytes", wcfg.Limits.MaxTotalBytes,
+		"workers", wcfg.Workers,
+		"worst_case_resident_bytes", int64(wcfg.Workers)*(wcfg.MaxObjectBytes+wcfg.Limits.MaxTotalBytes))
 	wk := worker.New(st, reg, m, jobs, wcfg, log)
 
 	// --- control + browser API server ---
@@ -207,6 +218,15 @@ func envBool(k string, def bool) bool {
 func envInt(k string, def int) int {
 	if v := os.Getenv(k); v != "" {
 		if n, err := strconv.Atoi(v); err == nil {
+			return n
+		}
+	}
+	return def
+}
+
+func envInt64(k string, def int64) int64 {
+	if v := os.Getenv(k); v != "" {
+		if n, err := strconv.ParseInt(v, 10, 64); err == nil {
 			return n
 		}
 	}

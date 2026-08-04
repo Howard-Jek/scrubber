@@ -39,12 +39,22 @@ func run(args []string) int {
 		salt        = fs.String("salt", "scrubber", "salt used when --redact-report is set")
 		dryRun      = fs.Bool("dry-run", false, "analyze and report without writing any output")
 		maxDepth    = fs.Int("max-depth", 16, "maximum container nesting depth")
-		maxRatio    = fs.Int("max-ratio", 200, "maximum decompression expansion ratio per stream")
+		maxBytes    = fs.Int64("max-expand-bytes", 2<<30, "cumulative decompressed bytes held in memory per input")
+		maxRatio    = fs.Int("max-ratio", 0, "DEPRECATED, ignored: expansion-ratio limits reject ordinary logs (see --max-expand-bytes)")
 		scrubNames  = fs.Bool("scrub-names", true, "also scrub archive member names/paths, not just contents")
 		verbose     = fs.Bool("verbose", false, "print the per-rule breakdown to stderr")
+		failUnscrub = fs.Bool("fail-on-unscrubbed", false, "exit 3 if any file was emitted unscrubbed (guard-tripped, unreadable, or unsupported container)")
 	)
 	if err := fs.Parse(args); err != nil {
 		return 2
+	}
+
+	if *maxRatio != 0 {
+		fmt.Fprintln(os.Stderr,
+			"warning: --max-ratio is ignored. An expansion-ratio limit cannot tell a\n"+
+				"         decompression bomb from an ordinary log (logs compress 200:1 and\n"+
+				"         beyond), and tripping it emits the file UNSCRUBBED. Memory is now\n"+
+				"         bounded by --max-expand-bytes, enforced while reading.")
 	}
 
 	if *termsPath == "" || *inPath == "" {
@@ -91,8 +101,7 @@ func run(args []string) int {
 		ScrubNames: *scrubNames,
 		Limits: pipeline.Limits{
 			MaxDepth:      *maxDepth,
-			MaxRatio:      *maxRatio,
-			MaxTotalBytes: 2 << 30,
+			MaxTotalBytes: *maxBytes,
 			MaxMembers:    100000,
 		},
 	}
@@ -118,6 +127,9 @@ func run(args []string) int {
 		for _, line := range rep.RuleBreakdown() {
 			fmt.Fprintln(os.Stderr, line)
 		}
+	}
+	if *failUnscrub && rep.HasUnscrubbed() {
+		return 3
 	}
 	return 0
 }

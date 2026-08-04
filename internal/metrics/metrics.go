@@ -8,6 +8,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/howard/scrubber/internal/report"
 	"github.com/prometheus/client_golang/prometheus"
 )
 
@@ -58,6 +59,12 @@ type Job struct {
 	// OutputKey is where the scrubbed object was written (may differ from Key when
 	// filename scrubbing renamed it).
 	OutputKey string `json:"output_key,omitempty"`
+	// Passthrough counts files inside the bundle that were emitted WITHOUT being
+	// scrubbed. Non-zero means the result is not fully sanitized and a human must
+	// review it, so it is surfaced as a warning rather than a success.
+	Passthrough int `json:"passthrough"`
+	// PassthroughPaths names those files and why, for display.
+	PassthroughPaths []report.PassthroughNote `json:"passthrough_paths,omitempty"`
 }
 
 // JobLog is a fixed-size ring buffer of recent jobs.

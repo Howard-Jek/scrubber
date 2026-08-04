@@ -158,10 +158,7 @@ func (s *Server) apiStatus(w http.ResponseWriter, r *http.Request) {
 	}
 	for _, j := range s.d.Jobs.Recent() {
 		if j.Key == key {
-			writeJSON(w, map[string]any{
-				"status": j.Status, "policy": j.Policy, "matches": j.Matches,
-				"bytes_in": j.BytesIn, "bytes_out": j.BytesOut, "by_label": j.ByLabel, "error": j.Error,
-			})
+			writeJSON(w, jobStatusPayload(j))
 			return
 		}
 	}
@@ -199,6 +196,23 @@ func (s *Server) index(w http.ResponseWriter, r *http.Request) {
 	}
 	w.Header().Set("Content-Type", "text/html; charset=utf-8")
 	_, _ = w.Write(indexHTML)
+}
+
+// jobStatusPayload renders a job for the browser. It always includes the
+// passthrough fields so the UI can distinguish a fully scrubbed bundle from one
+// that contains files the pipeline never inspected.
+func jobStatusPayload(j metrics.Job) map[string]any {
+	return map[string]any{
+		"status":            j.Status,
+		"policy":            j.Policy,
+		"matches":           j.Matches,
+		"bytes_in":          j.BytesIn,
+		"bytes_out":         j.BytesOut,
+		"by_label":          j.ByLabel,
+		"error":             j.Error,
+		"passthrough":       j.Passthrough,
+		"passthrough_paths": j.PassthroughPaths,
+	}
 }
 
 func writeJSON(w http.ResponseWriter, v any) {

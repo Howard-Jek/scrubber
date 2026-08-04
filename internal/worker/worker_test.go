@@ -244,3 +244,71 @@ func TestWorkerSkipsCorruptWithoutCrashing(t *testing.T) {
 		t.Errorf("corrupt object should pass through byte-identical, got %q", out)
 	}
 }
+
+// panicStore wraps a memStore and panics on Put, simulating a bug anywhere in
+// the per-object path.
+type panicStore struct {
+	*memStore
+	panicOn string
+}
+
+func (p *panicStore) Put(ctx context.Context, bucket, key string, data []byte, ct string) error {
+	if bucket == p.panicOn {
+		panic("simulated bug in the object path")
+	}
+	return p.memStore.Put(ctx, bucket, key, data, ct)
+}
+
+// TestWorkerSurvivesPanic checks that a panic costs one object rather than the
+// whole service. Without recovery the goroutine takes the process down, which
+// orphans every in-flight upload and wipes the in-memory job history — the
+// failure mode behind "stuck forever while MinIO shows the object finished".
+func TestWorkerSurvivesPanic(t *testing.T) {
+	ms := newMemStore("input", "output", "reports")
+	ms.Put(context.Background(), "input", "boom.log", []byte("AcmeCorp\n"), "")
+	ms.Put(context.Background(), "input", "fine.log", []byte("AcmeCorp\n"), "")
+
+	ps := &panicStore{memStore: ms, panicOn: "output"}
+	w := newTestWorker(t, ms)
+	w.store = ps
+
+	// Must return normally rather than taking the test process down.
+	w.pollOnce(context.Background())
+
+	var sawError bool
+	for _, j := range w.jobs.Recent() {
+		if j.Status == "error" && strings.Contains(j.Error, "panic") {
+			sawError = true
+		}
+	}
+	if !sawError {
+		t.Error("panic should be recorded as a job error so the UI stops waiting")
+	}
+}
+
+// TestWorkerReportsUnscrubbedFiles checks that an object containing a member the
+// pipeline could not inspect is reported with a non-zero passthrough count, so
+// the UI can warn instead of showing a green check.
+func TestWorkerReportsUnscrubbedFiles(t *testing.T) {
+	ms := newMemStore("input", "output", "reports")
+	sevenZip := append([]byte{'7', 'z', 0xbc, 0xaf, 0x27, 0x1c}, bytes.Repeat([]byte{1}, 64)...)
+	ms.Put(context.Background(), "input", "vendor.7z", sevenZip, "")
+
+	w := newTestWorker(t, ms)
+	w.pollOnce(context.Background())
+
+	jobs := w.jobs.Recent()
+	if len(jobs) == 0 {
+		t.Fatal("no job recorded")
+	}
+	j := jobs[len(jobs)-1]
+	if j.Status != "scrubbed" {
+		t.Fatalf("status = %q, want scrubbed", j.Status)
+	}
+	if j.Passthrough == 0 {
+		t.Error("passthrough count should be non-zero for an uninspectable container")
+	}
+	if len(j.PassthroughPaths) == 0 {
+		t.Error("passthrough paths should name the uninspected file")
+	}
+}

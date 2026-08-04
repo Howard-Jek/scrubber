@@ -11,6 +11,7 @@ import (
 	"fmt"
 	"os"
 	"sort"
+	"strings"
 	"sync"
 
 	"github.com/howard/scrubber/internal/scrub"
@@ -61,6 +62,21 @@ type FileEntry struct {
 	Matches  []scrub.Match `json:"matches,omitempty"`
 }
 
+// PassthroughNote identifies a file that was emitted WITHOUT being scrubbed and
+// why. These are the entries a reviewer must inspect by hand before sharing the
+// bundle: the tool could not read them, could not rewrite them, or refused to
+// expand them. Surfacing them is the difference between a safe failure and a
+// silent leak, so they are carried all the way to the UI.
+type PassthroughNote struct {
+	Path   string `json:"path"`
+	Status Status `json:"status"`
+	Reason string `json:"reason,omitempty"`
+}
+
+// maxPassthroughNotes bounds the retained list so a pathological archive can't
+// inflate the report; the count in FilesPassthrough stays exact regardless.
+const maxPassthroughNotes = 100
+
 // Summary aggregates totals across the whole run.
 type Summary struct {
 	FilesTotal       int            `json:"files_total"`
@@ -70,6 +86,9 @@ type Summary struct {
 	FilesPassthrough int            `json:"files_passthrough"`
 	TotalMatches     int            `json:"total_matches"`
 	MatchesByRule    map[string]int `json:"matches_by_rule"`
+	// Passthroughs names the files counted by FilesPassthrough (capped at
+	// maxPassthroughNotes entries).
+	Passthroughs []PassthroughNote `json:"passthroughs,omitempty"`
 	// MatchesByLabel is keyed by the replacement label (e.g. "[EMAIL]") rather than
 	// the rule ID. Rule IDs can embed literal values, so this is the safe breakdown
 	// to surface over a browser-facing / external API.
@@ -138,6 +157,10 @@ func (r *Report) Record(path string, status Status, detail string, bytesIn, byte
 		r.Summary.FilesBinarySkip++
 	case StatusPassthrough, StatusUnsupported, StatusGuardTripped:
 		r.Summary.FilesPassthrough++
+		if len(r.Summary.Passthroughs) < maxPassthroughNotes {
+			r.Summary.Passthroughs = append(r.Summary.Passthroughs,
+				PassthroughNote{Path: path, Status: status, Reason: detail})
+		}
 	}
 	for _, m := range matches {
 		r.Summary.TotalMatches++
@@ -169,11 +192,45 @@ func (r *Report) WriteJSON(path string) error {
 	return os.WriteFile(path, b, 0o600)
 }
 
-// Banner returns the one-line end-of-run transparency summary printed to stderr.
+// HasUnscrubbed reports whether any file was emitted without being scrubbed
+// (guard-tripped, unreadable, or an unsupported container). Binary files are not
+// counted: skipping them is intentional and safe, since byte-substitution would
+// corrupt them.
+func (r *Report) HasUnscrubbed() bool {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	return r.Summary.FilesPassthrough > 0
+}
+
+// Banner returns the end-of-run transparency summary printed to stderr. When any
+// file was emitted unscrubbed the banner says so first and names the files: a
+// caller who reads only one line must not come away believing the bundle is
+// clean when part of it was never inspected.
 func (r *Report) Banner() string {
+	r.mu.Lock()
+	defer r.mu.Unlock()
 	s := r.Summary
-	return fmt.Sprintf("redacted %d matches across %d rules in %d file(s); %d file(s) passed through unchanged, %d binary skipped",
-		s.TotalMatches, len(s.MatchesByRule), s.FilesScrubbed, s.FilesPassthrough, s.FilesBinarySkip)
+
+	base := fmt.Sprintf("redacted %d matches across %d rules in %d file(s); %d binary file(s) skipped",
+		s.TotalMatches, len(s.MatchesByRule), s.FilesScrubbed, s.FilesBinarySkip)
+	if s.FilesPassthrough == 0 {
+		return base
+	}
+
+	var b strings.Builder
+	fmt.Fprintf(&b, "WARNING: %d file(s) were emitted UNSCRUBBED and must be reviewed by hand:\n", s.FilesPassthrough)
+	for _, p := range s.Passthroughs {
+		fmt.Fprintf(&b, "  ! %s (%s)", p.Path, p.Status)
+		if p.Reason != "" {
+			fmt.Fprintf(&b, ": %s", p.Reason)
+		}
+		b.WriteByte('\n')
+	}
+	if n := s.FilesPassthrough - len(s.Passthroughs); n > 0 {
+		fmt.Fprintf(&b, "  ... and %d more\n", n)
+	}
+	b.WriteString(base)
+	return b.String()
 }
 
 // RuleBreakdown returns the per-rule totals sorted by descending count, for the

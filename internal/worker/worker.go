@@ -11,6 +11,7 @@ import (
 	"fmt"
 	"log/slog"
 	"path"
+	"runtime/debug"
 	"strings"
 	"sync"
 	"time"
@@ -135,12 +136,40 @@ func (w *Worker) processObject(ctx context.Context, o store.Object) {
 	start := time.Now()
 	job := metrics.Job{Key: o.Key, Timestamp: start}
 
+	// recorded guards against double-recording a job when a panic unwinds after
+	// the normal path already logged its outcome.
+	recorded := false
+	record := func(j metrics.Job) {
+		if recorded {
+			return
+		}
+		recorded = true
+		w.jobs.Add(j)
+	}
+
+	// A panic in the pipeline must cost one object, not the whole service: without
+	// this the goroutine takes the process down, every in-flight upload is orphaned,
+	// and the in-memory job history is lost.
+	defer func() {
+		r := recover()
+		if r == nil {
+			return
+		}
+		w.metrics.Errors.Inc()
+		w.metrics.Objects.WithLabelValues("panic").Inc()
+		job.Status = "error"
+		job.Error = fmt.Sprintf("internal error while processing (panic: %v)", r)
+		record(job)
+		w.log.Error("panic while processing object; object skipped, service continues",
+			"key", o.Key, "panic", r, "stack", string(debug.Stack()))
+	}()
+
 	fail := func(err error) {
 		w.metrics.Errors.Inc()
 		w.metrics.Objects.WithLabelValues("error").Inc()
 		job.Status = "error"
 		job.Error = err.Error()
-		w.jobs.Add(job)
+		record(job)
 		w.log.Error("process object", "key", o.Key, "err", err)
 	}
 
@@ -152,7 +181,7 @@ func (w *Worker) processObject(ctx context.Context, o store.Object) {
 			w.metrics.Objects.WithLabelValues("too_large").Inc()
 			job.Status = "skipped"
 			job.Error = fmt.Sprintf("object exceeds MaxObjectBytes (%d); skipped", w.cfg.MaxObjectBytes)
-			w.jobs.Add(job)
+			record(job)
 			w.log.Warn("object too large; skipping", "key", o.Key, "limit", w.cfg.MaxObjectBytes)
 			if ferr := w.finish(ctx, o.Key); ferr != nil {
 				w.log.Warn("move oversized input aside", "key", o.Key, "err", ferr)
@@ -225,9 +254,25 @@ func (w *Worker) processObject(ctx context.Context, o store.Object) {
 	job.BytesIn = len(data)
 	job.BytesOut = len(out)
 	job.ByLabel = sum.MatchesByLabel
-	w.jobs.Add(job)
+	job.Passthrough = sum.FilesPassthrough
+	job.PassthroughPaths = sum.Passthroughs
+	record(job)
+
+	if sum.FilesPassthrough > 0 {
+		// Not a clean result: part of the bundle left the pipeline uninspected.
+		// Log it at warn with the offending paths so it is visible without having
+		// to open the report object.
+		paths := make([]string, 0, len(sum.Passthroughs))
+		for _, p := range sum.Passthroughs {
+			paths = append(paths, fmt.Sprintf("%s (%s: %s)", p.Path, p.Status, p.Reason))
+		}
+		w.log.Warn("scrubbed WITH UNSCRUBBED FILES; manual review required",
+			"key", o.Key, "policy", res.Name, "matches", sum.TotalMatches,
+			"unscrubbed_files", sum.FilesPassthrough, "paths", strings.Join(paths, "; "))
+		return
+	}
 	w.log.Info("scrubbed", "key", o.Key, "policy", res.Name, "matches", sum.TotalMatches,
-		"passthrough", sum.FilesPassthrough, "changed", !bytes.Equal(out, data))
+		"binary_skipped", sum.FilesBinarySkip, "changed", !bytes.Equal(out, data))
 }
 
 func (w *Worker) finish(ctx context.Context, key string) error {
