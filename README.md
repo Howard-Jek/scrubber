@@ -243,18 +243,37 @@ alongside a larger batch, and none of them compete for the pod's single CPU.
 `/api/status` reports `queue_position` and `queue_depth` while an object waits, and
 `/api/queue` shows the in-flight key plus the head of the pending list.
 
-**Sizing.** Because objects are processed one at a time, the resident worst case is a
-single object: roughly `MAX_OBJECT_BYTES` (the compressed input) plus
-`MAX_EXPAND_BYTES` (everything it decompresses), plus transient copies while
-repacking. Keep `MAX_OBJECT_BYTES + MAX_EXPAND_BYTES` under ~60% of the container
-memory limit and set `GOMEMLIMIT` below that limit. The service logs
-`worst_case_resident_bytes` at startup so the configured budget is visible.
+**Sizing.** Objects are processed one at a time, so only one is ever resident — but
+**the expansion budget is not resident memory**, and sizing a pod as though it were
+is how you get OOM-killed.
 
-These values and `resources.limits.memory` move together — changing one alone is how
-you get an OOM. The shipped manifests use 64 MiB + 512 MiB = 576 MiB against a 2 GiB
-limit (28%), which leaves real headroom for repack copies and GC. A 1 GiB limit also
-satisfies the rule (576 MiB = 56% of 1 GiB) if quota is tight; drop `GOMEMLIMIT` to
-about 800 MiB alongside it.
+`MAX_OBJECT_BYTES + MAX_EXPAND_BYTES` bounds the bytes *read*: the compressed object
+plus everything decompressed out of it. Actual RSS holds considerably more at the
+same instant — each archive member's scrubbed output alongside its input, the
+repacked archive being assembled, and heap the Go GC has not yet returned. Measured
+with a match-dense `.tar.gz`:
+
+| budget drawn | peak RSS | against a 2 GiB limit |
+| --- | --- | --- |
+| 241 MiB | 1587 MiB | 78% |
+| 407 MiB | 1889 MiB | **92%** |
+
+That is roughly **4–6× the budget**. Note the second row: with `MAX_EXPAND_BYTES` at
+512 MiB a perfectly legal object came within ~160 MiB of the container limit, which
+is why the shipped value is now **256 MiB**.
+
+So size `resources.limits.memory` against `~4.5 × (MAX_OBJECT_BYTES + MAX_EXPAND_BYTES)`,
+not against the sum. The service logs both `budget_bytes` and `est_peak_rss_bytes` at
+startup — compare `est_peak_rss_bytes` with the limit.
+
+`GOMEMLIMIT` deserves care for the same reason. It is a soft target the GC grows the
+heap *toward*, so it sets steady-state RSS as much as it caps it: measured runs
+settled just under it regardless of how much budget the object actually used. Keep it
+well below `limits.memory` — the shipped 1200 MiB against 2 GiB leaves ~850 MiB of
+slack for non-heap memory.
+
+If you need the old 512 MiB expansion capacity, raise `limits.memory` to 4 GiB and
+`GOMEMLIMIT` to ~3000 MiB rather than just putting `MAX_EXPAND_BYTES` back.
 
 `WORKERS` is retained for configuration compatibility but is **clamped to 1**; a
 higher value is ignored with a warning. Concurrent scrubs on a single CPU do not add
@@ -280,7 +299,7 @@ Resolution per object, highest precedence first:
 `REPORTS_BUCKET`, `INPUT_PREFIX`, `DEFAULT_POLICY`, `PREFIX_POLICY_MAP` (JSON),
 `PROCESSED_ACTION` (`move`|`delete`), `POLL_INTERVAL` (default `15s`; discovery only),
 `WORKERS` (clamped to 1), `QUEUE_MAX` (default `10000`), `FINALIZE_GRACE` (default `15s`),
-`MAX_OBJECT_BYTES` (default 64Mi), `MAX_EXPAND_BYTES` (default 512Mi),
+`MAX_OBJECT_BYTES` (default 64Mi), `MAX_EXPAND_BYTES` (default 256Mi),
 `REDACT_REPORTS` (default `false`), `SCRUB_FILENAMES` (default `true`), `PORT` (default `8080`).
 
 **Filenames & paths** are scrubbed by default (`SCRUB_FILENAMES=true`): archive member
@@ -369,7 +388,7 @@ IMAGE=scrubberd:queue    ./scripts/bench-queue.sh
 Serialising does **not** buy raw throughput — on one CPU the same bytes have to be
 scrubbed either way, and `BenchmarkDrainSerialVsFanOut` measures the old fan-out as
 roughly 8% faster on total drain time. What it buys is a halved memory budget
-(576 MiB instead of 1152 MiB) and arrival-ordered completion, so the first upload
+(one object resident instead of two) and arrival-ordered completion, so the first upload
 finishes early instead of every upload finishing late together. `-cpu=1` matters:
 unpinned on a multi-core box the fan-out looks twice as fast, which is true of
 hardware the pod does not have, so the benchmark skips rather than print it.

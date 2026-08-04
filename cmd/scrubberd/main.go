@@ -117,8 +117,13 @@ func realMain(log *slog.Logger) error {
 		RedactReports:  envBool("REDACT_REPORTS", false),
 		ScrubNames:     envBool("SCRUB_FILENAMES", true),
 		Limits: pipeline.Limits{
-			MaxDepth:      envInt("MAX_DEPTH", 16),
-			MaxTotalBytes: envInt64("MAX_EXPAND_BYTES", 512<<20),
+			MaxDepth: envInt("MAX_DEPTH", 16),
+			// 256Mi, not 512Mi. Measured: a match-dense .tar.gz drawing 407Mi of a
+			// 512Mi budget peaked at 1889Mi RSS — 92% of the 2Gi pod. The same shape
+			// drawing 241Mi peaked at 1587Mi. The expansion budget counts bytes read;
+			// resident memory is several times that, so a 512Mi budget does not fit
+			// the pod it was sized for.
+			MaxTotalBytes: envInt64("MAX_EXPAND_BYTES", 256<<20),
 			MaxMembers:    envInt("MAX_MEMBERS", 100000),
 		},
 	}
@@ -129,15 +134,27 @@ func realMain(log *slog.Logger) error {
 			"it emitted the object UNSCRUBBED. Memory is now bounded by MAX_EXPAND_BYTES, " +
 			"enforced while decompressing.")
 	}
-	// Objects are scrubbed one at a time, so the resident worst case is a single
-	// object: its compressed bytes plus everything it decompresses. Check this
-	// against the container's memory limit after changing either cap.
+	// Objects are scrubbed one at a time, so only one object is ever resident. Note
+	// the two numbers below are NOT the same thing, and conflating them is how you
+	// size a pod that then gets OOM-killed:
+	//
+	//   budget_bytes  — what the expansion accounting caps: compressed input plus
+	//                   cumulative decompressed bytes.
+	//   est_peak_rss  — what the process actually occupies, which is several times
+	//                   larger. The budget counts bytes read; resident memory also
+	//                   holds each member's scrubbed output, the repacked archive,
+	//                   and GC slack that Go does not return promptly. Measured at
+	//                   ~4.6x the budget drawn for a match-dense .tar.gz.
+	//
+	// Size limits.memory against est_peak_rss, not against budget_bytes.
+	budget := wcfg.MaxObjectBytes + wcfg.Limits.MaxTotalBytes
 	log.Info("resource limits",
 		"max_object_bytes", wcfg.MaxObjectBytes,
 		"max_expand_bytes", wcfg.Limits.MaxTotalBytes,
 		"queue_concurrency", 1,
 		"queue_max", wcfg.QueueMax,
-		"worst_case_resident_bytes", wcfg.MaxObjectBytes+wcfg.Limits.MaxTotalBytes)
+		"budget_bytes", budget,
+		"est_peak_rss_bytes", int64(float64(budget)*peakRSSFactor))
 	wk := worker.New(st, reg, m, jobs, wcfg, log)
 	metrics.RegisterQueue(promReg,
 		func() float64 { return float64(wk.Queue().Depth()) },
@@ -215,6 +232,17 @@ const (
 	// the worker persist whatever it had finished. Keep it inside the pod's
 	// terminationGracePeriodSeconds, or the kubelet kills the process first.
 	shutdownTimeout = 30 * time.Second
+	// peakRSSFactor converts the expansion budget into an estimate of actual
+	// resident memory.
+	//
+	// The budget counts bytes *read* — the compressed object plus everything
+	// decompressed out of it. Resident memory holds considerably more at the same
+	// instant: each archive member's scrubbed output alongside its input, the
+	// repacked archive being assembled, and heap the Go GC has not yet returned.
+	// Measured at ~4.6x on a match-dense .tar.gz (a 407MiB budget draw peaked at
+	// 1889MiB RSS), so this is rounded down slightly rather than up — it is an
+	// estimate to size a pod from, not a guarantee.
+	peakRSSFactor = 4.5
 )
 
 // cachedReady wraps a readiness check so concurrent probes share one in-flight
