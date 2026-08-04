@@ -259,21 +259,29 @@ with a match-dense `.tar.gz`:
 | 407 MiB | 1889 MiB | **92%** |
 
 That is roughly **4–6× the budget**. Note the second row: with `MAX_EXPAND_BYTES` at
-512 MiB a perfectly legal object came within ~160 MiB of the container limit, which
-is why the shipped value is now **256 MiB**.
+512 MiB a perfectly legal object came within ~160 MiB of the container limit.
+
+**The shipped configuration is measured, not estimated.** With `MAX_EXPAND_BYTES` at
+256 MiB and `GOMEMLIMIT` at 1200 MiB, an object drawing the full budget scrubs
+cleanly (0 passthrough) at a peak of **1394 MiB — 68% of the 2 GiB limit, leaving
+~650 MiB of headroom**. That is the configuration in `deploy/openshift-manifests.yaml`.
 
 So size `resources.limits.memory` against `~4.5 × (MAX_OBJECT_BYTES + MAX_EXPAND_BYTES)`,
 not against the sum. The service logs both `budget_bytes` and `est_peak_rss_bytes` at
-startup — compare `est_peak_rss_bytes` with the limit.
+startup — compare `est_peak_rss_bytes` with the limit. On the shipped config that
+estimate reads 1440 MiB against a measured 1394 MiB, so it errs slightly high, which
+is the direction you want.
 
-`GOMEMLIMIT` deserves care for the same reason. It is a soft target the GC grows the
-heap *toward*, so it sets steady-state RSS as much as it caps it: measured runs
-settled just under it regardless of how much budget the object actually used. Keep it
-well below `limits.memory` — the shipped 1200 MiB against 2 GiB leaves ~850 MiB of
-slack for non-heap memory.
+`GOMEMLIMIT` is the lever that actually holds the ceiling, and it deserves care. It is
+a soft target the GC grows the heap *toward*, so it sets steady-state RSS as much as
+it caps it — the same object peaked at 1587 MiB under a 1600 MiB limit and 1394 MiB
+under a 1200 MiB one. It only holds while the *live* set fits beneath it: at
+`MAX_EXPAND_BYTES=512Mi` the live set exceeded 1600 MiB, the GC could not keep up, and
+RSS overran to 1889 MiB. Both caps have to move together.
 
-If you need the old 512 MiB expansion capacity, raise `limits.memory` to 4 GiB and
-`GOMEMLIMIT` to ~3000 MiB rather than just putting `MAX_EXPAND_BYTES` back.
+Raising `MAX_EXPAND_BYTES` back to 512 MiB requires `limits.memory` of 4 GiB and
+`GOMEMLIMIT` around 3000 MiB. **If the pod is fixed at 2 GiB, do not raise it** — the
+measured overrun above is what happens.
 
 `WORKERS` is retained for configuration compatibility but is **clamped to 1**; a
 higher value is ignored with a warning. Concurrent scrubs on a single CPU do not add

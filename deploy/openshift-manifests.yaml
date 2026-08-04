@@ -46,18 +46,23 @@ data:
   # at the same instant -- every member's scrubbed output alongside its input, the
   # repacked archive, and heap the Go GC has not returned yet.
   #
-  # Measured with a match-dense .tar.gz on this configuration:
+  # Measured with a match-dense .tar.gz, GOMEMLIMIT 1600MiB:
   #     241Mi budget drawn  ->  1587Mi peak RSS
   #     407Mi budget drawn  ->  1889Mi peak RSS   (92% of a 2Gi limit)
-  # i.e. roughly 4-6x the budget. MAX_EXPAND_BYTES was 512Mi here and that does NOT
+  # i.e. roughly 4-6x the budget. MAX_EXPAND_BYTES was 512Mi there and that does NOT
   # fit a 2Gi pod: a perfectly legal object came within ~160Mi of the limit.
   #
-  # So: size limits.memory against ~4.5x (MAX_OBJECT_BYTES + MAX_EXPAND_BYTES), not
+  # THE VALUES BELOW ARE MEASURED, NOT ESTIMATED. With MAX_EXPAND_BYTES=256Mi and
+  # GOMEMLIMIT=1200MiB, an object drawing the full budget scrubbed cleanly (0
+  # passthrough) at a peak of 1394Mi -- 68% of this 2Gi limit, ~650Mi of headroom.
+  #
+  # Size limits.memory against ~4.5x (MAX_OBJECT_BYTES + MAX_EXPAND_BYTES), not
   # against the sum itself. The service logs both budget_bytes and est_peak_rss_bytes
   # at startup -- check est_peak_rss_bytes against limits.memory, not budget_bytes.
+  # (On these values it reads 1440Mi vs the 1394Mi measured, so it errs high.)
   #
-  # If you need the old 512Mi expansion capacity, raise limits.memory to 4Gi and
-  # GOMEMLIMIT to ~3000MiB rather than putting this back.
+  # Raising MAX_EXPAND_BYTES back to 512Mi needs limits.memory 4Gi and GOMEMLIMIT
+  # ~3000MiB. If this pod is fixed at 2Gi, do NOT raise it -- see the 1889Mi row.
   WORKERS: "1"                    # queue concurrency. Kept for config compatibility
                                   # and CLAMPED to 1 -- a higher value is ignored
                                   # (with a warning) because concurrent scrubs on a
