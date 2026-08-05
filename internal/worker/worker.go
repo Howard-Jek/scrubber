@@ -548,8 +548,15 @@ func (w *Worker) processObject(ctx context.Context, o store.Object) {
 		fail(fmt.Errorf("read scrubbed output: %w", err))
 		return
 	}
-	err = w.store.PutStream(ctx, w.cfg.OutputBucket, outKey, outRC, out.Size(), "")
-	outRC.Close()
+	// Close through a defer, not a following statement: a panic inside PutStream
+	// would skip a trailing Close and leak the open handle. The blob's own Close
+	// then unlinks a file that is still open, which on Linux removes the directory
+	// entry but does NOT free the blocks until the process exits — invisible to
+	// `ls /work` while still counting against the emptyDir sizeLimit.
+	err = func() error {
+		defer outRC.Close()
+		return w.store.PutStream(ctx, w.cfg.OutputBucket, outKey, outRC, out.Size(), "")
+	}()
 	if err != nil {
 		fail(fmt.Errorf("put output: %w", err))
 		return

@@ -19,10 +19,18 @@ import (
 // like the bug that caused it. So every walk must leave the scratch directory as it
 // found it, on the success path and on each of the failure paths.
 
+// leakEnv redirects the temp directory these tests inspect.
+//
+// os.TempDir consults TMPDIR on unix but TMP then TEMP on Windows, so setting only
+// TMPDIR left spilled files in the real temp dir while the assertions below read an
+// empty directory — a leak test that passes because it is looking somewhere else is
+// worse than one that fails. Set all three.
 func leakEnv(t *testing.T) string {
 	t.Helper()
 	dir := t.TempDir()
-	t.Setenv("TMPDIR", dir) // os.CreateTemp("") resolves TMPDIR per call
+	t.Setenv("TMPDIR", dir)
+	t.Setenv("TMP", dir)
+	t.Setenv("TEMP", dir)
 	return dir
 }
 
