@@ -325,15 +325,25 @@
         if(s.status==='unknown'){ fail(s.error||'no result recorded for this upload'); return; }
         if(s.status!=='processing'){ fail('unexpected status: '+s.status); return; }
 
-        // Real progress when the server has it; fall back to a slow creep only
-        // while the object is still queued.
-        if(s.files_done>0){
+        // Objects are scrubbed one at a time in arrival order, so a file can sit in
+        // the queue for minutes. The bar must NOT creep while it waits: it would
+        // reach nearly full having done nothing, which reads as "almost there" to
+        // someone who is actually twentieth in line. Hold the bar where the upload
+        // left it and put the real state in the text instead.
+        if(s.phase==='queued'){
+          creep=Math.min(creep,60);
+          st.textContent=s.queue_position
+            ? 'Queued — '+s.queue_position+' of '+s.queue_depth
+            : 'Queued…';
+          st.title=s.queue_position?'Scrubbing runs one file at a time, in upload order':'';
+        } else if(s.files_done>0){
+          // Real progress when the server has it.
           creep=Math.max(creep,Math.min(95,60+Math.log(1+s.files_done)*8));
           st.textContent=(s.phase==='writing'?'Writing… ':'Scrubbing… ')+s.files_done+' file'+(s.files_done===1?'':'s');
           if(s.current_file) st.title=s.current_file;
         } else {
           creep=Math.min(95,creep+2);
-          st.textContent=s.phase==='queued'?'Queued…':(isArch?'Unpacking…':'Scrubbing…');
+          st.textContent=isArch?'Unpacking…':'Scrubbing…';
         }
         setp(creep);
         setTimeout(function(){poll(key,creep);},1200);

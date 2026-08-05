@@ -30,28 +30,74 @@ data:
   # Map an input key prefix to a named policy (JSON object), highest-specificity wins:
   PREFIX_POLICY_MAP: '{"secure/":"strict"}'
   PROCESSED_ACTION: "move"        # move (to processed/) or delete
+  # How often the input bucket is listed for NEW work. It does NOT govern the drain
+  # rate: the queue hands the next object to the consumer the instant it finishes
+  # one. The API also nudges a listing when a browser starts polling a key the
+  # worker has not seen yet, so a fresh upload is picked up within a second or two
+  # without polling harder. Listing covers the whole input bucket including
+  # processed/, so shortening this gets more expensive as that prefix grows.
   POLL_INTERVAL: "15s"
-  # Memory budget. Each concurrent worker can hold roughly
-  # MAX_OBJECT_BYTES (the compressed input) + MAX_EXPAND_BYTES (everything it
-  # decompresses) plus transient copies while repacking. Size WORKERS against
-  # limits.memory below:
-  #     WORKERS * (MAX_OBJECT_BYTES + MAX_EXPAND_BYTES) <= ~60% of limits.memory
-  # With 2 * (64Mi + 512Mi) = 1152Mi against the 2Gi limit below (56%) there is
-  # headroom for repack copies and GC. The service logs worst_case_resident_bytes
-  # at startup -- check it against limits.memory after changing any of these.
-  # If you cannot allocate 2Gi, drop WORKERS to 1 and keep limits.memory at 1Gi
-  # (1 * 576Mi = 56% of 1Gi); that halves throughput but not capacity per object.
-  WORKERS: "2"
-  MAX_OBJECT_BYTES: "67108864"    # 64Mi compressed input; larger objects are
-                                  # skipped without being downloaded whole.
-  MAX_EXPAND_BYTES: "536870912"   # 512Mi cumulative decompressed bytes per object.
-                                  # Enforced *while* reading, so this is a real
-                                  # memory bound rather than a ratio heuristic.
+  # Memory and scratch storage.
+  #
+  # Objects are scrubbed one at a time, and archive members SPILL TO DISK: only the
+  # member being scrubbed right now is on the heap. Before that, every member body,
+  # every scrubbed replacement and the repacked container were live at once, so
+  # resident memory was a multiple of the bundle size and a few-hundred-MiB upload
+  # could not fit this pod at any cap. It now can.
+  #
+  # The consequence is that MAX_EXPAND_BYTES bounds mostly DISK, not memory. Size the
+  # /work emptyDir against it — an ephemeral-storage eviction kills a pod exactly as
+  # dead as an OOM, and an unbounded emptyDir draws on node storage shared with every
+  # other pod on the node.
+  #
+  # Resident memory is now governed by the two SPILL_* settings below, NOT by
+  # MAX_EXPAND_BYTES. Verify any change with ./scripts/memory-matrix.sh, which runs
+  # the worst-shaped bundle end to end and fails if peak RSS exceeds 60% of the limit
+  # OR if the object comes back with a passthrough — a cap set too low stops bounding
+  # anything and starts silently emitting unscrubbed files, which looks like a pass
+  # if you only watch memory.
+  WORKERS: "1"                    # queue concurrency. Kept for config compatibility
+                                  # and CLAMPED to 1 -- a higher value is ignored
+                                  # (with a warning) because concurrent scrubs on a
+                                  # single CPU only slow each other down and would
+                                  # multiply the memory budget above.
+  QUEUE_MAX: "10000"              # cap on the in-memory pending set. Anything beyond
+                                  # it stays in the bucket and is picked up later;
+                                  # the service warns when it truncates.
+  FINALIZE_GRACE: "15s"           # on shutdown, how long an object that has already
+                                  # finished scrubbing may keep writing its output,
+                                  # report and digest. Without this a SIGTERM lands
+                                  # mid-object and discards a completed scrub, which
+                                  # then has to be redone after the restart. Keep it
+                                  # inside terminationGracePeriodSeconds below.
+  MAX_OBJECT_BYTES: "671088640"   # 640Mi compressed input. Larger objects are
+                                  # skipped without being downloaded whole and
+                                  # counted in scrubber_objects_total{status=
+                                  # "too_large"}. Watch that counter: it is how you
+                                  # find out real uploads are being turned away.
+                                  # Raised from 64Mi, which rejected ordinary
+                                  # bundles outright before the spill made them
+                                  # processable.
+  MAX_EXPAND_BYTES: "1610612736"  # 1536Mi cumulative decompressed bytes per object,
+                                  # enforced *while* reading so it is a real budget
+                                  # rather than a ratio heuristic. Members spill, so
+                                  # this is now a DISK bound: keep the /work
+                                  # sizeLimit comfortably above it.
                                   # NOTE: a .tar.gz draws on this budget twice --
                                   # once for the decompressed tar, once for the
-                                  # member bodies copied out of it (they really
-                                  # are two copies in memory). Effective capacity
-                                  # for a tar.gz is therefore ~256Mi of content.
+                                  # member bodies read out of it. Effective capacity
+                                  # for a tar.gz is therefore ~768Mi of content.
+  SPILL_THRESHOLD: "4194304"      # 4Mi. Payloads larger than this go to /work on
+                                  # their own. Below it they stay on the heap, which
+                                  # keeps a 20000-member archive from creating 20000
+                                  # files.
+  SPILL_RESIDENT_MAX: "67108864"  # 64Mi aggregate in-memory budget. This is the one
+                                  # that catches many-small-members bundles: each
+                                  # payload is individually under the threshold while
+                                  # together they would hold the whole archive. Once
+                                  # this is exceeded everything spills regardless of
+                                  # size. THIS, not MAX_EXPAND_BYTES, is what bounds
+                                  # resident memory now.
   SCRUB_FILENAMES: "true"         # also scrub archive member names/paths + output key
   # Reports live in an internal bucket for operators to verify the scrub, so they
   # show the actual original values by default. Set "true" to store salted hashes
@@ -69,7 +115,17 @@ data:
   PORT: "8080"
   # Let the Go GC know the container ceiling so it collects harder as it nears it
   # rather than being OOM-killed. Keep this below limits.memory.
-  GOMEMLIMIT: "1600MiB"
+  #
+  # This is a soft target the GC grows the heap *toward*, so it sets the steady-state
+  # RSS as much as it caps it. It only holds while the LIVE set fits underneath: before
+  # members spilled, at MAX_EXPAND_BYTES=512Mi the live set exceeded 1600MiB, the GC
+  # could not keep up, and RSS overran to 1889Mi -- 92% of this pod.
+  #
+  # Now that the live set is bounded by the SPILL_* settings rather than by the bundle,
+  # the measured peak is 445Mi (22% of the limit) with this target, across both worst
+  # shapes: 90000 tiny members and a 500Mi incompressible bundle. This is the value
+  # ./scripts/memory-matrix.sh measured at; change it and re-run that script.
+  GOMEMLIMIT: "1200MiB"
   # Web UI: browser uploads straight to MinIO via presigned URLs, so the browser
   # must be able to reach MinIO. Set these to MinIO's externally reachable host.
   # (MinIO also needs CORS allowing the scrubber Route origin.)
@@ -87,18 +143,31 @@ metadata:
   name: scrubberd
   labels: { app: scrubberd }
 spec:
-  replicas: 1            # single replica in v1 (no distributed object-claim yet)
+  replicas: 1            # single replica: the FCFS queue is per-pod, and there is no
+                         # distributed object-claim, so two pods would both list the
+                         # same bucket and double-process objects.
+  # Recreate, NOT the default RollingUpdate. With replicas: 1 the defaults work out
+  # to maxSurge=1 / maxUnavailable=0, so a rollout starts the new pod BEFORE
+  # terminating the old one -- two scrubberds polling the same input bucket, each
+  # with its own queue, for the length of the rollout. Recreate stops the old pod
+  # first, at the cost of a short gap in service.
+  strategy:
+    type: Recreate
   selector:
     matchLabels: { app: scrubberd }
   template:
     metadata:
       labels: { app: scrubberd }
     spec:
+      # Long enough for the HTTP drain plus FINALIZE_GRACE, so an object that has
+      # finished scrubbing gets its result persisted instead of being killed and
+      # redone. The default 30s leaves no room once the server drain is counted.
+      terminationGracePeriodSeconds: 60
       imagePullSecrets:
         - name: artifactory-pull   # only if pulling from a private Artifactory repo
       containers:
         - name: scrubberd
-          image: <ARTIFACTORY_DOCKER_HOST>/docker-local/scrubberd:0.2.0
+          image: <ARTIFACTORY_DOCKER_HOST>/docker-local/scrubberd:0.3.0
           ports:
             - containerPort: 8080
           envFrom:
@@ -133,9 +202,14 @@ spec:
             timeoutSeconds: 5
             failureThreshold: 6
           resources:
-            # Sized from the MAX_OBJECT_BYTES / MAX_EXPAND_BYTES / WORKERS budget
-            # in the ConfigMap above -- change them together, never one alone.
-            requests: { cpu: 100m, memory: 512Mi }
+            # Sized from the MAX_OBJECT_BYTES + MAX_EXPAND_BYTES budget in the
+            # ConfigMap above (one object at a time) -- change them together, never
+            # one alone.
+            # The CPU request matters more than it used to: with a single consumer,
+            # the queue's drain rate IS the CPU share this pod gets when the node is
+            # contended. 100m was conservative when work was spread over several
+            # goroutines; now it directly throttles every upload in the queue.
+            requests: { cpu: 500m, memory: 512Mi }
             limits:   { cpu: "1",  memory: 2Gi }
           securityContext:
             runAsNonRoot: true
@@ -149,7 +223,14 @@ spec:
         - name: policies
           configMap: { name: scrubber-policies }
         - name: work
-          emptyDir: {}
+          # sizeLimit is load-bearing now that archive members spill here. Without
+          # it an emptyDir draws on node ephemeral storage shared with every other
+          # pod, and exceeding it evicts this pod — the same outcome as an OOM, from
+          # a different resource. Keep it comfortably above MAX_EXPAND_BYTES: a
+          # .tar.gz stages the decompressed container, the member bodies and the
+          # repacked result, so budget roughly 2.5x the expansion cap.
+          emptyDir:
+            sizeLimit: 4Gi
         # - name: ca
         #   configMap: { name: scrubber-ca }
 ---

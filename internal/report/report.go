@@ -75,8 +75,8 @@ const (
 	StatusUnchanged    Status = "unchanged"          // text file, no matches found
 	StatusBinarySkip   Status = "binary-skipped"     // detected binary, passed through
 	StatusPassthrough  Status = "passthrough-error"  // unreadable/corrupted/encrypted, passed through verbatim
-	StatusUnsupported  Status = "unsupported-format"  // container we can read but not rewrite, passed through
-	StatusGuardTripped Status = "guard-tripped"       // size/ratio/depth guard, passed through
+	StatusUnsupported  Status = "unsupported-format" // container we can read but not rewrite, passed through
+	StatusGuardTripped Status = "guard-tripped"      // size/ratio/depth guard, passed through
 )
 
 // AuditLevel controls how much per-match detail the report retains.
@@ -110,6 +110,15 @@ type FileEntry struct {
 	BytesIn  int           `json:"bytes_in"`
 	BytesOut int           `json:"bytes_out"`
 	Matches  []scrub.Match `json:"matches,omitempty"`
+	// MatchCount is the number of matches in this file. It stays exact even when
+	// Matches has been truncated, so a reader can tell the difference between "12
+	// replacements" and "12 replacements listed out of 2850816".
+	MatchCount int `json:"match_count"`
+	// MatchesTruncated marks a file whose itemised list was capped at
+	// maxMatchesPerFile. It must be visible: a short list that looks complete
+	// invites someone to conclude a bundle was barely touched when it was rewritten
+	// millions of times.
+	MatchesTruncated bool `json:"matches_truncated,omitempty"`
 }
 
 // PassthroughNote identifies a file that was emitted WITHOUT being scrubbed and
@@ -126,6 +135,28 @@ type PassthroughNote struct {
 // maxPassthroughNotes bounds the retained list so a pathological archive can't
 // inflate the report; the count in FilesPassthrough stays exact regardless.
 const maxPassthroughNotes = 100
+
+// maxMatchesPerFile and maxMatchesPerReport bound the per-match detail retained.
+//
+// These are memory bounds, not cosmetic ones. Every retained match holds its rule ID,
+// original value and replacement, so the report grows with match *count* rather than
+// input size, and the expansion budget does not check it: that caps bytes read, not
+// the report assembled from them.
+//
+// Both caps are needed, and the report-wide one is the load-bearing half. A per-file
+// cap alone bounds nothing when the archive is the variable: a bundle of 18000
+// members averaging 200 matches each sits under any sane per-file limit while still
+// retaining 3.6 million matches in aggregate — measured at roughly 440 MiB of report
+// on a pod with 2 GiB to spend. The per-file cap stops one pathological *file*; the
+// report cap stops a pathological *bundle*.
+//
+// Counts stay exact throughout (FileEntry.MatchCount, Summary.TotalMatches and the
+// by-rule and by-label breakdowns are all unaffected); only the itemised lists are
+// truncated, and truncation is flagged per file.
+const (
+	maxMatchesPerFile   = 1000
+	maxMatchesPerReport = 20000
+)
 
 // Summary aggregates totals across the whole run.
 type Summary struct {
@@ -174,6 +205,10 @@ type Report struct {
 	// Summary, so a discarded subtree can be un-counted at any audit level (the
 	// retained per-match detail is trimmed or absent below AuditFull).
 	deltas []summaryDelta
+
+	// retained counts matches itemised across the whole report, bounding it by
+	// maxMatchesPerReport. Summary counts are unaffected.
+	retained int
 }
 
 // summaryDelta is one entry's contribution to the running Summary.
@@ -183,6 +218,10 @@ type summaryDelta struct {
 	byRule      map[string]int
 	byLabel     map[string]int
 	passthrough bool // whether it appended a PassthroughNote
+	// retained is how much of the report-wide match budget this entry consumed, so
+	// undoing the entry gives the budget back rather than permanently spending it on
+	// a subtree that never reached the output.
+	retained int
 }
 
 // Mark returns a checkpoint identifying the current end of the report.
@@ -221,6 +260,7 @@ func (r *Report) Rollback(mark int, path string, status Status, detail string, b
 		if d.passthrough && len(r.Summary.Passthroughs) > 0 {
 			r.Summary.Passthroughs = r.Summary.Passthroughs[:len(r.Summary.Passthroughs)-1]
 		}
+		r.retained -= d.retained
 		r.Summary.TotalMatches -= d.matches
 		for k, v := range d.byRule {
 			if r.Summary.MatchesByRule[k] -= v; r.Summary.MatchesByRule[k] <= 0 {
@@ -266,17 +306,40 @@ func (r *Report) Record(path string, status Status, detail string, bytesIn, byte
 	r.mu.Lock()
 	defer r.mu.Unlock()
 
-	entry := FileEntry{Path: path, Status: status, Detail: detail, BytesIn: bytesIn, BytesOut: bytesOut}
+	entry := FileEntry{
+		Path: path, Status: status, Detail: detail,
+		BytesIn: bytesIn, BytesOut: bytesOut, MatchCount: len(matches),
+	}
 
+	// Retain at most maxMatchesPerFile from this file, and at most
+	// maxMatchesPerReport across the whole run. The counts above and the summary
+	// accounting below run over every match regardless, so truncating here costs
+	// detail, never accuracy. The flag is only meaningful when a list is being kept
+	// at all — under AuditOff there is nothing to truncate.
+	keep := len(matches)
+	if keep > maxMatchesPerFile {
+		keep = maxMatchesPerFile
+	}
+	if remaining := maxMatchesPerReport - r.retained; keep > remaining {
+		keep = max(remaining, 0)
+	}
+	if keep < len(matches) {
+		entry.MatchesTruncated = r.audit != AuditOff
+	}
+	if r.audit != AuditOff {
+		r.retained += keep
+	}
 	switch r.audit {
 	case AuditOff:
 		// keep counts in summary only
 	case AuditCounts:
-		for _, m := range matches {
+		entry.Matches = make([]scrub.Match, 0, keep)
+		for _, m := range matches[:keep] {
 			entry.Matches = append(entry.Matches, scrub.Match{RuleID: m.RuleID, Line: m.Line, Offset: m.Offset})
 		}
 	case AuditFull:
-		for _, m := range matches {
+		entry.Matches = make([]scrub.Match, 0, keep)
+		for _, m := range matches[:keep] {
 			mm := m
 			if r.redact {
 				mm.Original = r.hash(m.Original)
@@ -289,6 +352,9 @@ func (r *Report) Record(path string, status Status, detail string, bytesIn, byte
 
 	// Summary accounting, mirrored into a delta so it can be undone exactly.
 	delta := summaryDelta{status: status}
+	if r.audit != AuditOff {
+		delta.retained = keep
+	}
 	r.Summary.FilesTotal++
 	switch status {
 	case StatusScrubbed:

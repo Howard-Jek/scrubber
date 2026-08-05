@@ -21,6 +21,14 @@ type Metrics struct {
 	BytesIn     prometheus.Counter
 	BytesOut    prometheus.Counter
 	Duration    prometheus.Histogram
+
+	// QueueWait is how long an object sat in the queue before its scrub started.
+	QueueWait prometheus.Histogram
+	// Latency is arrival-to-finished: queue wait plus processing. This is the
+	// number a user actually experiences, and the one to watch when comparing
+	// throughput before and after a scheduling change — Duration alone cannot show
+	// it, because it starts counting only once an object reaches the front.
+	Latency prometheus.Histogram
 }
 
 // New registers and returns the collectors on reg.
@@ -38,9 +46,49 @@ func New(reg prometheus.Registerer) *Metrics {
 			Name: "scrubber_process_seconds", Help: "Per-object processing time.",
 			Buckets: prometheus.ExponentialBuckets(0.01, 3, 8),
 		}),
+		// Queue waits are measured in seconds-to-minutes, not the sub-second range
+		// Duration covers, so these get their own scale: 1s .. ~17min.
+		QueueWait: prometheus.NewHistogram(prometheus.HistogramOpts{
+			Name: "scrubber_queue_wait_seconds", Help: "Time an object waited in the queue before processing began.",
+			Buckets: prometheus.ExponentialBuckets(1, 2, 10),
+		}),
+		Latency: prometheus.NewHistogram(prometheus.HistogramOpts{
+			Name: "scrubber_object_latency_seconds", Help: "Time from an object's arrival in the bucket to its completion.",
+			Buckets: prometheus.ExponentialBuckets(1, 2, 10),
+		}),
 	}
-	reg.MustRegister(m.Objects, m.Matches, m.Passthrough, m.Errors, m.BytesIn, m.BytesOut, m.Duration)
+	reg.MustRegister(m.Objects, m.Matches, m.Passthrough, m.Errors, m.BytesIn, m.BytesOut,
+		m.Duration, m.QueueWait, m.Latency)
 	return m
+}
+
+// RegisterQueue attaches gauges that read the live queue.
+//
+// It is separate from New because the queue does not exist until the worker is
+// constructed, and because a GaugeFunc reads through to the real depth rather than
+// tracking it with paired increments that can drift when a path returns early.
+func RegisterQueue(reg prometheus.Registerer, depth, inflight func() float64) {
+	reg.MustRegister(
+		prometheus.NewGaugeFunc(prometheus.GaugeOpts{
+			Name: "scrubber_queue_depth", Help: "Objects waiting to be scrubbed, plus the one in flight.",
+		}, depth),
+		prometheus.NewGaugeFunc(prometheus.GaugeOpts{
+			Name: "scrubber_inflight_objects", Help: "Objects being scrubbed right now (0 or 1).",
+		}, inflight),
+	)
+}
+
+// SinceClamped returns the elapsed time from t to now, never negative.
+//
+// Arrival times come from the object store's clock and the elapsed time is computed
+// against the pod's, so a small skew can make a fresh object look like it arrived in
+// the future. A negative observation would corrupt the histogram, so clamp it.
+func SinceClamped(t time.Time) time.Duration {
+	d := time.Since(t)
+	if d < 0 {
+		return 0
+	}
+	return d
 }
 
 // Job records a single object's outcome for the /jobs endpoint. It contains only
