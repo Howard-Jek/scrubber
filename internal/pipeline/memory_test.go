@@ -250,18 +250,27 @@ func TestMemoryMatrix(t *testing.T) {
 	if testing.Short() {
 		t.Skip("allocates hundreds of MiB; skipped under -short")
 	}
+	if raceEnabled {
+		t.Skip("heap measurements are meaningless under -race; run without it")
+	}
 	m := memMatcher(t)
 
 	// Kept modest so the matrix runs in seconds and fits comfortably in a CI box.
 	// Ratios are what transfer to production sizing, not absolute bytes.
 	const (
-		unit           = 4 << 20 // 4 MiB per "large" member
-		fewMembers     = 8
-		manySmall      = 1000
-		manyTiny       = 20000
-		totalContent   = fewMembers * unit
-		heapCeiling    = 14.0 // ratio of peak heap to content bytes
-		binaryFloorMax = 8.0
+		unit         = 4 << 20 // 4 MiB per "large" member
+		fewMembers   = 8
+		manySmall    = 1000
+		manyTiny     = 20000
+		totalContent = fewMembers * unit
+		// Ratios collapsed when members started spilling: the worst shape went from
+		// 11.6x to 3.6x. Note the ratio is now the wrong mental model — peak heap is
+		// bounded by the spill policy (ResidentMax plus a leaf's working set), not by
+		// content size, so it FALLS as bundles grow. These ceilings are regression
+		// guards at this fixture size, not a sizing formula; size a pod from
+		// scripts/memory-matrix.sh.
+		heapCeiling    = 6.0
+		binaryFloorMax = 3.0
 	)
 
 	cases := []memCase{

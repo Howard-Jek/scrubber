@@ -13,7 +13,6 @@
 package worker
 
 import (
-	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
@@ -30,6 +29,7 @@ import (
 	"github.com/howard/scrubber/internal/policy"
 	"github.com/howard/scrubber/internal/queue"
 	"github.com/howard/scrubber/internal/report"
+	"github.com/howard/scrubber/internal/spill"
 	"github.com/howard/scrubber/internal/store"
 )
 
@@ -423,7 +423,21 @@ func (w *Worker) processObject(ctx context.Context, o store.Object) {
 		w.log.Error("process object", "key", o.Key, "err", err)
 	}
 
-	data, err := w.store.GetLimited(ctx, w.cfg.InputBucket, o.Key, w.cfg.MaxObjectBytes)
+	// Stage the upload on scratch storage rather than the heap. For an
+	// incompressible bundle the compressed object is most of its expanded size, so
+	// holding it resident for the whole scrub was one of the copies that put a
+	// few-hundred-MiB upload out of reach of this pod.
+	input, w2, err := spill.Create()
+	if err != nil {
+		fail(fmt.Errorf("stage input: %w", err))
+		return
+	}
+	inSize, err := w.store.GetLimitedTo(ctx, w2, w.cfg.InputBucket, o.Key, w.cfg.MaxObjectBytes)
+	if cerr := w2.Close(); err == nil {
+		err = cerr
+	}
+	input.Done(inSize)
+	defer input.Close()
 	if err != nil {
 		if errors.Is(err, store.ErrTooLarge) {
 			// Backstop against OOM: skip the object and move it aside so the loop
@@ -496,10 +510,19 @@ func (w *Worker) processObject(ctx context.Context, o store.Object) {
 	})
 
 	eng := &pipeline.Engine{Matcher: res.Matcher, Report: rep, Limits: w.cfg.Limits, ScrubNames: w.cfg.ScrubNames}
-	out := eng.Process(o.Key, data, 0)
+	// Release every blob the walk staged. This runs before the panic recovery
+	// above (defers unwind last-registered-first), so a bug anywhere in the
+	// pipeline costs one object rather than a temp file that outlives it.
+	defer eng.Release()
+	out, changed := eng.ProcessBlob(o.Key, input, 0)
+	if changed {
+		// ProcessBlob returns the input itself when nothing changed, so only close
+		// the result when it is genuinely a separate payload.
+		defer out.Close()
+	}
 	rep.EndedAt = time.Now()
-	rep.BytesIn = len(data)
-	rep.BytesOut = len(out)
+	rep.BytesIn = int(inSize)
+	rep.BytesOut = int(out.Size())
 
 	job.Phase = "writing"
 	job.FilesDone = filesDone
@@ -518,8 +541,16 @@ func (w *Worker) processObject(ctx context.Context, o store.Object) {
 			"key", o.Key, "grace", w.cfg.FinalizeGrace)
 	}
 
-	// Write scrubbed output under the (possibly scrubbed) key.
-	if err := w.store.Put(ctx, w.cfg.OutputBucket, outKey, out, ""); err != nil {
+	// Write scrubbed output under the (possibly scrubbed) key, streaming from
+	// scratch storage so the result never has to be whole on the heap.
+	outRC, err := out.Reader()
+	if err != nil {
+		fail(fmt.Errorf("read scrubbed output: %w", err))
+		return
+	}
+	err = w.store.PutStream(ctx, w.cfg.OutputBucket, outKey, outRC, out.Size(), "")
+	outRC.Close()
+	if err != nil {
 		fail(fmt.Errorf("put output: %w", err))
 		return
 	}
@@ -561,8 +592,8 @@ func (w *Worker) processObject(ctx context.Context, o store.Object) {
 	sum := rep.Summary
 	w.metrics.Matches.Add(float64(sum.TotalMatches))
 	w.metrics.Passthrough.Add(float64(sum.FilesPassthrough))
-	w.metrics.BytesIn.Add(float64(len(data)))
-	w.metrics.BytesOut.Add(float64(len(out)))
+	w.metrics.BytesIn.Add(float64(inSize))
+	w.metrics.BytesOut.Add(float64(out.Size()))
 	w.metrics.Objects.WithLabelValues("scrubbed").Inc()
 	w.metrics.Duration.Observe(time.Since(start).Seconds())
 
@@ -571,8 +602,8 @@ func (w *Worker) processObject(ctx context.Context, o store.Object) {
 	job.CurrentFile = ""
 	job.FilesDone = filesDone
 	job.Matches = sum.TotalMatches
-	job.BytesIn = len(data)
-	job.BytesOut = len(out)
+	job.BytesIn = int(inSize)
+	job.BytesOut = int(out.Size())
 	job.ByLabel = sum.MatchesByLabel
 	job.Passthrough = sum.FilesPassthrough
 	job.PassthroughPaths = sum.Passthroughs
@@ -592,7 +623,7 @@ func (w *Worker) processObject(ctx context.Context, o store.Object) {
 		return
 	}
 	w.log.Info("scrubbed", "key", o.Key, "policy", res.Name, "matches", sum.TotalMatches,
-		"binary_skipped", sum.FilesBinarySkip, "changed", !bytes.Equal(out, data))
+		"binary_skipped", sum.FilesBinarySkip, "changed", changed)
 }
 
 func (w *Worker) finish(ctx context.Context, key string) error {

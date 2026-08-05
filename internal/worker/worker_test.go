@@ -97,6 +97,28 @@ func (m *memStore) GetLimited(_ context.Context, bucket, key string, max int64) 
 	return append([]byte(nil), v...), nil
 }
 
+func (m *memStore) PutStream(ctx context.Context, bucket, key string, r io.Reader, _ int64, ct string) error {
+	data, err := io.ReadAll(r)
+	if err != nil {
+		return err
+	}
+	return m.Put(ctx, bucket, key, data, ct)
+}
+
+func (m *memStore) GetLimitedTo(_ context.Context, w io.Writer, bucket, key string, max int64) (int64, error) {
+	m.mu.Lock()
+	v, ok := m.buckets[bucket][key]
+	m.mu.Unlock()
+	if !ok {
+		return 0, os.ErrNotExist
+	}
+	if int64(len(v)) > max {
+		return 0, store.ErrTooLarge
+	}
+	n, err := w.Write(v)
+	return int64(n), err
+}
+
 func (m *memStore) Exists(_ context.Context, bucket, key string) (bool, []byte, error) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
@@ -293,6 +315,15 @@ func (p *panicStore) Put(ctx context.Context, bucket, key string, data []byte, c
 	return p.memStore.Put(ctx, bucket, key, data, ct)
 }
 
+// PutStream is the path the worker actually takes for the scrubbed output; without
+// it the panic would never be injected.
+func (p *panicStore) PutStream(ctx context.Context, bucket, key string, r io.Reader, size int64, ct string) error {
+	if bucket == p.panicOn {
+		panic("simulated bug in the object path")
+	}
+	return p.memStore.PutStream(ctx, bucket, key, r, size, ct)
+}
+
 // TestWorkerSurvivesPanic checks that a panic costs one object rather than the
 // whole service. Without recovery the goroutine takes the process down, which
 // orphans every in-flight upload and wipes the in-memory job history — the
@@ -435,7 +466,7 @@ type serialProbe struct {
 	maxDepth int
 }
 
-func (p *serialProbe) GetLimited(ctx context.Context, bucket, key string, max int64) ([]byte, error) {
+func (p *serialProbe) GetLimitedTo(ctx context.Context, w io.Writer, bucket, key string, max int64) (int64, error) {
 	p.mu.Lock()
 	p.depth++
 	if p.depth > p.maxDepth {
@@ -444,7 +475,7 @@ func (p *serialProbe) GetLimited(ctx context.Context, bucket, key string, max in
 	p.order = append(p.order, key)
 	p.mu.Unlock()
 	time.Sleep(2 * time.Millisecond)
-	return p.memStore.GetLimited(ctx, bucket, key, max)
+	return p.memStore.GetLimitedTo(ctx, w, bucket, key, max)
 }
 
 func (p *serialProbe) Move(ctx context.Context, bucket, src, dst string) error {

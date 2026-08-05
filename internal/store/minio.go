@@ -39,6 +39,13 @@ type ObjectStore interface {
 	GetLimited(ctx context.Context, bucket, key string, max int64) ([]byte, error)
 	Exists(ctx context.Context, bucket, key string) (bool, []byte, error)
 	Put(ctx context.Context, bucket, key string, data []byte, contentType string) error
+	// PutStream uploads from a reader, so a result assembled on scratch storage is
+	// never materialised on the heap just to be sent. size may be -1 for unknown,
+	// which switches the client to multipart streaming.
+	PutStream(ctx context.Context, bucket, key string, r io.Reader, size int64, contentType string) error
+	// GetLimitedTo streams an object into w, reading at most max bytes and returning
+	// ErrTooLarge past that. It is GetLimited without the intermediate []byte.
+	GetLimitedTo(ctx context.Context, w io.Writer, bucket, key string, max int64) (int64, error)
 	Move(ctx context.Context, bucket, srcKey, dstKey string) error
 	Delete(ctx context.Context, bucket, key string) error
 }
@@ -222,6 +229,39 @@ func (c *Client) Put(ctx context.Context, bucket, key string, data []byte, conte
 	_, err := c.mc.PutObject(ctx, bucket, key, bytes.NewReader(data), int64(len(data)),
 		minio.PutObjectOptions{ContentType: contentType})
 	return err
+}
+
+// PutStream uploads from a reader. minio-go's PutObject is reader-based already, so
+// the byte-slice Put is the adapter here, not this.
+func (c *Client) PutStream(ctx context.Context, bucket, key string, r io.Reader, size int64, contentType string) error {
+	if contentType == "" {
+		contentType = "application/octet-stream"
+	}
+	_, err := c.mc.PutObject(ctx, bucket, key, r, size,
+		minio.PutObjectOptions{ContentType: contentType})
+	return err
+}
+
+// GetLimitedTo streams an object into w under a byte cap.
+//
+// Same contract as GetLimited — the cap is enforced while reading, so an oversized
+// object is refused without ever being buffered whole — except the destination is
+// the caller's writer, which lets the worker stage a large upload on scratch storage
+// instead of the heap.
+func (c *Client) GetLimitedTo(ctx context.Context, w io.Writer, bucket, key string, max int64) (int64, error) {
+	obj, err := c.mc.GetObject(ctx, bucket, key, minio.GetObjectOptions{})
+	if err != nil {
+		return 0, err
+	}
+	defer obj.Close()
+	n, err := io.CopyN(w, obj, max+1)
+	if err != nil && err != io.EOF {
+		return n, err
+	}
+	if n > max {
+		return n, ErrTooLarge
+	}
+	return n, nil
 }
 
 // Move copies srcKey to dstKey within a bucket then deletes the source.

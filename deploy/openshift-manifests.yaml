@@ -37,55 +37,25 @@ data:
   # without polling harder. Listing covers the whole input bucket including
   # processed/, so shortening this gets more expensive as that prefix grows.
   POLL_INTERVAL: "15s"
-  # Memory. Objects are scrubbed ONE AT A TIME, so only one is ever resident --
-  # but the expansion BUDGET is not the same as resident memory, and treating it as
-  # such is how this pod gets OOM-killed.
+  # Memory and scratch storage.
   #
-  # The budget counts bytes *read*: MAX_OBJECT_BYTES (compressed input) plus
-  # MAX_EXPAND_BYTES (everything decompressed out of it). Actual RSS holds much more
-  # at the same instant -- every member's scrubbed output alongside its input, the
-  # repacked archive, and heap the Go GC has not returned yet.
+  # Objects are scrubbed one at a time, and archive members SPILL TO DISK: only the
+  # member being scrubbed right now is on the heap. Before that, every member body,
+  # every scrubbed replacement and the repacked container were live at once, so
+  # resident memory was a multiple of the bundle size and a few-hundred-MiB upload
+  # could not fit this pod at any cap. It now can.
   #
-  # The multiplier is not a constant: it depends on the SHAPE of the object, not just
-  # its size. `go test ./internal/pipeline -run TestMemoryMatrix` measures peak heap
-  # across container formats, member counts, match densities and compressibility.
-  # Worst is NOT the few-large-members bundle most people reach for when testing by
-  # hand -- it is many *tiny* members in a .tar.gz, where per-member overhead
-  # dominates:
+  # The consequence is that MAX_EXPAND_BYTES bounds mostly DISK, not memory. Size the
+  # /work emptyDir against it — an ephemeral-storage eviction kills a pod exactly as
+  # dead as an OOM, and an unbounded emptyDir draws on node storage shared with every
+  # other pod on the node.
   #
-  #     targz / 20000 tiny members / dense    11.6x content   <- worst
-  #     targz / 8 large members / dense        8.3x
-  #     targz / sparse / incompressible        6.0x
-  #     bare tar / dense                       4.7x
-  #     zip / dense                            4.4x
-  #
-  # Measured end to end on that worst shape (./scripts/memory-matrix.sh), all with the
-  # same 3.8M-match fixture:
-  #
-  #     512Mi cap                    ->  1889Mi peak RSS   (92% of 2Gi -- shipped value, unsafe)
-  #     192Mi cap, 163Mi drawn       ->  1244Mi            (61%)
-  #     160Mi cap, 152Mi drawn       ->  1390Mi            (68%) -- before the report was bounded
-  #     160Mi cap, 152Mi drawn       ->   775Mi            (38%) -- CURRENT
-  #
-  # The last two rows are the same workload. The 615Mi difference is entirely the
-  # report: it retained every one of those 3.8M matches, which no expansion cap could
-  # touch. See report.maxMatchesPerReport.
-  #
-  # Note the headroom that leaves. 775Mi against a 60% target of 1228Mi means this cap
-  # could be raised — roughly 224Mi looks reachable — but do not do it on arithmetic
-  # alone. Re-run ./scripts/memory-matrix.sh with the new value and let it decide.
-  #
-  # Size limits.memory against MAX_OBJECT_BYTES + ~5x MAX_EXPAND_BYTES, not against
-  # the plain sum. The service logs both budget_bytes and est_peak_rss_bytes
-  # at startup -- check est_peak_rss_bytes against limits.memory, not budget_bytes.
-  #
-  # Verify any change with ./scripts/memory-matrix.sh, which runs the worst shape end
-  # to end and fails if peak RSS exceeds 60% of the limit OR if the object comes back
-  # with a passthrough (a cap set too low stops bounding memory and starts silently
-  # emitting unscrubbed files instead).
-  #
-  # Raising MAX_EXPAND_BYTES needs limits.memory raised with it. If this pod is fixed
-  # at 2Gi, do NOT raise it.
+  # Resident memory is now governed by the two SPILL_* settings below, NOT by
+  # MAX_EXPAND_BYTES. Verify any change with ./scripts/memory-matrix.sh, which runs
+  # the worst-shaped bundle end to end and fails if peak RSS exceeds 60% of the limit
+  # OR if the object comes back with a passthrough — a cap set too low stops bounding
+  # anything and starts silently emitting unscrubbed files, which looks like a pass
+  # if you only watch memory.
   WORKERS: "1"                    # queue concurrency. Kept for config compatibility
                                   # and CLAMPED to 1 -- a higher value is ignored
                                   # (with a warning) because concurrent scrubs on a
@@ -100,34 +70,34 @@ data:
                                   # mid-object and discards a completed scrub, which
                                   # then has to be redone after the restart. Keep it
                                   # inside terminationGracePeriodSeconds below.
-  MAX_OBJECT_BYTES: "67108864"    # 64Mi compressed input; larger objects are
+  MAX_OBJECT_BYTES: "671088640"   # 640Mi compressed input. Larger objects are
                                   # skipped without being downloaded whole and
                                   # counted in scrubber_objects_total{status=
                                   # "too_large"}. Watch that counter: it is how you
                                   # find out real uploads are being turned away.
-  MAX_EXPAND_BYTES: "167772160"   # 160Mi cumulative decompressed bytes per object.
-                                  # Enforced *while* reading, so this is a real
-                                  # budget rather than a ratio heuristic -- but see
-                                  # the memory note above: it bounds bytes READ, not
-                                  # resident memory, which runs ~5x higher on the
-                                  # worst shape. Lowered from 512Mi, which does not
-                                  # fit this pod.
+                                  # Raised from 64Mi, which rejected ordinary
+                                  # bundles outright before the spill made them
+                                  # processable.
+  MAX_EXPAND_BYTES: "1610612736"  # 1536Mi cumulative decompressed bytes per object,
+                                  # enforced *while* reading so it is a real budget
+                                  # rather than a ratio heuristic. Members spill, so
+                                  # this is now a DISK bound: keep the /work
+                                  # sizeLimit comfortably above it.
                                   # NOTE: a .tar.gz draws on this budget twice --
                                   # once for the decompressed tar, once for the
-                                  # member bodies copied out of it (they really
-                                  # are two copies in memory). Effective capacity
-                                  # for a tar.gz is therefore ~80Mi of content.
-                                  #
-                                  # THE PRACTICAL CEILING: with these values a
-                                  # bundle above roughly 80Mi of expanded content is
-                                  # rejected. Raising the cap buys some of that back
-                                  # (see the headroom note above), but not an order
-                                  # of magnitude: the pipeline holds the input, the
-                                  # decompressed container, every member body, every
-                                  # scrubbed body and the repacked archive at once,
-                                  # so a ~500Mi bundle cannot fit a 2Gi pod at any
-                                  # cap. That needs members spilled to disk (/work is
-                                  # already mounted for exactly this kind of use).
+                                  # member bodies read out of it. Effective capacity
+                                  # for a tar.gz is therefore ~768Mi of content.
+  SPILL_THRESHOLD: "4194304"      # 4Mi. Payloads larger than this go to /work on
+                                  # their own. Below it they stay on the heap, which
+                                  # keeps a 20000-member archive from creating 20000
+                                  # files.
+  SPILL_RESIDENT_MAX: "67108864"  # 64Mi aggregate in-memory budget. This is the one
+                                  # that catches many-small-members bundles: each
+                                  # payload is individually under the threshold while
+                                  # together they would hold the whole archive. Once
+                                  # this is exceeded everything spills regardless of
+                                  # size. THIS, not MAX_EXPAND_BYTES, is what bounds
+                                  # resident memory now.
   SCRUB_FILENAMES: "true"         # also scrub archive member names/paths + output key
   # Reports live in an internal bucket for operators to verify the scrub, so they
   # show the actual original values by default. Set "true" to store salted hashes
@@ -147,12 +117,15 @@ data:
   # rather than being OOM-killed. Keep this below limits.memory.
   #
   # This is a soft target the GC grows the heap *toward*, so it sets the steady-state
-  # RSS as much as it caps it: the same object measured 1587Mi peak under a 1600MiB
-  # target and 1394Mi under a 1200MiB one. It only holds while the LIVE set fits
-  # underneath -- at MAX_EXPAND_BYTES=512Mi the live set exceeded 1600MiB, the GC
-  # could not keep up, and RSS overran to 1889Mi. Move it together with the expansion
-  # cap, never alone.
-  GOMEMLIMIT: "900MiB"
+  # RSS as much as it caps it. It only holds while the LIVE set fits underneath: before
+  # members spilled, at MAX_EXPAND_BYTES=512Mi the live set exceeded 1600MiB, the GC
+  # could not keep up, and RSS overran to 1889Mi -- 92% of this pod.
+  #
+  # Now that the live set is bounded by the SPILL_* settings rather than by the bundle,
+  # the measured peak is 445Mi (22% of the limit) with this target, across both worst
+  # shapes: 90000 tiny members and a 500Mi incompressible bundle. This is the value
+  # ./scripts/memory-matrix.sh measured at; change it and re-run that script.
+  GOMEMLIMIT: "1200MiB"
   # Web UI: browser uploads straight to MinIO via presigned URLs, so the browser
   # must be able to reach MinIO. Set these to MinIO's externally reachable host.
   # (MinIO also needs CORS allowing the scrubber Route origin.)
@@ -194,7 +167,7 @@ spec:
         - name: artifactory-pull   # only if pulling from a private Artifactory repo
       containers:
         - name: scrubberd
-          image: <ARTIFACTORY_DOCKER_HOST>/docker-local/scrubberd:0.2.0
+          image: <ARTIFACTORY_DOCKER_HOST>/docker-local/scrubberd:0.3.0
           ports:
             - containerPort: 8080
           envFrom:
@@ -250,7 +223,14 @@ spec:
         - name: policies
           configMap: { name: scrubber-policies }
         - name: work
-          emptyDir: {}
+          # sizeLimit is load-bearing now that archive members spill here. Without
+          # it an emptyDir draws on node ephemeral storage shared with every other
+          # pod, and exceeding it evicts this pod — the same outcome as an OOM, from
+          # a different resource. Keep it comfortably above MAX_EXPAND_BYTES: a
+          # .tar.gz stages the decompressed container, the member bodies and the
+          # repacked result, so budget roughly 2.5x the expansion cap.
+          emptyDir:
+            sizeLimit: 4Gi
         # - name: ca
         #   configMap: { name: scrubber-ca }
 ---

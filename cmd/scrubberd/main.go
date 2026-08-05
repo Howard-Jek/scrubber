@@ -25,6 +25,7 @@ import (
 	"github.com/howard/scrubber/internal/policy"
 	"github.com/howard/scrubber/internal/report"
 	"github.com/howard/scrubber/internal/server"
+	"github.com/howard/scrubber/internal/spill"
 	"github.com/howard/scrubber/internal/store"
 	"github.com/howard/scrubber/internal/worker"
 	"github.com/prometheus/client_golang/prometheus"
@@ -122,21 +123,28 @@ func realMain(log *slog.Logger) error {
 		QueueMax: envInt("QUEUE_MAX", 10000),
 		// Defaults match the shipped manifest. They used to disagree with it and
 		// with the README, which made the startup memory arithmetic unverifiable.
-		MaxObjectBytes: envInt64("MAX_OBJECT_BYTES", 64<<20),
+		MaxObjectBytes: envInt64("MAX_OBJECT_BYTES", 640<<20),
 		FinalizeGrace:  envDuration("FINALIZE_GRACE", 15*time.Second),
 		Audit:          audit,
 		RedactReports:  envBool("REDACT_REPORTS", false),
 		ScrubNames:     envBool("SCRUB_FILENAMES", true),
 		Limits: pipeline.Limits{
 			MaxDepth: envInt("MAX_DEPTH", 16),
-			// 160Mi, not the 512Mi this shipped with. The expansion budget counts
-			// bytes read; resident memory runs several times that, and 512Mi measured
-			// 1889Mi peak RSS — 92% of the 2Gi pod it was supposedly sized for. At
-			// 160Mi the worst shape the memory matrix finds peaks at 775Mi (38%).
-			// See deploy/openshift-manifests.yaml for the full measurement table and
+			// Archive members spill to scratch storage, so this now bounds mostly
+			// DISK rather than resident memory. Size the /work volume against it, not
+			// just limits.memory — an ephemeral-storage eviction kills a pod as dead
+			// as an OOM. See deploy/openshift-manifests.yaml for the arithmetic and
 			// scripts/memory-matrix.sh for how to re-derive it after any change.
-			MaxTotalBytes: envInt64("MAX_EXPAND_BYTES", 160<<20),
+			MaxTotalBytes: envInt64("MAX_EXPAND_BYTES", 1536<<20),
 			MaxMembers:    envInt("MAX_MEMBERS", 100000),
+			Spill: spill.Policy{
+				// Payloads above SPILL_THRESHOLD go to disk on their own; once live
+				// in-memory payloads exceed SPILL_RESIDENT_MAX everything spills
+				// regardless of size. The second limit is the one that catches an
+				// archive of many small members, which the memory matrix ranks worst.
+				Threshold:   envInt64("SPILL_THRESHOLD", 4<<20),
+				ResidentMax: envInt64("SPILL_RESIDENT_MAX", 64<<20),
+			},
 		},
 	}
 	if os.Getenv("MAX_RATIO") != "" {
@@ -146,35 +154,40 @@ func realMain(log *slog.Logger) error {
 			"it emitted the object UNSCRUBBED. Memory is now bounded by MAX_EXPAND_BYTES, " +
 			"enforced while decompressing.")
 	}
-	// Objects are scrubbed one at a time, so only one object is ever resident. Note
-	// the two numbers below are NOT the same thing, and conflating them is how you
-	// size a pod that then gets OOM-killed:
+	// Three different ceilings, and conflating them is how a pod gets killed:
 	//
-	//   budget_bytes  — what the expansion accounting caps: compressed input plus
-	//                   cumulative decompressed bytes.
-	//   est_peak_rss  — what the process actually occupies, which is several times
-	//                   larger. The budget counts bytes read; resident memory also
-	//                   holds each member's scrubbed output, the repacked archive,
-	//                   and GC slack that Go does not return promptly. Measured at
-	//                   ~5x the expansion budget on the worst shape the memory matrix
-	//                   finds: many tiny members in a .tar.gz, where per-member
-	//                   overhead dominates rather than per-byte cost.
+	//   budget_bytes  — what the expansion accounting caps. Since archive members
+	//                   spill, this bounds mostly DISK on the scratch volume.
+	//   est_peak_rss  — resident memory, which no longer tracks the expansion budget
+	//                   at all. Only the member being scrubbed is on the heap, so
+	//                   this is a function of the spill policy — the aggregate
+	//                   in-memory budget, plus a few multiples of the per-payload
+	//                   threshold for the leaf scrubber (which needs a contiguous
+	//                   string and therefore briefly holds several copies) — plus
+	//                   per-member bookkeeping, which spilling does not remove and
+	//                   which scales with MAX_MEMBERS, plus runtime baseline and
+	//                   GC slack.
+	//   scratch_bytes — the disk a single object can occupy. A .tar.gz stages the
+	//                   decompressed container, the member bodies and the repacked
+	//                   result, so budget well above the expansion cap.
 	//
-	// Size limits.memory against est_peak_rss, not against budget_bytes.
-	//
-	// The multiplier applies to the *expansion* budget only. The compressed input is
-	// resident once and does not get copied, scrubbed and repacked the way member
-	// bodies do, so folding it into the multiplied term would overstate the estimate
-	// by hundreds of MiB and push an operator toward a larger pod than they need.
+	// Size limits.memory against est_peak_rss and the /work sizeLimit against
+	// scratch_bytes. Re-derive both with scripts/memory-matrix.sh after any change.
 	budget := wcfg.MaxObjectBytes + wcfg.Limits.MaxTotalBytes
-	estPeak := wcfg.MaxObjectBytes + int64(float64(wcfg.Limits.MaxTotalBytes)*peakRSSFactor)
+	sp := wcfg.Limits.Spill
+	estPeak := int64(float64(sp.ResidentMax+leafCopies*sp.Threshold)*peakRSSFactor) +
+		runtimeBaselineBytes + int64(wcfg.Limits.MaxMembers)*perMemberBytes
 	log.Info("resource limits",
 		"max_object_bytes", wcfg.MaxObjectBytes,
 		"max_expand_bytes", wcfg.Limits.MaxTotalBytes,
+		"spill_threshold", sp.Threshold,
+		"spill_resident_max", sp.ResidentMax,
+		"max_members", wcfg.Limits.MaxMembers,
 		"queue_concurrency", 1,
 		"queue_max", wcfg.QueueMax,
 		"budget_bytes", budget,
-		"est_peak_rss_bytes", estPeak)
+		"est_peak_rss_bytes", estPeak,
+		"scratch_bytes", int64(scratchFactor*float64(wcfg.Limits.MaxTotalBytes)))
 	wk := worker.New(st, reg, m, jobs, wcfg, log)
 	metrics.RegisterQueue(promReg,
 		func() float64 { return float64(wk.Queue().Depth()) },
@@ -252,20 +265,38 @@ const (
 	// the worker persist whatever it had finished. Keep it inside the pod's
 	// terminationGracePeriodSeconds, or the kubelet kills the process first.
 	shutdownTimeout = 30 * time.Second
-	// peakRSSFactor converts the expansion budget into an estimate of actual
-	// resident memory.
+	// leafCopies is how many copies of a payload the leaf scrubber briefly holds:
+	// the bytes, the string the matcher needs, and the scrubbed result.
+	leafCopies = 3
+	// runtimeBaselineBytes is the Go runtime, the compiled policy and the HTTP
+	// server — what the process costs before it touches an object.
+	runtimeBaselineBytes = 128 << 20
+	// scratchFactor is how much scratch disk one object can occupy relative to the
+	// expansion budget: a .tar.gz stages the decompressed container, the member
+	// bodies and the repacked result.
+	scratchFactor = 2.5
+	// peakRSSFactor converts the spill policy into an estimate of actual resident
+	// memory.
 	//
 	// The budget counts bytes *read* — the compressed object plus everything
 	// decompressed out of it. Resident memory holds considerably more at the same
-	// instant: each archive member's scrubbed output alongside its input, the
-	// repacked archive being assembled, and heap the Go GC has not yet returned.
-	// Derived from the worst shape `go test ./internal/pipeline -run TestMemoryMatrix`
-	// finds — many tiny members in a .tar.gz — confirmed end to end by
-	// scripts/memory-matrix.sh: a 152MiB expansion draw peaked at 775MiB RSS, i.e.
-	// ~5.1x. Rounded up slightly, because an estimate an operator sizes a pod from
-	// should err high. It is an estimate, not a guarantee: re-run the script after
-	// changing any cap rather than trusting this number alone.
-	peakRSSFactor = 5.5
+	// instant: the leaf being scrubbed, its scrubbed output, and heap the Go GC has
+	// not yet returned. Go does not return freed heap promptly, so live-set
+	// arithmetic alone understates RSS. Errs high on purpose — an estimate an
+	// operator sizes a pod from should.
+	peakRSSFactor = 2.5
+	// perMemberBytes is the bookkeeping one archive entry costs regardless of how
+	// large its payload is: the tar/zip header, the report's per-file entry, the
+	// member path (recorded twice, since a scrubbed name keeps its original as the
+	// report label), the blob handle, and the GC slack over all of it.
+	//
+	// This term exists because the spill policy alone does NOT bound resident
+	// memory. Payloads go to disk, but per-member overhead does not, and it scales
+	// with MAX_MEMBERS rather than with bytes — which is why the memory matrix
+	// ranks a 352MiB archive of 90000 tiny members above a 500MiB one of 50 large
+	// ones. Calibrated so the estimate sits above both measured shapes
+	// (445MiB peak at MAX_MEMBERS=100000); see scripts/memory-matrix.sh.
+	perMemberBytes = 2 << 10
 )
 
 // cachedReady wraps a readiness check so concurrent probes share one in-flight
