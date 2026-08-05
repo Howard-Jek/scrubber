@@ -61,10 +61,12 @@ tgz(f"{work}/incomplete.tar.gz", [
     ("assets/logo.png", b"\x89PNG\r\n\x1a\n" + noise),
 ])
 
-# 3. A member the scrubber cannot read that is full of live secrets. UTF-32 is the
-#    honest case: a text encoding the tool does not round-trip, so it is skipped --
-#    and the residual scan reads it anyway and escalates.
+# 3. A member the scrubber cannot read that is full of live secrets. Well-formed
+#    UTF-32 is scrubbed now, so the honest case is UTF-32 that is MALFORMED: Decode
+#    must refuse it rather than repair it, which means it is skipped -- and the
+#    residual scan reads it at four-byte stride anyway and escalates.
 utf32 = b"\xff\xfe\x00\x00" + text.encode("utf-32-le")
+utf32 += b"\x00\x00\x11\x00"   # a code point past U+10FFFF
 tgz(f"{work}/risky.tar.gz", [
     ("logs/app.log", text.encode()),
     ("logs/lux.txt", utf32),

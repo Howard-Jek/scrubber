@@ -64,6 +64,25 @@ func corpusUTF16(t *testing.T, s string, be, bom bool) []byte {
 	return out
 }
 
+// corpusUTF32 is the four-byte-per-code-point form, i.e. `iconv -t UTF-32LE`.
+func corpusUTF32(t *testing.T, s string, be, bom bool) []byte {
+	t.Helper()
+	if bom {
+		s = "\ufeff" + s
+	}
+	runes := []rune(s)
+	out := make([]byte, 4*len(runes))
+	for i, r := range runes {
+		u := uint32(r)
+		if be {
+			out[4*i], out[4*i+1], out[4*i+2], out[4*i+3] = byte(u>>24), byte(u>>16), byte(u>>8), byte(u)
+		} else {
+			out[4*i], out[4*i+1], out[4*i+2], out[4*i+3] = byte(u), byte(u>>8), byte(u>>16), byte(u>>24)
+		}
+	}
+	return out
+}
+
 func corpusTarGz(t *testing.T, name string, body []byte) []byte {
 	t.Helper()
 	var raw bytes.Buffer
@@ -112,22 +131,44 @@ func corpusRows() []corpusRow {
 			wantStatus: report.StatusScrubbed, wantDisp: report.Inspected,
 		},
 
-		// --- text encodings we cannot handle: skipped, named, and caught by the net ---
+		// --- UTF-32, now round-tripped like UTF-16 rather than skipped ---
 		{
-			name: "utf-32le holding secrets",
+			name: "utf-32le with BOM",
 			body: func(t *testing.T) []byte {
-				out := []byte{0xff, 0xfe, 0x00, 0x00}
-				for _, r := range text {
-					out = append(out, byte(r), byte(r>>8), byte(r>>16), byte(r>>24))
-				}
-				return out
+				return corpusUTF32(t, text, false, true)
 			},
-			// UTF-32 is a text encoding the scrubber cannot round-trip, so it is
-			// skipped — but the safety net reads at four-byte stride too, sees the
-			// addresses, and escalates. This is the case the net exists for: the
-			// pipeline being unable to help is exactly when something else must look.
+			wantStatus: report.StatusScrubbed, wantDisp: report.Inspected,
+		},
+		{
+			name: "utf-32le no BOM",
+			body: func(t *testing.T) []byte { return corpusUTF32(t, text, false, false) },
+			// The shape most easily mistaken for UTF-16LE: every odd byte is NUL.
+			wantStatus: report.StatusScrubbed, wantDisp: report.Inspected,
+		},
+		{
+			name: "utf-32be with BOM",
+			body: func(t *testing.T) []byte { return corpusUTF32(t, text, true, true) },
+			wantStatus: report.StatusScrubbed, wantDisp: report.Inspected,
+		},
+		{
+			name: "utf-32be no BOM",
+			body: func(t *testing.T) []byte { return corpusUTF32(t, text, true, false) },
+			wantStatus: report.StatusScrubbed, wantDisp: report.Inspected,
+		},
+
+		// --- text encodings we still cannot handle: skipped, named, caught by the net ---
+		{
+			name: "malformed utf-32 (past U+10FFFF)",
+			body: func(t *testing.T) []byte {
+				// Well-formed UTF-32 apart from one out-of-range code point. Decode
+				// must refuse the whole payload rather than repair that one unit,
+				// and the residual scan still reads the addresses at four-byte
+				// stride — the pipeline being unable to help is exactly when
+				// something else must look.
+				return append(corpusUTF32(t, text, false, true), 0x00, 0x00, 0x11, 0x00)
+			},
 			wantStatus: report.StatusBinarySkip, wantDisp: report.NotInspected,
-			wantReason: report.ReasonBinary, wantResidual: true,
+			wantReason: report.ReasonEncoding, wantResidual: true,
 		},
 		{
 			name: "malformed utf-16 (lone surrogate)",

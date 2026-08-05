@@ -19,6 +19,7 @@ package textenc
 import (
 	"bytes"
 	"strings"
+	"unicode"
 	"unicode/utf16"
 	"unicode/utf8"
 )
@@ -34,6 +35,12 @@ const (
 	UTF8
 	UTF16LE
 	UTF16BE
+	// UTF32LE and UTF32BE spend four bytes on every code point. They are rarer than
+	// UTF-16, but `iconv -t UTF-32` and some Unix-side log tooling emit them, and
+	// they used to be classified Binary on the strength of their NULs — so a plain
+	// text log went out unscrubbed for exactly the reason UTF-16 did.
+	UTF32LE
+	UTF32BE
 )
 
 func (e Encoding) String() string {
@@ -44,6 +51,10 @@ func (e Encoding) String() string {
 		return "utf-16le"
 	case UTF16BE:
 		return "utf-16be"
+	case UTF32LE:
+		return "utf-32le"
+	case UTF32BE:
+		return "utf-32be"
 	default:
 		return "binary"
 	}
@@ -73,6 +84,13 @@ const (
 	// ctrlSharePercent is the share of control characters above which content is
 	// judged binary rather than text.
 	ctrlSharePercent = 10
+	// minUTF32Sniff is the smallest sample the BOM-less UTF-32 heuristic will judge,
+	// in bytes — four code points, for the same reason minUTF16Sniff exists.
+	minUTF32Sniff = 32
+	// utf32NULShare is the share of code units that must carry NULs in the three
+	// bytes the code point does not reach before a BOM-less payload is called
+	// UTF-32. Latin-script text sits at 100; the margin tolerates non-Latin runs.
+	utf32NULShare = 50
 )
 
 // Sniff classifies a leading sample of a payload.
@@ -86,16 +104,25 @@ func Sniff(sample []byte) Encoding {
 		return UTF8 // nothing to scrub; scrubbing it is a no-op, not a risk
 	}
 	// UTF-32LE begins FF FE 00 00, which is also a UTF-16LE BOM. Check the longer
-	// signature first so a UTF-32 file is reported as unsupported rather than
-	// quietly mislabelled as UTF-16 we then fail to find anything in.
-	if bytes.HasPrefix(sample, bomUTF32LE) || bytes.HasPrefix(sample, bomUTF32BE) {
-		return Binary
+	// signature first, or a UTF-32 file is decoded as UTF-16 and every other code
+	// unit reads as a NUL character.
+	if bytes.HasPrefix(sample, bomUTF32LE) {
+		return UTF32LE
+	}
+	if bytes.HasPrefix(sample, bomUTF32BE) {
+		return UTF32BE
 	}
 	if bytes.HasPrefix(sample, bomUTF16LE) {
 		return UTF16LE
 	}
 	if bytes.HasPrefix(sample, bomUTF16BE) {
 		return UTF16BE
+	}
+	// UTF-32 before UTF-16 again for the BOM-less heuristics: ASCII in UTF-32LE is
+	// 41 00 00 00, whose odd bytes are all NUL, so it is the shape most likely to be
+	// mistaken for UTF-16LE.
+	if enc, ok := sniffUTF32NoBOM(sample); ok {
+		return enc
 	}
 	if enc, ok := sniffUTF16NoBOM(sample); ok {
 		return enc
@@ -104,6 +131,37 @@ func Sniff(sample []byte) Encoding {
 		return Binary
 	}
 	return UTF8
+}
+
+// sniffUTF32NoBOM recognises UTF-32 without a byte-order mark.
+//
+// A code point below U+10000 leaves three of every four bytes NUL, and which three
+// gives the byte order: UTF-32LE writes 41 00 00 00, UTF-32BE writes 00 00 00 41.
+// The two patterns are disjoint for any non-NUL character, so unlike the UTF-16
+// heuristic this needs no skew ratio to separate them — a payload matching both is
+// all NULs, which is not text.
+func sniffUTF32NoBOM(sample []byte) (Encoding, bool) {
+	n := len(sample) &^ 3 // a partial trailing code unit tells us nothing
+	if n < minUTF32Sniff {
+		return Binary, false
+	}
+	var leNUL, beNUL int
+	for i := 0; i < n; i += 4 {
+		if sample[i+1] == 0 && sample[i+2] == 0 && sample[i+3] == 0 {
+			leNUL++
+		}
+		if sample[i] == 0 && sample[i+1] == 0 && sample[i+2] == 0 {
+			beNUL++
+		}
+	}
+	units := n / 4
+	switch {
+	case leNUL*100 >= units*utf32NULShare && leNUL > beNUL:
+		return UTF32LE, true
+	case beNUL*100 >= units*utf32NULShare && beNUL > leNUL:
+		return UTF32BE, true
+	}
+	return Binary, false
 }
 
 // sniffUTF16NoBOM recognises UTF-16 without a byte-order mark, which is what most
@@ -176,6 +234,15 @@ func Decode(data []byte, enc Encoding) (string, Refusal) {
 			return "", RefusalNotText
 		}
 		return s, RefusalNone
+	case UTF32LE, UTF32BE:
+		s, ok := decodeUTF32(data, enc == UTF32BE)
+		if !ok {
+			return "", RefusalMalformed
+		}
+		if looksBinaryText(s) {
+			return "", RefusalNotText
+		}
+		return s, RefusalNone
 	default:
 		return "", RefusalNotText
 	}
@@ -196,6 +263,14 @@ func Encode(text string, enc Encoding) []byte {
 			putUnit(out[2*i:], u, be)
 		}
 		return out
+	case UTF32LE, UTF32BE:
+		runes := []rune(text)
+		out := make([]byte, 4*len(runes))
+		be := enc == UTF32BE
+		for i, r := range runes {
+			putQuad(out[4*i:], uint32(r), be)
+		}
+		return out
 	default:
 		return []byte(text)
 	}
@@ -214,6 +289,45 @@ func putUnit(b []byte, u uint16, be bool) {
 		return
 	}
 	b[0], b[1] = byte(u), byte(u>>8)
+}
+
+func quad(b []byte, i int, be bool) uint32 {
+	if be {
+		return uint32(b[i])<<24 | uint32(b[i+1])<<16 | uint32(b[i+2])<<8 | uint32(b[i+3])
+	}
+	return uint32(b[i+3])<<24 | uint32(b[i+2])<<16 | uint32(b[i+1])<<8 | uint32(b[i])
+}
+
+func putQuad(b []byte, u uint32, be bool) {
+	if be {
+		b[0], b[1], b[2], b[3] = byte(u>>24), byte(u>>16), byte(u>>8), byte(u)
+		return
+	}
+	b[0], b[1], b[2], b[3] = byte(u), byte(u>>8), byte(u>>16), byte(u>>24)
+}
+
+// decodeUTF32 refuses malformed input rather than repairing it, for the same reason
+// decodeUTF16 does.
+//
+// In UTF-32 the code unit *is* the code point, so the only malformed cases are a
+// length that is not a multiple of four, a value past U+10FFFF, and a surrogate —
+// which UTF-32 never encodes. strings.Builder.WriteRune substitutes U+FFFD for all
+// three, and that substitution would rewrite bytes we were only meant to read past,
+// breaking the byte-for-byte round trip that makes rewriting safe.
+func decodeUTF32(data []byte, be bool) (string, bool) {
+	if len(data)%4 != 0 {
+		return "", false
+	}
+	var b strings.Builder
+	b.Grow(len(data)/4 + utf8.UTFMax)
+	for i := 0; i < len(data); i += 4 {
+		u := quad(data, i, be)
+		if u > unicode.MaxRune || (u >= 0xd800 && u <= 0xdfff) {
+			return "", false
+		}
+		b.WriteRune(rune(u))
+	}
+	return b.String(), true
 }
 
 // decodeUTF16 refuses malformed input rather than repairing it.
@@ -252,8 +366,8 @@ func decodeUTF16(data []byte, be bool) (string, bool) {
 // looksBinary judges raw bytes. A NUL is a strong binary signal; otherwise the sample
 // must be decodable as UTF-8 (after a BOM) to be treated as text.
 //
-// This is reached only once the UTF-16 possibilities are exhausted, so a NUL here
-// really does mean binary.
+// This is reached only once the UTF-16 and UTF-32 possibilities are exhausted, so a
+// NUL here really does mean binary.
 func looksBinary(sample []byte) bool {
 	if len(sample) == 0 {
 		return false

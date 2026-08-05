@@ -5,7 +5,39 @@ image on your machine and export it to your isolated environment).
 
 ---
 
-## Latest: a coverage contract, so skipped files stop being a discovery (image 0.5.0)
+## Latest: UTF-32 is scrubbed, not skipped
+
+**What changed.** UTF-32 in either byte order, with or without a BOM, is now decoded,
+scrubbed and written back in the same encoding — the same contract UTF-16 already had.
+It used to be classified binary on the strength of its NULs (a UTF-32 `A` is
+`41 00 00 00`), so an ordinary text log was emitted unscrubbed. The safety net did
+catch it — those runs came back `incomplete-risky` and were diverted to `review/` —
+but "flagged and quarantined" is not the same as "scrubbed", and UTF-32 is common
+enough (`iconv -t UTF-32`, some Unix log tooling) to belong in the covered tier.
+
+**Why it was not just a table entry.** UTF-32LE opens `FF FE 00 00`, which *is* a
+UTF-16LE BOM, so the longer signature has to be tested first or the file decodes as
+UTF-16 with a NUL between every character. The BOM-less case needs its own heuristic
+for the same reason: ASCII in UTF-32LE puts a NUL in every odd byte, which is exactly
+what the UTF-16LE sniffer looks for.
+
+**The safety contract is unchanged and still enforced.** `Encode(Decode(x)) == x`
+byte for byte, so a rewritten file differs from its input only where a match was
+replaced. Malformed UTF-32 — a code point past U+10FFFF, a surrogate (which UTF-32
+never encodes), a length that is not a multiple of four — is refused rather than
+repaired, because `WriteRune` would substitute U+FFFD and silently rewrite bytes no
+match touched. Those files keep the old behaviour: passed through, named
+`encoding-unsupported`, and read by the residual scan anyway.
+
+**Verified:** `go test ./... -race` green; the conformance corpus gained four UTF-32
+rows (both byte orders × BOM) plus a malformed-UTF-32 row; `FuzzRoundTrip` ran 6.4M
+executions against the byte-identical contract with no counterexample; and end to end
+against the real service all ten well-formed Unicode shapes now come back `complete`
+with 600 matches each, BOM preserved, output still decoding in its original encoding.
+
+---
+
+## Earlier: a coverage contract, so skipped files stop being a discovery (image 0.5.0)
 
 Three bugs in a row had the same shape — a file left the pipeline uninspected and the
 run reported clean — so this change goes after the shape rather than another instance.
@@ -65,7 +97,8 @@ series — "no incomplete runs" and "this metric does not exist yet" look identi
 otherwise.
 
 **What to check on your side:** upload a bundle containing an image and one containing
-something the scrubber cannot read (a 7z, or a UTF-32 log). The first should stay in
+something the scrubber cannot read (a 7z, or a log that is malformed in the encoding it
+claims — UTF-32 itself is scrubbed now, see the section above). The first should stay in
 the normal output flagged `incomplete`; the second should land under `review/` with the
 download gated. `./scripts/coverage-check.sh` runs exactly that end to end.
 

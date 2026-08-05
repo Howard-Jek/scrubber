@@ -22,6 +22,21 @@ func utf16Bytes(t testing.TB, s string, be, bom bool) []byte {
 	return out
 }
 
+// utf32Bytes is the same idea for the four-byte form, i.e. what `iconv -t UTF-32LE`
+// produces.
+func utf32Bytes(t testing.TB, s string, be, bom bool) []byte {
+	t.Helper()
+	if bom {
+		s = "\ufeff" + s
+	}
+	runes := []rune(s)
+	out := make([]byte, 4*len(runes))
+	for i, r := range runes {
+		putQuad(out[4*i:], uint32(r), be)
+	}
+	return out
+}
+
 const logLine = "2026-06-12T09:00:00Z INFO user bob@acme.test from 10.1.2.3 org=AcmeCorp\n"
 
 func TestSniff(t *testing.T) {
@@ -42,11 +57,19 @@ func TestSniff(t *testing.T) {
 		{"utf-16be with BOM", utf16Bytes(t, strings.Repeat(logLine, 4), true, true), UTF16BE},
 		{"utf-16be no BOM", utf16Bytes(t, strings.Repeat(logLine, 4), true, false), UTF16BE},
 
-		// UTF-32LE opens with FF FE 00 00, which is also a UTF-16LE BOM. Reporting it
-		// as binary is honest; calling it UTF-16 would mean scrubbing nothing and
-		// claiming the file was inspected.
-		{"utf-32le", append([]byte{0xff, 0xfe, 0x00, 0x00}, 'a', 0, 0, 0), Binary},
-		{"utf-32be", append([]byte{0x00, 0x00, 0xfe, 0xff}, 0, 0, 0, 'a'), Binary},
+		// UTF-32LE opens with FF FE 00 00, which is also a UTF-16LE BOM, so the
+		// longer signature has to be tested first or the file decodes as UTF-16 with
+		// a NUL between every character.
+		{"utf-32le with BOM", utf32Bytes(t, strings.Repeat(logLine, 4), false, true), UTF32LE},
+		{"utf-32be with BOM", utf32Bytes(t, strings.Repeat(logLine, 4), true, true), UTF32BE},
+		{"utf-32le no BOM", utf32Bytes(t, strings.Repeat(logLine, 4), false, false), UTF32LE},
+		{"utf-32be no BOM", utf32Bytes(t, strings.Repeat(logLine, 4), true, false), UTF32BE},
+		{"utf-32le BOM is decisive when short", append([]byte{0xff, 0xfe, 0x00, 0x00}, 'a', 0, 0, 0), UTF32LE},
+		{"utf-32be BOM is decisive when short", append([]byte{0x00, 0x00, 0xfe, 0xff}, 0, 0, 0, 'a'), UTF32BE},
+		// Below minUTF32Sniff the NUL distribution is noise, exactly as for UTF-16.
+		{"utf-32 too short to judge, no BOM", []byte{'h', 0, 0, 0, 'i', 0, 0, 0}, Binary},
+		// All-NUL matches both byte orders, which means it is not text either way.
+		{"all NULs is not utf-32", bytes.Repeat([]byte{0, 0, 0, 0}, 16), Binary},
 
 		{"png header", []byte("\x89PNG\r\n\x1a\n\x00\x00\x00\rIHDR\x00\x00\x01\x00"), Binary},
 
@@ -78,6 +101,10 @@ func TestDecodeYieldsIdenticalText(t *testing.T) {
 		{"utf-16le+bom", utf16Bytes(t, want, false, true)},
 		{"utf-16be+bom", utf16Bytes(t, want, true, true)},
 		{"utf-16le", utf16Bytes(t, want, false, false)},
+		{"utf-32le+bom", utf32Bytes(t, want, false, true)},
+		{"utf-32be+bom", utf32Bytes(t, want, true, true)},
+		{"utf-32le", utf32Bytes(t, want, false, false)},
+		{"utf-32be", utf32Bytes(t, want, true, false)},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			got, refusal := Decode(tc.data, Sniff(tc.data))
@@ -103,7 +130,7 @@ func TestRoundTripIsByteIdentical(t *testing.T) {
 		"astral: \U0001F600 \U0001F4A9 and CJK: 日本語テキスト\n",
 		"mixed \u00e9\u00fc\u00df and control \t\r\n",
 	}
-	for _, enc := range []Encoding{UTF8, UTF16LE, UTF16BE} {
+	for _, enc := range []Encoding{UTF8, UTF16LE, UTF16BE, UTF32LE, UTF32BE} {
 		for _, s := range texts {
 			data := Encode(s, enc)
 			got, refusal := Decode(data, enc)
@@ -142,6 +169,28 @@ func TestDecodeRefusesMalformed(t *testing.T) {
 	}
 }
 
+// The same invariant for UTF-32. Every case here is one WriteRune would happily turn
+// into U+FFFD, which would rewrite bytes no match touched.
+func TestDecodeUTF32RefusesMalformed(t *testing.T) {
+	cases := []struct {
+		name string
+		data []byte
+	}{
+		{"length not a multiple of four", []byte{'a', 0, 0, 0, 'b', 0, 0}},
+		{"past U+10FFFF", []byte{'a', 0, 0, 0, 0x00, 0x00, 0x11, 0x00}},
+		{"high surrogate", []byte{'a', 0, 0, 0, 0x00, 0xd8, 0x00, 0x00}},
+		{"low surrogate", []byte{'a', 0, 0, 0, 0x00, 0xdc, 0x00, 0x00}},
+		{"negative when read as a rune", []byte{'a', 0, 0, 0, 0xff, 0xff, 0xff, 0xff}},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			if _, refusal := Decode(tc.data, UTF32LE); refusal != RefusalMalformed {
+				t.Errorf("refusal = %v, want RefusalMalformed: it must refuse rather than repair", refusal)
+			}
+		})
+	}
+}
+
 // A binary payload with NULs on alternating bytes can decode as well-formed UTF-16.
 // Accepting it would mean rewriting a file the tool is supposed to leave alone, so
 // the decoded text is checked for being text at all.
@@ -159,7 +208,8 @@ func TestDecodeRefusesBinaryThatHappensToDecode(t *testing.T) {
 
 func TestEncodingString(t *testing.T) {
 	for enc, want := range map[Encoding]string{
-		UTF8: "utf-8", UTF16LE: "utf-16le", UTF16BE: "utf-16be", Binary: "binary",
+		UTF8: "utf-8", UTF16LE: "utf-16le", UTF16BE: "utf-16be",
+		UTF32LE: "utf-32le", UTF32BE: "utf-32be", Binary: "binary",
 	} {
 		if got := enc.String(); got != want {
 			t.Errorf("String() = %q, want %q", got, want)
@@ -173,6 +223,8 @@ func TestEncodingString(t *testing.T) {
 func FuzzRoundTrip(f *testing.F) {
 	f.Add([]byte(logLine))
 	f.Add(utf16Bytes(f, logLine, false, true))
+	f.Add(utf32Bytes(f, logLine, false, true))
+	f.Add(utf32Bytes(f, logLine, true, false))
 	f.Add([]byte{0xff, 0xfe, 0x00, 0xd8, 0x00, 0xdc})
 	f.Add([]byte{0x00, 0x00, 0x00, 0x00})
 	f.Add([]byte("\x89PNG\r\n\x1a\n"))

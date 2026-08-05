@@ -173,14 +173,17 @@ func (p panicOnPut) PutStream(_ context.Context, _, _ string, _ io.Reader, _ int
 // tried and is not enough — a flag only helps somebody who reads it.
 func TestRiskyResultIsDivertedForReview(t *testing.T) {
 	ms := newMemStore("input", "output", "reports")
-	// A UTF-32 log: not a format the scrubber can read, and full of live secrets.
-	// It is skipped, the residual scan sees the addresses inside it, and that is
+	// A UTF-32 log that is malformed part way through, and full of live secrets.
+	// Well-formed UTF-32 is scrubbed now, so the shape that still exercises this
+	// path is one Decode must refuse rather than repair: it is skipped, the
+	// residual scan reads the addresses at four-byte stride anyway, and that is
 	// what should move the output.
 	var utf32 []byte
 	utf32 = append(utf32, 0xff, 0xfe, 0x00, 0x00)
 	for _, r := range strings.Repeat("hi from AcmeCorp, mail bob@acme.test\n", 20) {
 		utf32 = append(utf32, byte(r), byte(r>>8), byte(r>>16), byte(r>>24))
 	}
+	utf32 = append(utf32, 0x00, 0x00, 0x11, 0x00) // a code point past U+10FFFF
 	ms.Put(context.Background(), "input", "lux.txt", utf32, "")
 
 	w := newTestWorker(t, ms)
