@@ -188,6 +188,21 @@ func realMain(log *slog.Logger) error {
 		"budget_bytes", budget,
 		"est_peak_rss_bytes", estPeak,
 		"scratch_bytes", int64(scratchFactor*float64(wcfg.Limits.MaxTotalBytes)))
+
+	// Reclaim scratch stranded by a previous process before taking any work.
+	// Blob.Close removes spilled files, and a SIGKILL never runs it, so whatever
+	// the last object had staged is still on the volume with no owner. Left alone
+	// that accumulates across restarts until the emptyDir hits its sizeLimit and
+	// the kubelet evicts for ephemeral-storage — which restarts the pod, possibly
+	// mid-object again. Safe here because the queue is single-consumer and the
+	// Deployment is pinned to one replica, so nothing else owns these files.
+	if envBool("SCRATCH_RECLAIM", true) {
+		if n, freed, rerr := spill.Reclaim(os.Getenv("TMPDIR")); n > 0 || rerr != nil {
+			log.Info("reclaimed orphaned scratch files from a previous run",
+				"files", n, "freed_bytes", freed, "err", rerr)
+		}
+	}
+
 	wk := worker.New(st, reg, m, jobs, wcfg, log)
 	metrics.RegisterQueue(promReg,
 		func() float64 { return float64(wk.Queue().Depth()) },
