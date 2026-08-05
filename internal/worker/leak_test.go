@@ -22,10 +22,17 @@ import (
 // nothing like the bug that caused it. So the scratch directory has to come back
 // empty after every object, whatever the outcome.
 
+// scratchEnv redirects the temp directory these tests inspect.
+//
+// os.TempDir consults TMPDIR on unix but TMP then TEMP on Windows, so setting only
+// TMPDIR left staged files in the real temp dir while the assertions below read an
+// empty directory — the leak check then passes for the wrong reason. Set all three.
 func scratchEnv(t *testing.T) string {
 	t.Helper()
 	dir := t.TempDir()
-	t.Setenv("TMPDIR", dir) // os.CreateTemp("") resolves TMPDIR per call
+	t.Setenv("TMPDIR", dir)
+	t.Setenv("TMP", dir)
+	t.Setenv("TEMP", dir)
 	return dir
 }
 

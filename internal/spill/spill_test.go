@@ -10,13 +10,25 @@ import (
 	"testing"
 )
 
-// isolate points TMPDIR at a per-test directory so leak checks can assert on it and
-// so a failing test cannot litter the real temp dir.
+// isolate points the temp directory at a per-test directory so leak checks can
+// assert on it and so a failing test cannot litter the real temp dir.
+//
+// os.TempDir consults different variables per platform: TMPDIR on unix, TMP then
+// TEMP on Windows. Setting only TMPDIR silently redirected nothing on Windows, so
+// spilled files landed in the real temp dir and the leak assertions inspected an
+// empty directory. Set all three.
 func isolate(t *testing.T) string {
 	t.Helper()
 	dir := t.TempDir()
-	t.Setenv("TMPDIR", dir)
+	setTempDir(t, dir)
 	return dir
+}
+
+func setTempDir(t *testing.T, dir string) {
+	t.Helper()
+	t.Setenv("TMPDIR", dir)
+	t.Setenv("TMP", dir)
+	t.Setenv("TEMP", dir)
 }
 
 func leftovers(t *testing.T, dir string) []string {
@@ -269,15 +281,16 @@ func TestCreateStreamsOut(t *testing.T) {
 // corrupt bundle. The pipeline classifies on this error, and the two cases call for
 // completely different operator responses.
 func TestSpillFailureIsDistinguishable(t *testing.T) {
+	// Make the temp location unusable in a way that holds on every platform: point
+	// it at a regular file, so creating a file *inside* it cannot succeed. A
+	// mode-0500 directory does not work here — Windows does not derive directory
+	// permissions from unix mode bits, and root ignores them on unix.
 	dir := t.TempDir()
-	ro := filepath.Join(dir, "readonly")
-	if err := os.Mkdir(ro, 0o500); err != nil {
+	notADir := filepath.Join(dir, "not-a-directory")
+	if err := os.WriteFile(notADir, []byte("x"), 0o600); err != nil {
 		t.Fatal(err)
 	}
-	t.Setenv("TMPDIR", ro)
-	if os.Geteuid() == 0 {
-		t.Skip("running as root: mode 0500 does not prevent writes")
-	}
+	setTempDir(t, notADir)
 
 	_, err := FromBytes(bytes.Repeat([]byte("x"), 4096), Policy{Threshold: 16})
 	if !errors.Is(err, ErrSpill) {

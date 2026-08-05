@@ -135,13 +135,18 @@ func WriteTarTo(w io.Writer, members []TarMember) error {
 			return err
 		}
 		if m.Body.Size() > 0 {
-			rc, err := m.Body.Reader()
-			if err != nil {
+			// Scoped to one member: a plain defer here would hold one open handle
+			// per member until the whole archive was written, and a trailing Close
+			// would be skipped if the copy panicked.
+			if err := func() error {
+				rc, err := m.Body.Reader()
+				if err != nil {
+					return err
+				}
+				defer rc.Close()
+				_, err = io.Copy(tw, rc)
 				return err
-			}
-			_, err = io.Copy(tw, rc)
-			rc.Close()
-			if err != nil {
+			}(); err != nil {
 				return err
 			}
 		}
@@ -225,13 +230,16 @@ func WriteZipTo(w io.Writer, members []ZipMember) error {
 			return err
 		}
 		if m.Body.Size() > 0 {
-			rc, err := m.Body.Reader()
-			if err != nil {
+			// Scoped per member, as in WriteTar above.
+			if err := func() error {
+				rc, err := m.Body.Reader()
+				if err != nil {
+					return err
+				}
+				defer rc.Close()
+				_, err = io.Copy(ew, rc)
 				return err
-			}
-			_, err = io.Copy(ew, rc)
-			rc.Close()
-			if err != nil {
+			}(); err != nil {
 				return err
 			}
 		}

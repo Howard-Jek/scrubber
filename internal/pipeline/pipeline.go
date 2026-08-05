@@ -355,8 +355,12 @@ func (e *Engine) handleTar(path string, in *spill.Blob, depth int) (*spill.Blob,
 		e.recordSize(path, report.StatusPassthrough, fmt.Sprintf("could not read tar: %v", err), in)
 		return in, false
 	}
-	members, err := archive.ReadTar(rc, e.budget, e.Limits.MaxMembers, e.Limits.Spill)
-	rc.Close()
+	// Close through a defer so a panic inside ReadTar cannot leak the handle; the
+	// closure scopes it to the read rather than to the whole member walk below.
+	members, err := func() ([]archive.TarMember, error) {
+		defer rc.Close()
+		return archive.ReadTar(rc, e.budget, e.Limits.MaxMembers, e.Limits.Spill)
+	}()
 	if err != nil {
 		e.containerFailure(path, "tar", in, err)
 		return in, false
@@ -403,8 +407,10 @@ func (e *Engine) handleZip(path string, in *spill.Blob, depth int) (*spill.Blob,
 		e.recordSize(path, report.StatusPassthrough, fmt.Sprintf("could not read zip: %v", err), in)
 		return in, false
 	}
-	members, err := archive.ReadZip(ra, in.Size(), e.budget, e.Limits.MaxMembers, e.Limits.Spill)
-	closer.Close()
+	members, err := func() ([]archive.ZipMember, error) {
+		defer closer.Close()
+		return archive.ReadZip(ra, in.Size(), e.budget, e.Limits.MaxMembers, e.Limits.Spill)
+	}()
 	if err != nil {
 		e.containerFailure(path, "zip", in, err)
 		return in, false
