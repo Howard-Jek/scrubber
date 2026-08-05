@@ -255,7 +255,11 @@ func TestBinarySkipsAreNamed(t *testing.T) {
 	if note.Status != report.StatusBinarySkip {
 		t.Errorf("status = %q, want %q", note.Status, report.StatusBinarySkip)
 	}
-	if note.Reason == "" {
+	if note.Detail == "" {
 		t.Error("a named skip with no reason is barely better than a bare count")
+	}
+	if note.Code != report.ReasonBinary {
+		t.Errorf("skip code = %q, want %q — the code is what metrics label and the UI groups by",
+			note.Code, report.ReasonBinary)
 	}
 }

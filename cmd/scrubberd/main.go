@@ -115,8 +115,12 @@ func realMain(log *slog.Logger) error {
 		ReportsBucket:   mustEnv("REPORTS_BUCKET"),
 		InputPrefix:     os.Getenv("INPUT_PREFIX"),
 		ProcessedPrefix: envDefault("PROCESSED_PREFIX", "processed/"),
-		Action:          worker.ProcessedAction(envDefault("PROCESSED_ACTION", "move")),
-		PollInterval:    envDuration("POLL_INTERVAL", 15*time.Second),
+		// Where a result lands when content the scrub did not inspect turns out to
+		// contain policy matches. Set empty to keep everything in one place and rely
+		// on the flagging alone.
+		ReviewPrefix: envDefault("REVIEW_PREFIX", "review/"),
+		Action:       worker.ProcessedAction(envDefault("PROCESSED_ACTION", "move")),
+		PollInterval: envDuration("POLL_INTERVAL", 15*time.Second),
 		// Clamped to 1 by worker.New. Read from the environment anyway so an
 		// operator who set it higher gets told it is being ignored.
 		Workers:  envInt("WORKERS", 1),
@@ -137,6 +141,16 @@ func realMain(log *slog.Logger) error {
 			// scripts/memory-matrix.sh for how to re-derive it after any change.
 			MaxTotalBytes: envInt64("MAX_EXPAND_BYTES", 1536<<20),
 			MaxMembers:    envInt("MAX_MEMBERS", 100000),
+			// Bytes the residual scan may read across one object. Negative disables
+			// it, which removes the only check that does not depend on the pipeline's
+			// own classification being correct — the check that would have caught
+			// UTF-16 logs being filed as binary.
+			ResidualBudget: envInt64("RESIDUAL_BUDGET", pipeline.DefaultResidualBudget),
+			// Re-scan every scrubbed file to confirm the policy no longer matches it.
+			// Off by default because it roughly doubles matcher work (measured at ~70%
+			// of the drain rate) and the failure it catches is rejected at policy load
+			// instead. Worth turning on if you suspect the matcher itself.
+			VerifyOutput: envBool("VERIFY_OUTPUT", false),
 			Spill: spill.Policy{
 				// Payloads above SPILL_THRESHOLD go to disk on their own; once live
 				// in-memory payloads exceed SPILL_RESIDENT_MAX everything spills

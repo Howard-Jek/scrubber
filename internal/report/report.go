@@ -44,10 +44,18 @@ type Digest struct {
 	Passthroughs []PassthroughNote `json:"passthroughs,omitempty"`
 	BinarySkip   int               `json:"binary_skipped"`
 	BinarySkips  []PassthroughNote `json:"binary_skips,omitempty"`
-	BytesIn      int               `json:"bytes_in"`
-	BytesOut     int               `json:"bytes_out"`
-	StartedAt    time.Time         `json:"started_at,omitempty"`
-	EndedAt      time.Time         `json:"ended_at,omitempty"`
+	// Verdict and the coverage fields are what every surface reads. The per-status
+	// counts above are kept for continuity with reports written before them.
+	Verdict         Verdict        `json:"verdict"`
+	NotInspected    int            `json:"files_not_inspected"`
+	NotInspectedSet []Note         `json:"not_inspected,omitempty"`
+	ByReason        map[Reason]int `json:"by_reason,omitempty"`
+	ResidualHits    int            `json:"residual_hits"`
+	ResidualSamples []string       `json:"residual_samples,omitempty"`
+	BytesIn         int            `json:"bytes_in"`
+	BytesOut        int            `json:"bytes_out"`
+	StartedAt       time.Time      `json:"started_at,omitempty"`
+	EndedAt         time.Time      `json:"ended_at,omitempty"`
 }
 
 // Digest renders the compact view of this report.
@@ -55,21 +63,62 @@ func (r *Report) Digest() Digest {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	return Digest{
-		InputKey:     r.InputKey,
-		OutputKey:    r.OutputKey,
-		Matches:      r.Summary.TotalMatches,
-		ByLabel:      r.Summary.MatchesByLabel,
-		FilesTotal:   r.Summary.FilesTotal,
-		Passthrough:  r.Summary.FilesPassthrough,
-		Passthroughs: r.Summary.Passthroughs,
-		BinarySkip:   r.Summary.FilesBinarySkip,
-		BinarySkips:  r.Summary.BinarySkips,
-		BytesIn:      r.BytesIn,
-		BytesOut:     r.BytesOut,
-		StartedAt:    r.StartedAt,
-		EndedAt:      r.EndedAt,
+		InputKey:        r.InputKey,
+		OutputKey:       r.OutputKey,
+		Matches:         r.Summary.TotalMatches,
+		ByLabel:         r.Summary.MatchesByLabel,
+		FilesTotal:      r.Summary.FilesTotal,
+		Passthrough:     r.Summary.FilesPassthrough,
+		Passthroughs:    r.Summary.Passthroughs,
+		BinarySkip:      r.Summary.FilesBinarySkip,
+		BinarySkips:     r.Summary.BinarySkips,
+		Verdict:         r.Summary.Verdict(),
+		NotInspected:    r.Summary.FilesNotInspected,
+		NotInspectedSet: r.Summary.NotInspected,
+		ByReason:        r.Summary.ByReason,
+		ResidualHits:    r.Summary.ResidualHits,
+		ResidualSamples: r.Summary.ResidualSamples,
+		BytesIn:         r.BytesIn,
+		BytesOut:        r.BytesOut,
+		StartedAt:       r.StartedAt,
+		EndedAt:         r.EndedAt,
 	}
 }
+
+// Verdict is the whole object's answer, derived from the per-file dispositions and
+// what the residual scan found. It is the single thing an operator, the UI, and the
+// output routing all key on, so that "is this result safe to share?" has one answer
+// rather than one per surface.
+type Verdict string
+
+const (
+	// VerdictComplete: every file was inspected. Nothing to review.
+	VerdictComplete Verdict = "complete"
+	// VerdictIncomplete: something was not inspected, but scanning it found nothing
+	// resembling the policy. An image inside a bundle lands here — worth naming,
+	// not worth blocking, and deliberately not treated as a failure so the alarm
+	// that does matter keeps its meaning.
+	VerdictIncomplete Verdict = "incomplete"
+	// VerdictIncompleteRisky: something was not inspected AND it contains matches
+	// for the policy. The tool skipped content that demonstrably holds the data it
+	// exists to remove. This is the one that diverts the output for review.
+	VerdictIncompleteRisky Verdict = "incomplete-risky"
+)
+
+// Verdict computes the object-level answer from the coverage counts.
+func (s Summary) Verdict() Verdict {
+	switch {
+	case s.FilesNotInspected == 0:
+		return VerdictComplete
+	case s.ResidualHits > 0:
+		return VerdictIncompleteRisky
+	default:
+		return VerdictIncomplete
+	}
+}
+
+// NeedsReview reports whether this result must not be mistaken for a clean one.
+func (v Verdict) NeedsReview() bool { return v == VerdictIncompleteRisky }
 
 // Status describes the outcome for a single file within the bundle.
 type Status string
@@ -81,7 +130,87 @@ const (
 	StatusPassthrough  Status = "passthrough-error"  // unreadable/corrupted/encrypted, passed through verbatim
 	StatusUnsupported  Status = "unsupported-format" // container we can read but not rewrite, passed through
 	StatusGuardTripped Status = "guard-tripped"      // size/ratio/depth guard, passed through
+	// StatusResidualMatch means the file WAS scrubbed and the policy still matches
+	// the result. That is a broken scrub, not a skipped file, and it is the only
+	// outcome that says the tool's own output cannot be trusted.
+	StatusResidualMatch Status = "residual-match"
 )
+
+// AllStatuses is every Status the report can carry. TestEveryStatusIsClassified
+// walks it, so a new status that nobody classified fails the build rather than
+// quietly inheriting whichever bucket a switch statement happened to fall into.
+var AllStatuses = []Status{
+	StatusScrubbed, StatusUnchanged, StatusBinarySkip,
+	StatusPassthrough, StatusUnsupported, StatusGuardTripped, StatusResidualMatch,
+}
+
+// Disposition answers the only question that matters about a file: is its content
+// covered by the scrub?
+//
+// This exists because it used to be answered in four different places that disagreed
+// with each other — the summary buckets, the rollback switch, HasUnscrubbed, and the
+// worker's per-file log — so whether a new failure mode was visible depended on which
+// bucket its author picked. UTF-16 text read as binary was invisible for exactly that
+// reason. Every surface now derives from this one function.
+type Disposition int
+
+const (
+	// Inspected: the content reached the matcher and the output is clean.
+	Inspected Disposition = iota
+	// NotInspected: the content is not covered by the scrub. Either it never reached
+	// the matcher, or it did and the result still matches the policy. Both mean a
+	// human has to look at the file, which is what makes them one category.
+	NotInspected
+)
+
+// Disposition classifies s. The switch is exhaustive on purpose and has no default:
+// adding a Status without classifying it must be a compile error, not a silent
+// default to "fine".
+func (s Status) Disposition() Disposition {
+	switch s {
+	case StatusScrubbed, StatusUnchanged:
+		return Inspected
+	case StatusBinarySkip, StatusPassthrough, StatusUnsupported,
+		StatusGuardTripped, StatusResidualMatch:
+		return NotInspected
+	}
+	// Unreachable for a classified Status. An unknown one is treated as a hole,
+	// because the safe answer to "I don't know what this is" is "review it".
+	return NotInspected
+}
+
+// Reason is a stable, machine-readable code for why content was not inspected.
+//
+// Free-text detail is for humans and changes with the wording; this is what metrics
+// label, what the UI groups by, and what an operator alerts on. A reason code
+// appearing that nobody has seen before is the signal that a new failure mode exists.
+type Reason string
+
+const (
+	ReasonBinary        Reason = "binary"               // not text, correctly skipped
+	ReasonEncoding      Reason = "encoding-unsupported" // text in an encoding we cannot round-trip
+	ReasonUnsupported   Reason = "unsupported-format"   // container we can read but not rewrite
+	ReasonMalformed     Reason = "malformed"            // corrupt, truncated or encrypted
+	ReasonExpandBudget  Reason = "expansion-budget"     // would exceed MAX_EXPAND_BYTES
+	ReasonMemberCap     Reason = "member-cap"           // archive exceeds MAX_MEMBERS
+	ReasonDepthCap      Reason = "depth-cap"            // nesting exceeds MAX_DEPTH
+	ReasonScratch       Reason = "scratch-unavailable"  // could not spill to disk
+	ReasonRepackFailed  Reason = "repack-failed"        // scrubbed, then could not be rebuilt
+	ReasonResidualScrub Reason = "residual-after-scrub" // scrubbed, but the policy still matches
+	// ReasonUnclassified is the tripwire. It is never written deliberately: it marks
+	// a hole recorded through Record instead of Skip, i.e. one whose author did not
+	// say why. The conformance corpus asserts zero of these, so the shortcut that
+	// created this whole class of bug cannot be taken again.
+	ReasonUnclassified Reason = "unclassified"
+)
+
+// AllReasons is every Reason a hole can carry, for the corpus test and for seeding
+// the metric label set so a dashboard shows a zero rather than a missing series.
+var AllReasons = []Reason{
+	ReasonBinary, ReasonEncoding, ReasonUnsupported, ReasonMalformed,
+	ReasonExpandBudget, ReasonMemberCap, ReasonDepthCap, ReasonScratch,
+	ReasonRepackFailed, ReasonResidualScrub, ReasonUnclassified,
+}
 
 // AuditLevel controls how much per-match detail the report retains.
 type AuditLevel int
@@ -125,16 +254,29 @@ type FileEntry struct {
 	MatchesTruncated bool `json:"matches_truncated,omitempty"`
 }
 
-// PassthroughNote identifies a file that was emitted WITHOUT being scrubbed and
+// Note identifies a file that was emitted WITHOUT being covered by the scrub, and
 // why. These are the entries a reviewer must inspect by hand before sharing the
-// bundle: the tool could not read them, could not rewrite them, or refused to
-// expand them. Surfacing them is the difference between a safe failure and a
-// silent leak, so they are carried all the way to the UI.
-type PassthroughNote struct {
+// bundle: the tool could not read them, could not rewrite them, refused to expand
+// them, or rewrote them and found the policy still matched. Surfacing them is the
+// difference between a safe failure and a silent leak, so they are carried all the
+// way to the UI.
+//
+// Code is what machines use — metric labels, UI grouping, alerting. Detail is prose
+// for a human and is free to change wording without breaking any of that.
+type Note struct {
 	Path   string `json:"path"`
 	Status Status `json:"status"`
-	Reason string `json:"reason,omitempty"`
+	Code   Reason `json:"code"`
+	Detail string `json:"reason,omitempty"` // JSON name kept: the UI reads "reason"
+	// Residual is a disclosure-safe summary of policy matches the residual scan
+	// found inside this file — "[EMAIL]×3, [IPV4]×1". Non-empty means the tool
+	// skipped something that demonstrably contains the data it exists to remove,
+	// which is the difference between a skipped image and a leak.
+	Residual string `json:"residual,omitempty"`
 }
+
+// PassthroughNote is the former name for Note, kept so existing callers compile.
+type PassthroughNote = Note
 
 // maxPassthroughNotes bounds the retained list so a pathological archive can't
 // inflate the report; the count in FilesPassthrough stays exact regardless.
@@ -186,6 +328,30 @@ type Summary struct {
 	// the rule ID. Rule IDs can embed literal values, so this is the safe breakdown
 	// to surface over a browser-facing / external API.
 	MatchesByLabel map[string]int `json:"matches_by_label"`
+
+	// --- coverage: the one view every surface derives from ---
+
+	// FilesInspected and FilesNotInspected partition FilesTotal by Disposition.
+	// FilesNotInspected is the number that decides the run's verdict; the per-status
+	// counters above are labels on top of it, not independent judgements.
+	FilesInspected    int `json:"files_inspected"`
+	FilesNotInspected int `json:"files_not_inspected"`
+	// NotInspected names every file in that second group, whatever the status —
+	// the union of Passthroughs and BinarySkips plus anything added later. Code
+	// paths that ask "what did we not cover?" must read this and nothing else.
+	NotInspected []Note `json:"not_inspected,omitempty"`
+	// ByReason counts the holes by reason code. A code appearing here that an
+	// operator has never seen is the signal that a new failure mode exists — which
+	// previously required somebody to notice a file looked wrong.
+	ByReason map[Reason]int `json:"by_reason,omitempty"`
+	// ResidualHits counts matches the residual scan found inside content that was
+	// NOT inspected. Non-zero means the tool skipped something that demonstrably
+	// contains the very data it exists to remove, and is what escalates a run from
+	// "incomplete" to "incomplete-risky".
+	ResidualHits int `json:"residual_hits"`
+	// ResidualSamples shows a few of those hits, already replaced with their policy
+	// labels so the report never quotes the sensitive value back.
+	ResidualSamples []string `json:"residual_samples,omitempty"`
 }
 
 // Report is the full run record.
@@ -225,17 +391,97 @@ type Report struct {
 
 // summaryDelta is one entry's contribution to the running Summary.
 type summaryDelta struct {
-	status      Status
-	matches     int
-	byRule      map[string]int
-	byLabel     map[string]int
-	passthrough bool // whether it appended a Passthroughs note
-	binarySkip  bool // whether it appended a BinarySkips note
+	status       Status
+	matches      int
+	byRule       map[string]int
+	byLabel      map[string]int
+	passthrough  bool // whether it appended a Passthroughs note
+	binarySkip   bool // whether it appended a BinarySkips note
+	notInspected bool // whether it appended a NotInspected note
+	reason       Reason
+	residualHits int
 	// retained is how much of the report-wide match budget this entry consumed, so
 	// undoing the entry gives the budget back rather than permanently spending it on
 	// a subtree that never reached the output.
 	retained int
 }
+
+// countStatus applies one entry's contribution to the summary counters, with sign
+// +1 to record and -1 to roll back.
+//
+// This is deliberately the ONLY place a status turns into a number. It used to be
+// two switches — one in Record and a mirror in Rollback — plus two more ad-hoc
+// classifications in HasUnscrubbed and the worker's per-file log, and they disagreed:
+// a binary skip was a problem to the log and not a problem to HasUnscrubbed. That
+// disagreement is how UTF-16 text left the pipeline unscrubbed while the run reported
+// clean. One function, one answer, both directions.
+func (r *Report) countStatus(status Status, reason Reason, sign int) {
+	r.Summary.FilesTotal += sign
+	switch status.Disposition() {
+	case Inspected:
+		r.Summary.FilesInspected += sign
+	case NotInspected:
+		r.Summary.FilesNotInspected += sign
+		if reason != "" {
+			if r.Summary.ByReason == nil {
+				r.Summary.ByReason = map[Reason]int{}
+			}
+			if r.Summary.ByReason[reason] += sign; r.Summary.ByReason[reason] <= 0 {
+				delete(r.Summary.ByReason, reason)
+			}
+		}
+	}
+	// The per-status counters below are labels on the coverage split above, kept
+	// because reports and tests read them. They are derived here rather than
+	// maintained separately, which is what stops them drifting from it.
+	switch status {
+	case StatusScrubbed:
+		r.Summary.FilesScrubbed += sign
+	case StatusUnchanged:
+		r.Summary.FilesUnchanged += sign
+	case StatusBinarySkip:
+		r.Summary.FilesBinarySkip += sign
+	default:
+		r.Summary.FilesPassthrough += sign
+	}
+}
+
+// NoteResidual attaches what the residual scan found to the entry just recorded.
+//
+// It amends the most recent entry rather than searching by path, because the two are
+// always recorded together: the pipeline scans the payload at the moment it decides
+// to skip it, while the blob is open and the path is in hand. Calling this at any
+// other time would annotate the wrong file, so it is unexported behaviour in
+// everything but name — the only callers are the two skip paths in the engine.
+func (r *Report) NoteResidual(path string, reason Reason, hits int, summary string) {
+	if hits <= 0 {
+		return
+	}
+	r.mu.Lock()
+	defer r.mu.Unlock()
+
+	r.Summary.ResidualHits += hits
+	if len(r.Summary.ResidualSamples) < maxResidualSamples {
+		r.Summary.ResidualSamples = append(r.Summary.ResidualSamples, path+": "+summary)
+	}
+	if n := len(r.deltas); n > 0 {
+		r.deltas[n-1].residualHits = hits
+	}
+	// Annotate the note in every list that carries this entry, so whichever one a
+	// surface reads shows the same thing.
+	for _, list := range [][]Note{r.Summary.NotInspected, r.Summary.Passthroughs, r.Summary.BinarySkips} {
+		for i := len(list) - 1; i >= 0; i-- {
+			if list[i].Path == path {
+				list[i].Residual = summary
+				break
+			}
+		}
+	}
+}
+
+// maxResidualSamples bounds the retained residual summaries the same way the note
+// lists are bounded; ResidualHits stays exact regardless.
+const maxResidualSamples = 20
 
 // Mark returns a checkpoint identifying the current end of the report.
 func (r *Report) Mark() int {
@@ -252,31 +498,25 @@ func (r *Report) Mark() int {
 // were never applied to the output, so leaving them counted would tell an
 // operator that more was redacted than actually was. That is the one direction a
 // transparency report must never be wrong in.
-func (r *Report) Rollback(mark int, path string, status Status, detail string, bytesIn, bytesOut int) {
+func (r *Report) Rollback(mark int, path string, status Status, reason Reason, detail string, bytesIn, bytesOut int) {
 	r.mu.Lock()
 	if mark < 0 || mark > len(r.Files) {
 		r.mu.Unlock()
 		return
 	}
 	for _, d := range r.deltas[mark:] {
-		r.Summary.FilesTotal--
-		switch d.status {
-		case StatusScrubbed:
-			r.Summary.FilesScrubbed--
-		case StatusUnchanged:
-			r.Summary.FilesUnchanged--
-		case StatusBinarySkip:
-			r.Summary.FilesBinarySkip--
-		case StatusPassthrough, StatusUnsupported, StatusGuardTripped:
-			r.Summary.FilesPassthrough--
-		}
+		r.countStatus(d.status, d.reason, -1)
 		if d.passthrough && len(r.Summary.Passthroughs) > 0 {
 			r.Summary.Passthroughs = r.Summary.Passthroughs[:len(r.Summary.Passthroughs)-1]
 		}
 		if d.binarySkip && len(r.Summary.BinarySkips) > 0 {
 			r.Summary.BinarySkips = r.Summary.BinarySkips[:len(r.Summary.BinarySkips)-1]
 		}
+		if d.notInspected && len(r.Summary.NotInspected) > 0 {
+			r.Summary.NotInspected = r.Summary.NotInspected[:len(r.Summary.NotInspected)-1]
+		}
 		r.retained -= d.retained
+		r.Summary.ResidualHits -= d.residualHits
 		r.Summary.TotalMatches -= d.matches
 		for k, v := range d.byRule {
 			if r.Summary.MatchesByRule[k] -= v; r.Summary.MatchesByRule[k] <= 0 {
@@ -293,7 +533,7 @@ func (r *Report) Rollback(mark int, path string, status Status, detail string, b
 	r.deltas = r.deltas[:mark]
 	r.mu.Unlock()
 
-	r.Record(path, status, detail, bytesIn, bytesOut, nil)
+	r.record(path, status, reason, detail, bytesIn, bytesOut, nil)
 }
 
 // OnFile registers a callback invoked for each file as it is recorded, so a
@@ -318,7 +558,29 @@ func New(source, output string, audit AuditLevel, redact bool, salt string) *Rep
 }
 
 // Record adds a file outcome, applying the configured audit level and redaction.
+// Record files an outcome whose content WAS inspected, or an outcome from a caller
+// that predates reason codes.
+//
+// A hole recorded through here gets ReasonUnclassified, which is a tripwire rather
+// than a value: the conformance corpus asserts no run produces one. Skip is the way
+// to record a hole, and it makes the reason a required argument precisely so that
+// "add a status and move on" — the shortcut behind three shipped bugs — is no longer
+// available.
 func (r *Report) Record(path string, status Status, detail string, bytesIn, bytesOut int, matches []scrub.Match) {
+	reason := Reason("")
+	if status.Disposition() == NotInspected {
+		reason = ReasonUnclassified
+	}
+	r.record(path, status, reason, detail, bytesIn, bytesOut, matches)
+}
+
+// Skip files a file whose content is not covered by the scrub, with the reason code
+// that says why. Every such site in the pipeline goes through here.
+func (r *Report) Skip(path string, status Status, reason Reason, detail string, bytesIn, bytesOut int) {
+	r.record(path, status, reason, detail, bytesIn, bytesOut, nil)
+}
+
+func (r *Report) record(path string, status Status, reason Reason, detail string, bytesIn, bytesOut int, matches []scrub.Match) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 
@@ -367,28 +629,29 @@ func (r *Report) Record(path string, status Status, detail string, bytesIn, byte
 	r.Files = append(r.Files, entry)
 
 	// Summary accounting, mirrored into a delta so it can be undone exactly.
-	delta := summaryDelta{status: status}
+	delta := summaryDelta{status: status, reason: reason}
 	if r.audit != AuditOff {
 		delta.retained = keep
 	}
-	r.Summary.FilesTotal++
-	switch status {
-	case StatusScrubbed:
-		r.Summary.FilesScrubbed++
-	case StatusUnchanged:
-		r.Summary.FilesUnchanged++
-	case StatusBinarySkip:
-		r.Summary.FilesBinarySkip++
-		if len(r.Summary.BinarySkips) < maxPassthroughNotes {
-			r.Summary.BinarySkips = append(r.Summary.BinarySkips,
-				PassthroughNote{Path: path, Status: status, Reason: detail})
-			delta.binarySkip = true
+	r.countStatus(status, reason, +1)
+
+	// Name every hole, once, in the list the verdict reads. Passthroughs and
+	// BinarySkips are the older split of the same information, kept for reports and
+	// callers that already read them; all three are appended from here so they
+	// describe the same set.
+	if status.Disposition() == NotInspected {
+		note := Note{Path: path, Status: status, Code: reason, Detail: detail}
+		if len(r.Summary.NotInspected) < maxPassthroughNotes {
+			r.Summary.NotInspected = append(r.Summary.NotInspected, note)
+			delta.notInspected = true
 		}
-	case StatusPassthrough, StatusUnsupported, StatusGuardTripped:
-		r.Summary.FilesPassthrough++
-		if len(r.Summary.Passthroughs) < maxPassthroughNotes {
-			r.Summary.Passthroughs = append(r.Summary.Passthroughs,
-				PassthroughNote{Path: path, Status: status, Reason: detail})
+		if status == StatusBinarySkip {
+			if len(r.Summary.BinarySkips) < maxPassthroughNotes {
+				r.Summary.BinarySkips = append(r.Summary.BinarySkips, note)
+				delta.binarySkip = true
+			}
+		} else if len(r.Summary.Passthroughs) < maxPassthroughNotes {
+			r.Summary.Passthroughs = append(r.Summary.Passthroughs, note)
 			delta.passthrough = true
 		}
 	}
@@ -442,10 +705,15 @@ func (r *Report) WriteJSON(path string) error {
 // (guard-tripped, unreadable, or an unsupported container). Binary files are not
 // counted: skipping them is intentional and safe, since byte-substitution would
 // corrupt them.
+// HasUnscrubbed reports whether any file was left uncovered by the scrub.
+//
+// It used to read FilesPassthrough, which excluded binary skips — so a UTF-16 log
+// misread as binary left this false and --fail-on-unscrubbed silent. It now asks the
+// coverage question directly, which is the whole point of Disposition existing.
 func (r *Report) HasUnscrubbed() bool {
 	r.mu.Lock()
 	defer r.mu.Unlock()
-	return r.Summary.FilesPassthrough > 0
+	return r.Summary.FilesNotInspected > 0
 }
 
 // Banner returns the end-of-run transparency summary printed to stderr. When any
@@ -457,13 +725,22 @@ func (r *Report) Banner() string {
 	defer r.mu.Unlock()
 	s := r.Summary
 
-	base := fmt.Sprintf("redacted %d matches across %d rules in %d file(s); %d binary file(s) skipped",
-		s.TotalMatches, len(s.MatchesByRule), s.FilesScrubbed, s.FilesBinarySkip)
-	if s.FilesPassthrough == 0 && s.FilesBinarySkip == 0 {
+	base := fmt.Sprintf("%s: redacted %d matches across %d rules in %d file(s); %d of %d file(s) NOT inspected",
+		s.Verdict(), s.TotalMatches, len(s.MatchesByRule), s.FilesScrubbed,
+		s.FilesNotInspected, s.FilesTotal)
+	if s.FilesNotInspected == 0 {
 		return base
 	}
 
 	var b strings.Builder
+	// The residual finding comes first because it is the only line that says the
+	// skipped content was checked and was NOT harmless.
+	if s.ResidualHits > 0 {
+		fmt.Fprintf(&b, "WARNING: content that was NOT inspected contains %d policy match(es):\n", s.ResidualHits)
+		for _, sample := range s.ResidualSamples {
+			fmt.Fprintf(&b, "  !! %s\n", sample)
+		}
+	}
 	if s.FilesPassthrough > 0 {
 		fmt.Fprintf(&b, "WARNING: %d file(s) were emitted UNSCRUBBED and must be reviewed by hand:\n", s.FilesPassthrough)
 		listNotes(&b, "!", s.Passthroughs, s.FilesPassthrough)
@@ -479,11 +756,15 @@ func (r *Report) Banner() string {
 	return b.String()
 }
 
-func listNotes(b *strings.Builder, bullet string, notes []PassthroughNote, total int) {
+func listNotes(b *strings.Builder, bullet string, notes []Note, total int) {
 	for _, p := range notes {
-		fmt.Fprintf(b, "  %s %s (%s)", bullet, p.Path, p.Status)
-		if p.Reason != "" {
-			fmt.Fprintf(b, ": %s", p.Reason)
+		fmt.Fprintf(b, "  %s %s (%s", bullet, p.Path, p.Status)
+		if p.Code != "" {
+			fmt.Fprintf(b, "/%s", p.Code)
+		}
+		b.WriteString(")")
+		if p.Detail != "" {
+			fmt.Fprintf(b, ": %s", p.Detail)
 		}
 		b.WriteByte('\n')
 	}

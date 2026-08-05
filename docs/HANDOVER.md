@@ -5,7 +5,73 @@ image on your machine and export it to your isolated environment).
 
 ---
 
-## Latest: UTF-16 text was being skipped entirely (image 0.4.0)
+## Latest: a coverage contract, so skipped files stop being a discovery (image 0.5.0)
+
+Three bugs in a row had the same shape — a file left the pipeline uninspected and the
+run reported clean — so this change goes after the shape rather than another instance.
+
+**The root cause was structural.** "Not scrubbed" was decided in four places that
+disagreed: the summary buckets, the rollback switch, `HasUnscrubbed`, and the worker's
+per-file log. A binary skip was a problem to the log and not a problem to
+`--fail-on-unscrubbed`. Nothing forced a new failure mode to declare whether content
+had been inspected, so its visibility depended on which bucket its author picked.
+
+**Four things now hold:**
+
+1. **One definition.** Every file gets a disposition — inspected, or not — from a
+   single exhaustive function. Adding a status without classifying it is a compile
+   error. Every hole carries a machine-readable reason code (`binary`,
+   `unsupported-format`, `expansion-budget`, …), and `unclassified` is a tripwire the
+   conformance corpus asserts never appears.
+2. **Whatever is skipped gets looked inside anyway.** A new package pulls printable
+   runs straight out of the raw bytes at every code-unit width Latin text uses — one
+   byte, UTF-16's two, UTF-32's four, either byte order — and runs the policy over
+   them. It never asks what the format is, which is exactly why it survives the
+   classification being wrong. This is the check that would have caught `lux.txt` on
+   day one.
+3. **One verdict, and it routes the output.** `complete` / `incomplete` /
+   `incomplete-risky`. A bundle whose skipped parts contain policy matches is written
+   under `review/` instead of the normal output key, and the UI makes you tick a box
+   before it will download one. Harmless skips deliberately do *not* divert — if every
+   bundle with an image landed in the review queue nobody would read it.
+4. **A conformance corpus.** 28 rows: every format × encoding × failure mode, each
+   declaring its expected status, disposition and reason. Adding a format means adding
+   rows. I verified it catches all three shipped bugs by reverting each fix and
+   watching the table fail.
+
+**One thing I measured and then changed my mind about.** I first added a check that
+re-scanned every scrubbed file to confirm the policy no longer matched it. It cost
+**~70% of the drain rate** on the 500 MiB shape — 139s to 237s. The failure it catches
+(a policy whose replacement matches its own rule) is a property of the *policy*, so it
+is now rejected when the policy loads instead, for free and before any data is touched.
+The re-scan survives as `VERIFY_OUTPUT=true`, off by default. At the defaults this
+whole change costs nothing measurable: 134s/127s against a 136s/130s baseline, same
+435 MiB peak.
+
+**New config:** `REVIEW_PREFIX` (default `review/`, empty disables diverting),
+`RESIDUAL_BUDGET` (default 64Mi, negative disables the scan), `VERIFY_OUTPUT`
+(default false).
+
+**New metrics — these are the ones to alert on:**
+
+```
+scrubber_object_verdict_total{verdict="incomplete-risky"}   > 0  → something skipped that contains matches
+scrubber_files_not_inspected_total{reason="..."}                 → a reason you have not seen before is a new failure mode
+scrubber_residual_hits_total
+```
+
+The label sets are seeded at startup, so a fresh pod shows zeros rather than missing
+series — "no incomplete runs" and "this metric does not exist yet" look identical
+otherwise.
+
+**What to check on your side:** upload a bundle containing an image and one containing
+something the scrubber cannot read (a 7z, or a UTF-32 log). The first should stay in
+the normal output flagged `incomplete`; the second should land under `review/` with the
+download gated. `./scripts/coverage-check.sh` runs exactly that end to end.
+
+---
+
+## Earlier: UTF-16 text was being skipped entirely (image 0.4.0)
 
 **The bug.** Two `.txt` files, same content, same policy: the UTF-8 one scrubbed, the
 UTF-16 one came back untouched. The binary check called anything binary the moment it
@@ -115,14 +181,14 @@ access to your filesystem. These run on your machine:
 
 ```sh
 git pull
-docker build -f deploy/Containerfile -t scrubberd:0.4.0 .
-docker save -o ~/Desktop/scrubberd-0.4.0.tar scrubberd:0.4.0
+docker build -f deploy/Containerfile -t scrubberd:0.5.0 .
+docker save -o ~/Desktop/scrubberd-0.5.0.tar scrubberd:0.5.0
 ```
 
 On the isolated side:
 
 ```sh
-docker load -i scrubberd-0.4.0.tar
+docker load -i scrubberd-0.5.0.tar
 ```
 
 If your air-gapped registry mirrors its own base images, build with them instead —
@@ -133,7 +199,7 @@ docker build -f deploy/Containerfile \
   --build-arg BASE_BUILD_IMAGE=<artifactory>/docker-public/golang:1.25 \
   --build-arg BASE_RUNTIME_IMAGE=<artifactory>/docker-public/ubi9/ubi-micro:latest \
   --build-arg GOPROXY=https://<artifactory>/artifactory/api/go/go-remote \
-  -t <artifactory>/docker-local/scrubberd:0.4.0 .
+  -t <artifactory>/docker-local/scrubberd:0.5.0 .
 ```
 
 Add `--platform linux/amd64` if you are building on an Apple-silicon Mac for an x86

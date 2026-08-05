@@ -11,7 +11,7 @@
     --color-border-tertiary:rgba(0,0,0,.10); --color-border-secondary:rgba(0,0,0,.16); --color-border-info:#378add;
     --color-text-success:#0f6e56; --color-background-success:#e1f5ee;
     --color-text-info:#185fa5; --color-background-info:#e6f1fb;
-    --color-text-danger:#a32d2d;
+    --color-text-danger:#a32d2d; --color-background-danger:#fdeaea; --color-border-danger:#dd9a9a;
     --color-text-warning:#8a5300; --color-background-warning:#fdf1de; --color-border-warning:#e3b877;
     --accent:#1d9e75;
     --border-radius-md:8px; --border-radius-lg:12px;
@@ -27,7 +27,7 @@
     --color-border-tertiary:rgba(255,255,255,.12); --color-border-secondary:rgba(255,255,255,.20); --color-border-info:#378add;
     --color-text-success:#5dcaa5; --color-background-success:#123a2f;
     --color-text-info:#85b7eb; --color-background-info:#0f3050;
-    --color-text-danger:#f09595;
+    --color-text-danger:#f09595; --color-background-danger:#3d1f1f; --color-border-danger:#7a4141;
     --color-text-warning:#e8b563; --color-background-warning:#3a2c14; --color-border-warning:#6b5124;
   }}
   :root[data-theme="dark"]{
@@ -36,7 +36,7 @@
     --color-border-tertiary:rgba(255,255,255,.12); --color-border-secondary:rgba(255,255,255,.20); --color-border-info:#378add;
     --color-text-success:#5dcaa5; --color-background-success:#123a2f;
     --color-text-info:#85b7eb; --color-background-info:#0f3050;
-    --color-text-danger:#f09595;
+    --color-text-danger:#f09595; --color-background-danger:#3d1f1f; --color-border-danger:#7a4141;
     --color-text-warning:#e8b563; --color-background-warning:#3a2c14; --color-border-warning:#6b5124;
   }
   *{box-sizing:border-box;}
@@ -355,13 +355,23 @@
 
     function finish(s,key){
       clearInterval(tick); meta.style.display='none';
-      var secs=((Date.now()-start)/1000).toFixed(1), pt=s.passthrough||0, bs=s.binary_skipped||0;
+      var secs=((Date.now()-start)/1000).toFixed(1);
+      // One coverage question, one answer. The UI used to read `passthrough`, which
+      // excluded files skipped as binary — so a UTF-16 log that was never inspected
+      // drew a green check here.
+      var ni=s.not_inspected||0, rh=s.residual_hits||0, verdict=s.verdict||(ni?'incomplete':'complete');
+      var risky=verdict==='incomplete-risky';
       // A bundle containing files the pipeline never inspected is NOT a success.
       // Showing a green check here is how unscrubbed data gets shared by mistake.
-      if(pt>0){
+      if(risky){
+        bar.style.background='var(--color-text-danger)';
+        st.innerHTML='<span style="display:inline-flex; align-items:center; gap:5px; color:var(--color-text-danger); background:var(--color-background-danger); padding:3px 9px; border-radius:var(--border-radius-md);">'
+          +'<svg class="icn" style="font-size:14px;" aria-hidden="true"><use href="#i-alert-triangle"/></svg>'
+          +ni+' file'+(ni===1?'':'s')+' NOT inspected — and they contain matches</span>';
+      } else if(ni>0){
         bar.style.background='var(--color-text-warning)';
         st.innerHTML='<span style="display:inline-flex; align-items:center; gap:5px; color:var(--color-text-warning); background:var(--color-background-warning); padding:3px 9px; border-radius:var(--border-radius-md);">'
-          +'<svg class="icn" style="font-size:14px;" aria-hidden="true"><use href="#i-alert-triangle"/></svg>'+pt+' file'+(pt===1?'':'s')+' NOT scrubbed</span>';
+          +'<svg class="icn" style="font-size:14px;" aria-hidden="true"><use href="#i-alert-triangle"/></svg>'+ni+' file'+(ni===1?'':'s')+' NOT inspected</span>';
       } else {
         st.innerHTML='<span style="display:inline-flex; align-items:center; gap:5px; color:var(--color-text-success); background:var(--color-background-success); padding:3px 9px; border-radius:var(--border-radius-md);"><svg class="icn" style="font-size:14px;" aria-hidden="true"><use href="#i-check"/></svg>Scrubbed in '+secs+'s</span>';
       }
@@ -380,23 +390,33 @@
         if(more>0) rows+='<div style="font-size:11px; color:var(--color-text-tertiary); padding-top:6px;">…and '+more+' more</div>';
         return rows;
       }
+      // One list, grouped by reason code, covering every file the scrub did not
+      // cover — whatever the mechanism. The old split (passthroughs here, binary
+      // skips there, each with its own count) is what let a whole category go
+      // unrendered.
       var warn='';
-      if(pt>0){
-        warn='<div style="margin-top:12px; padding:10px 12px; border-radius:var(--border-radius-md); background:var(--color-background-warning); border:0.5px solid var(--color-border-warning);">'
-          +'<div style="font-size:12px; font-weight:500; color:var(--color-text-warning); display:flex; align-items:center; gap:6px;">'
-          +'<svg class="icn" style="font-size:14px;" aria-hidden="true"><use href="#i-alert-triangle"/></svg>Emitted without scrubbing — review before sharing</div>'
-          +'<div style="margin-top:8px;">'+fileRows(s.passthrough_paths,pt)+'</div></div>';
-      }
-      // Binary skips are listed too, in a quieter style. Skipping an image is normal
-      // and should not read as a failure, but it must be visible: a text file wrongly
-      // classified as binary leaves with its contents intact, and while this count was
-      // hidden that is exactly what happened to UTF-16 logs.
-      if(bs>0){
-        warn+='<div style="margin-top:12px; padding:10px 12px; border-radius:var(--border-radius-md); background:var(--color-background-secondary); border:0.5px solid var(--color-border-tertiary);">'
-          +'<div style="font-size:12px; font-weight:500; color:var(--color-text-secondary); display:flex; align-items:center; gap:6px;">'
-          +'<svg class="icn" style="font-size:14px;" aria-hidden="true"><use href="#i-file-search"/></svg>'
-          +bs+' file'+(bs===1?'':'s')+' skipped as binary — not scrubbed</div>'
-          +'<div style="margin-top:8px;">'+fileRows(s.binary_skip_paths,bs)+'</div></div>';
+      if(ni>0){
+        var byReason={};
+        (s.not_inspected_set||[]).forEach(function(p){ (byReason[p.code||'other']=byReason[p.code||'other']||[]).push(p); });
+        var groups=Object.keys(byReason).sort().map(function(code){
+          var list=byReason[code];
+          return '<div style="margin-top:8px;"><div style="font-family:var(--font-mono); font-size:11px; color:var(--color-text-secondary);">'
+            +esc(code)+' ×'+list.length+'</div>'+fileRows(list,list.length)+'</div>';
+        }).join('');
+        var tone=risky
+          ? {bg:'var(--color-background-danger)', bd:'var(--color-border-danger)', fg:'var(--color-text-danger)',
+             head:'Content that was NOT inspected contains '+rh+' policy match'+(rh===1?'':'es')+' — do not share without review'}
+          : {bg:'var(--color-background-warning)', bd:'var(--color-border-warning)', fg:'var(--color-text-warning)',
+             head:'Emitted without being inspected — review before sharing'};
+        warn='<div style="margin-top:12px; padding:10px 12px; border-radius:var(--border-radius-md); background:'+tone.bg+'; border:0.5px solid '+tone.bd+';">'
+          +'<div style="font-size:12px; font-weight:500; color:'+tone.fg+'; display:flex; align-items:center; gap:6px;">'
+          +'<svg class="icn" style="font-size:14px;" aria-hidden="true"><use href="#i-alert-triangle"/></svg>'+tone.head+'</div>'
+          +groups;
+        if(risky && (s.residual_samples||[]).length){
+          warn+='<div style="margin-top:10px; font-size:11px; font-family:var(--font-mono); color:'+tone.fg+';">'
+            +(s.residual_samples||[]).map(esc).join('<br>')+'</div>';
+        }
+        warn+='</div>';
       }
       done.innerHTML=
         warn
@@ -408,7 +428,23 @@
         +'<div style="font-size:12px; color:var(--color-text-secondary); margin:12px 0 8px;">Replacements by rule</div>'
         +'<div style="display:flex; flex-wrap:wrap; gap:6px;">'+(chips||'<span style="font-size:12px;color:var(--color-text-tertiary)">no matches</span>')+'</div></div>';
       done.querySelector('.rp').onclick=function(){ var p=done.querySelector('.panel'); p.style.display=p.style.display==='block'?'none':'block'; };
-      done.querySelector('.dl').onclick=function(){ download(key); };
+      // A result whose uninspected parts contain matches must not be downloadable by
+      // reflex: the button arms only after an explicit acknowledgement. It is the one
+      // place a person can still stop unscrubbed data from being passed on.
+      var dlBtn=done.querySelector('.dl');
+      if(risky){
+        dlBtn.disabled=true;
+        dlBtn.style.opacity='0.5';
+        var ack=document.createElement('label');
+        ack.style.cssText='display:flex; align-items:center; gap:7px; margin-top:10px; font-size:12px; color:var(--color-text-danger); cursor:pointer;';
+        ack.innerHTML='<input type="checkbox" style="cursor:pointer;"> I understand this bundle was not fully scrubbed';
+        ack.querySelector('input').onchange=function(){
+          dlBtn.disabled=!this.checked;
+          dlBtn.style.opacity=this.checked?'1':'0.5';
+        };
+        dlBtn.parentNode.parentNode.insertBefore(ack, dlBtn.parentNode.nextSibling);
+      }
+      dlBtn.onclick=function(){ if(!dlBtn.disabled) download(key); };
       loadHistory(); // the run is now durable — reflect it in the list
     }
   }
@@ -496,13 +532,14 @@
       return;
     }
     histEl.innerHTML=runs.map(function(r){
-      var pt=r.passthrough||0, bs=r.binary_skipped||0;
+      var rni=r.not_inspected||0, rrisky=(r.verdict==='incomplete-risky');
       var badge = r.status==='unreadable'
         ? '<span style="font-size:11px; color:var(--color-text-danger);">report unreadable</span>'
-        : (pt>0
-          ? '<span style="font-size:11px; color:var(--color-text-warning); background:var(--color-background-warning); padding:2px 8px; border-radius:999px; white-space:nowrap;">'+pt+' not scrubbed</span>'
-          : '<span style="font-size:11px; color:var(--color-text-success); background:var(--color-background-success); padding:2px 8px; border-radius:999px; white-space:nowrap;">'+(r.matches||0)+' redacted</span>')
-        +(bs>0 ? '<span style="font-size:11px; color:var(--color-text-secondary); background:var(--color-background-secondary); padding:2px 8px; border-radius:999px; white-space:nowrap;">'+bs+' skipped</span>' : '');
+        : (rrisky
+          ? '<span style="font-size:11px; color:var(--color-text-danger); background:var(--color-background-danger); padding:2px 8px; border-radius:999px; white-space:nowrap;">review — '+rni+' not inspected</span>'
+          : rni>0
+          ? '<span style="font-size:11px; color:var(--color-text-warning); background:var(--color-background-warning); padding:2px 8px; border-radius:999px; white-space:nowrap;">'+rni+' not inspected</span>'
+          : '<span style="font-size:11px; color:var(--color-text-success); background:var(--color-background-success); padding:2px 8px; border-radius:999px; white-space:nowrap;">'+(r.matches||0)+' redacted</span>');
       return '<div style="display:flex; align-items:center; gap:10px; padding:9px 0; border-top:0.5px solid var(--color-border-tertiary);">'
         +'<svg class="icn" style="font-size:17px; color:var(--color-text-tertiary);" aria-hidden="true"><use href="#i-file-check"/></svg>'
         +'<div style="min-width:0; flex:1;">'

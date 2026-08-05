@@ -94,7 +94,7 @@ func storedDigest(t *testing.T, inKey, outKey string, matches, passthrough int) 
 	var notes []report.PassthroughNote
 	for i := 0; i < passthrough; i++ {
 		notes = append(notes, report.PassthroughNote{
-			Path: fmt.Sprintf("blob%d.7z", i), Status: report.StatusUnsupported, Reason: "read-only format"})
+			Path: fmt.Sprintf("blob%d.7z", i), Status: report.StatusUnsupported, Code: report.ReasonUnsupported, Detail: "read-only format"})
 	}
 	b, err := json.Marshal(report.Digest{
 		InputKey: inKey, OutputKey: outKey, Matches: matches,
@@ -607,7 +607,7 @@ func TestStatusReportsBinarySkips(t *testing.T) {
 		Matches: 12, FilesTotal: 2, BytesIn: 1000, BytesOut: 900,
 		BinarySkip: 1,
 		BinarySkips: []report.PassthroughNote{{
-			Path: "logs/lux.txt", Status: report.StatusBinarySkip, Reason: "detected binary content"}},
+			Path: "logs/lux.txt", Status: report.StatusBinarySkip, Code: report.ReasonBinary, Detail: "detected binary content"}},
 	})
 	if err != nil {
 		t.Fatal(err)

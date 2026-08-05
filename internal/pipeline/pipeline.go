@@ -19,6 +19,7 @@ import (
 	"github.com/howard/scrubber/internal/archive"
 	"github.com/howard/scrubber/internal/detect"
 	"github.com/howard/scrubber/internal/report"
+	"github.com/howard/scrubber/internal/residual"
 	"github.com/howard/scrubber/internal/scrub"
 	"github.com/howard/scrubber/internal/spill"
 	"github.com/howard/scrubber/internal/textenc"
@@ -46,7 +47,29 @@ type Limits struct {
 	// Spill decides which payloads stay on the heap. The zero value uses
 	// spill.DefaultPolicy.
 	Spill spill.Policy
+	// VerifyOutput re-runs the matcher over every scrubbed leaf and reports any file
+	// whose result still matches the policy.
+	//
+	// Off by default, and the reason is measured rather than assumed: it doubles the
+	// matcher's work and cost ~70% of the drain rate on the 500MiB shape in
+	// scripts/memory-matrix.sh (139s to 237s). The failure it guards against — a
+	// policy whose replacement matches its own rule — is a property of the policy,
+	// and scrub.NewMatcher now rejects that when the policy loads, before any data is
+	// touched. What remains is defence against a bug inside the matcher itself, which
+	// is worth having available for a paranoid deployment and is not worth paying for
+	// on every object of every run.
+	VerifyOutput bool
+	// ResidualBudget bounds the bytes the residual scan reads across one object.
+	// Zero uses DefaultResidualBudget; negative disables the scan entirely, which
+	// is a supported choice but removes the only check that does not depend on the
+	// pipeline's own classification being right.
+	ResidualBudget int64
 }
+
+// DefaultResidualBudget is the per-object allowance for scanning uninspected
+// content. Generous enough that a real skipped log is read in full, small enough
+// that a bundle of large binaries does not double the drain time.
+const DefaultResidualBudget = 64 << 20
 
 // DefaultLimits returns conservative defaults.
 func DefaultLimits() Limits {
@@ -74,6 +97,54 @@ type Engine struct {
 	// which is exactly what turns "one orphaned file" into "a full scratch volume
 	// a week later".
 	staged []*spill.Blob
+
+	// residualLeft is the remaining allowance for scanning uninspected content,
+	// reset per object alongside the expansion budget.
+	residualLeft int64
+	// residualHits and residualLabels accumulate what the scan found across the
+	// whole object. Non-zero is what turns a merely incomplete run into a risky one.
+	residualHits   int
+	residualLabels map[string]int
+}
+
+// ResidualFindings reports what the safety net found in content this walk did not
+// inspect: the match count and a disclosure-safe label breakdown.
+func (e *Engine) ResidualFindings() (int, map[string]int) { return e.residualHits, e.residualLabels }
+
+// residualScan looks inside a payload the walk declined to inspect and records what
+// it finds on the report.
+//
+// It runs at the moment of the skip, where the blob is already open and the path is
+// already known, so it costs no second walk. ReasonBinary is the case it exists for:
+// "we decided this is not text" is precisely the judgement that was wrong before, and
+// this is the one check that does not take that judgement's word for it.
+func (e *Engine) residualScan(path string, reason report.Reason, b *spill.Blob) {
+	if e.Limits.ResidualBudget < 0 || e.Matcher == nil || b == nil {
+		return
+	}
+	if e.residualLeft <= 0 {
+		return
+	}
+	res, err := residual.Scan(b, e.Matcher, e.residualLeft)
+	if err != nil {
+		return // the payload is already being passed through; a failed peek changes nothing
+	}
+	if n := b.Size(); n < e.residualLeft {
+		e.residualLeft -= n
+	} else {
+		e.residualLeft = 0
+	}
+	if res.Hits == 0 {
+		return
+	}
+	e.residualHits += res.Hits
+	if e.residualLabels == nil {
+		e.residualLabels = map[string]int{}
+	}
+	for k, v := range res.Labels {
+		e.residualLabels[k] += v
+	}
+	e.Report.NoteResidual(path, reason, res.Hits, res.Summary())
 }
 
 // stageNew stages a blob from a constructor that may have failed.
@@ -181,16 +252,21 @@ func (e *Engine) ProcessBlob(path string, in *spill.Blob, depth int) (*spill.Blo
 		if e.budget <= 0 {
 			e.budget = DefaultLimits().MaxTotalBytes
 		}
+		e.residualLeft = e.Limits.ResidualBudget
+		if e.residualLeft == 0 {
+			e.residualLeft = DefaultResidualBudget
+		}
+		e.residualHits, e.residualLabels = 0, nil
 	}
 	if depth > e.Limits.MaxDepth {
-		e.recordSize(path, report.StatusGuardTripped,
+		e.skip(path, report.StatusGuardTripped, report.ReasonDepthCap,
 			fmt.Sprintf("nesting depth exceeded %d", e.Limits.MaxDepth), in)
 		return in, false
 	}
 
 	head, err := in.Head(512)
 	if err != nil {
-		e.recordSize(path, report.StatusPassthrough,
+		e.skip(path, report.StatusPassthrough, report.ReasonMalformed,
 			fmt.Sprintf("could not read payload: %v", err), in)
 		return in, false
 	}
@@ -202,7 +278,7 @@ func (e *Engine) ProcessBlob(path string, in *spill.Blob, depth int) (*spill.Blo
 	case detect.Gzip, detect.Zlib, detect.Bzip2, detect.Xz, detect.Zstd:
 		return e.handleCompressed(f, path, in, depth)
 	case detect.SevenZip, detect.Rar:
-		e.recordSize(path, report.StatusUnsupported,
+		e.skip(path, report.StatusUnsupported, report.ReasonUnsupported,
 			"read-only archive format in this build; passed through unchanged", in)
 		return in, false
 	default:
@@ -210,11 +286,18 @@ func (e *Engine) ProcessBlob(path string, in *spill.Blob, depth int) (*spill.Blo
 	}
 }
 
-// recordSize records an outcome whose byte counts are just the payload size, which
-// is every passthrough case.
-func (e *Engine) recordSize(path string, status report.Status, detail string, b *spill.Blob) {
+// skip records a file whose content is not covered by the scrub. Byte counts are
+// just the payload size, which is true of every such case: nothing was rewritten.
+//
+// The reason code is a required argument, not an optional extra. Three shipped bugs
+// came from a site picking a status, writing a sentence, and moving on — after which
+// whether anyone ever saw it depended on which summary bucket that status happened to
+// land in. A code cannot be omitted, is what metrics label, and is what the residual
+// scan below decides to run on.
+func (e *Engine) skip(path string, status report.Status, reason report.Reason, detail string, b *spill.Blob) {
 	n := int(b.Size())
-	e.Report.Record(path, status, detail, n, n, nil)
+	e.Report.Skip(path, status, reason, detail, n, n)
+	e.residualScan(path, reason, b)
 }
 
 // containerFailure classifies a container read error and records it.
@@ -227,30 +310,31 @@ func (e *Engine) recordSize(path string, status report.Status, detail string, b 
 func (e *Engine) containerFailure(path, kind string, in *spill.Blob, err error) {
 	switch {
 	case errors.Is(err, archive.ErrTooLarge):
-		e.recordSize(path, report.StatusGuardTripped,
+		e.skip(path, report.StatusGuardTripped, report.ReasonExpandBudget,
 			fmt.Sprintf("%s members would exceed the remaining %d-byte expansion budget", kind, e.budget), in)
 	case errors.Is(err, archive.ErrTooManyMembers):
-		e.recordSize(path, report.StatusGuardTripped,
+		e.skip(path, report.StatusGuardTripped, report.ReasonMemberCap,
 			fmt.Sprintf("%s member count exceeds %d", kind, e.Limits.MaxMembers), in)
 	case errors.Is(err, spill.ErrSpill):
-		e.recordSize(path, report.StatusPassthrough,
+		e.skip(path, report.StatusPassthrough, report.ReasonScratch,
 			fmt.Sprintf("could not stage %s members to scratch storage (%v); passed through unchanged and NOT scrubbed", kind, err), in)
 	default:
-		e.recordSize(path, report.StatusPassthrough,
+		e.skip(path, report.StatusPassthrough, report.ReasonMalformed,
 			fmt.Sprintf("could not read %s: %v", kind, err), in)
 	}
 }
 
 func (e *Engine) handleLeaf(path string, in *spill.Blob) (*spill.Blob, bool) {
+	mark := e.Report.Mark()
 	sample, err := in.Head(8192)
 	if err != nil {
-		e.recordSize(path, report.StatusPassthrough,
+		e.skip(path, report.StatusPassthrough, report.ReasonMalformed,
 			fmt.Sprintf("could not read payload: %v", err), in)
 		return in, false
 	}
 	enc := textenc.Sniff(sample)
 	if enc == textenc.Binary {
-		e.recordSize(path, report.StatusBinarySkip, "detected binary content", in)
+		e.skip(path, report.StatusBinarySkip, report.ReasonBinary, "detected binary content", in)
 		return in, false
 	}
 
@@ -260,7 +344,7 @@ func (e *Engine) handleLeaf(path string, in *spill.Blob) (*spill.Blob, bool) {
 	// archive.
 	data, err := in.Bytes()
 	if err != nil {
-		e.recordSize(path, report.StatusPassthrough,
+		e.skip(path, report.StatusPassthrough, report.ReasonMalformed,
 			fmt.Sprintf("could not read payload: %v", err), in)
 		return in, false
 	}
@@ -268,20 +352,44 @@ func (e *Engine) handleLeaf(path string, in *spill.Blob) (*spill.Blob, bool) {
 	// does so for anything that would not re-encode to exactly these bytes, which
 	// keeps "we only changed what we redacted" true for UTF-16 as it already was for
 	// UTF-8. A refusal is the old behaviour: pass it through as binary.
-	text, ok := textenc.Decode(data, enc)
-	if !ok {
-		e.recordSize(path, report.StatusBinarySkip,
-			fmt.Sprintf("looked like %s but is not well-formed text; passed through unchanged", enc), in)
+	text, refusal := textenc.Decode(data, enc)
+	switch refusal {
+	case textenc.RefusalMalformed:
+		e.skip(path, report.StatusBinarySkip, report.ReasonEncoding,
+			fmt.Sprintf("looked like %s but is not well-formed; passed through unchanged", enc), in)
+		return in, false
+	case textenc.RefusalNotText:
+		e.skip(path, report.StatusBinarySkip, report.ReasonBinary,
+			"detected binary content", in)
 		return in, false
 	}
 	scrubbed, matches := e.Matcher.Scrub(text)
 	if len(matches) == 0 {
-		e.recordSize(path, report.StatusUnchanged, enc.String(), in)
+		e.Report.Record(path, report.StatusUnchanged, enc.String(), int(in.Size()), int(in.Size()), nil)
 		return in, false
 	}
+
+	// Post-condition, when asked for: the scrub is only done if the policy no longer
+	// matches its own output. This verifies the bytes rather than the decision, which
+	// is what makes it the one check that can catch a half-scrubbed file.
+	//
+	// The realistic trigger — a policy whose replacement matches its own rule — is
+	// caught at policy load by scrub.NewMatcher, so this is off unless VerifyOutput
+	// is set. See the field's comment for the measurement behind that default.
+	if e.Limits.VerifyOutput {
+		if _, residualMatches := e.Matcher.Scrub(scrubbed); len(residualMatches) > 0 {
+			e.Report.Rollback(mark, path, report.StatusResidualMatch, report.ReasonResidualScrub,
+				fmt.Sprintf("scrubbed, but %d match(es) of rule %q survive in the result; "+
+					"emitted unchanged and NOT scrubbed",
+					len(residualMatches), residualMatches[0].RuleID),
+				int(in.Size()), int(in.Size()))
+			return in, false
+		}
+	}
+
 	out, err := e.stageNew(spill.FromBytes(textenc.Encode(scrubbed, enc), e.Limits.Spill))
 	if err != nil {
-		e.recordSize(path, report.StatusPassthrough,
+		e.skip(path, report.StatusPassthrough, report.ReasonScratch,
 			fmt.Sprintf("could not stage scrubbed payload: %v", err), in)
 		return in, false
 	}
@@ -296,7 +404,7 @@ func (e *Engine) handleCompressed(f detect.Format, path string, in *spill.Blob, 
 	// discarding the result at repack time, wasting the work and leaving those
 	// matches counted as redacted when they were never applied.
 	if !archive.CanWrite(f) {
-		e.recordSize(path, report.StatusUnsupported,
+		e.skip(path, report.StatusUnsupported, report.ReasonUnsupported,
 			fmt.Sprintf("%s can be read but not rewritten in this build; passed through unchanged and NOT scrubbed", f), in)
 		return in, false
 	}
@@ -306,10 +414,10 @@ func (e *Engine) handleCompressed(f detect.Format, path string, in *spill.Blob, 
 	if err != nil {
 		switch {
 		case errors.Is(err, archive.ErrTooLarge):
-			e.recordSize(path, report.StatusGuardTripped,
+			e.skip(path, report.StatusGuardTripped, report.ReasonExpandBudget,
 				fmt.Sprintf("decompressing %s would exceed the remaining %d-byte expansion budget", f, e.budget), in)
 		case errors.Is(err, spill.ErrSpill):
-			e.recordSize(path, report.StatusPassthrough,
+			e.skip(path, report.StatusPassthrough, report.ReasonScratch,
 				fmt.Sprintf("could not stage decompressed %s to scratch storage (%v); passed through unchanged and NOT scrubbed", f, err), in)
 		case f == detect.Zlib:
 			// zlib has no magic number: it is recognised from two header bytes that
@@ -319,7 +427,7 @@ func (e *Engine) handleCompressed(f detect.Format, path string, in *spill.Blob, 
 			// actually is. A genuine zlib stream is unaffected — it inflates.
 			return e.handleLeaf(path, in)
 		default:
-			e.recordSize(path, report.StatusPassthrough,
+			e.skip(path, report.StatusPassthrough, report.ReasonMalformed,
 				fmt.Sprintf("could not decompress %s: %v", f, err), in)
 		}
 		return in, false
@@ -337,9 +445,10 @@ func (e *Engine) handleCompressed(f detect.Format, path string, in *spill.Blob, 
 
 	out, w, err := e.stageCreated(spill.Create())
 	if err != nil {
-		e.Report.Rollback(mark, path, report.StatusPassthrough,
+		e.Report.Rollback(mark, path, report.StatusPassthrough, report.ReasonScratch,
 			fmt.Sprintf("could not stage recompressed %s (%v); passed through unchanged and NOT scrubbed", f, err),
 			int(in.Size()), int(in.Size()))
+		e.residualScan(path, report.ReasonScratch, in)
 		return in, false
 	}
 	cerr := archive.CompressTo(w, f, processed, meta)
@@ -351,9 +460,10 @@ func (e *Engine) handleCompressed(f detect.Format, path string, in *spill.Blob, 
 		out.Close()
 		// The scrubbed bytes cannot be repacked, so the original goes out instead.
 		// Roll the subtree's accounting back: those replacements never landed.
-		e.Report.Rollback(mark, path, report.StatusUnsupported,
+		e.Report.Rollback(mark, path, report.StatusUnsupported, report.ReasonRepackFailed,
 			fmt.Sprintf("cannot re-write %s (%v); passed through unchanged and NOT scrubbed", f, firstErr(cerr, serr)),
 			int(in.Size()), int(in.Size()))
+		e.residualScan(path, report.ReasonRepackFailed, in)
 		return in, false
 	}
 	out.Done(size)
@@ -373,7 +483,7 @@ func (e *Engine) handleTar(path string, in *spill.Blob, depth int) (*spill.Blob,
 	mark := e.Report.Mark()
 	rc, err := in.Reader()
 	if err != nil {
-		e.recordSize(path, report.StatusPassthrough, fmt.Sprintf("could not read tar: %v", err), in)
+		e.skip(path, report.StatusPassthrough, report.ReasonMalformed, fmt.Sprintf("could not read tar: %v", err), in)
 		return in, false
 	}
 	// Close through a defer so a panic inside ReadTar cannot leak the handle; the
@@ -425,7 +535,7 @@ func (e *Engine) handleZip(path string, in *spill.Blob, depth int) (*spill.Blob,
 	mark := e.Report.Mark()
 	ra, closer, err := in.ReaderAt()
 	if err != nil {
-		e.recordSize(path, report.StatusPassthrough, fmt.Sprintf("could not read zip: %v", err), in)
+		e.skip(path, report.StatusPassthrough, report.ReasonMalformed, fmt.Sprintf("could not read zip: %v", err), in)
 		return in, false
 	}
 	members, err := func() ([]archive.ZipMember, error) {
@@ -477,9 +587,10 @@ func (e *Engine) handleZip(path string, in *spill.Blob, depth int) (*spill.Blob,
 // transparency report must never be wrong in.
 func (e *Engine) repack(mark int, path, kind string, in *spill.Blob, write func(io.Writer) error) (*spill.Blob, bool) {
 	fail := func(err error) (*spill.Blob, bool) {
-		e.Report.Rollback(mark, path, report.StatusPassthrough,
+		e.Report.Rollback(mark, path, report.StatusPassthrough, report.ReasonRepackFailed,
 			fmt.Sprintf("could not rebuild %s (%v); passed through unchanged and NOT scrubbed", kind, err),
 			int(in.Size()), int(in.Size()))
+		e.residualScan(path, report.ReasonRepackFailed, in)
 		return in, false
 	}
 	out, w, err := e.stageCreated(spill.Create())

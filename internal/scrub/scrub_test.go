@@ -65,3 +65,68 @@ func TestValidatorRejects(t *testing.T) {
 		t.Errorf("expected only even-length match: %+v", matches)
 	}
 }
+
+// A policy must converge: scrubbing its own output must find nothing. Otherwise every
+// file it touches comes out still containing the term, reported as scrubbed — the
+// half-scrubbed document, caught here at load rather than per file at runtime.
+func TestNewMatcherRejectsNonConvergentPolicies(t *testing.T) {
+	cases := []struct {
+		name  string
+		rules []Rule
+		def   string
+		ok    bool
+	}{
+		{
+			name:  "replacement contains the term",
+			rules: []Rule{{ID: "literal:secret", Pattern: `secret`, Replacement: "secret-[REDACTED]"}},
+		},
+		{
+			name: "replacement matched by a different rule",
+			rules: []Rule{
+				{ID: "literal:acme", Pattern: `AcmeCorp`, Replacement: "[COMPANY]"},
+				{ID: "literal:company", Pattern: `\[COMPANY\]`, Replacement: "[X]"},
+			},
+		},
+		{
+			name:  "default replacement is matched",
+			rules: []Rule{{ID: "literal:redacted", Pattern: `REDACTED`}},
+			def:   "[REDACTED]",
+		},
+		{
+			name: "ordinary policy converges",
+			rules: []Rule{
+				{ID: "literal:acme", Pattern: `AcmeCorp`, Replacement: "[COMPANY]"},
+				{ID: "preset:email", Pattern: `[a-z]+@[a-z.]+`, Replacement: "[EMAIL]"},
+			},
+			ok: true,
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			def := tc.def
+			if def == "" {
+				def = "[REDACTED]"
+			}
+			_, err := NewMatcher(def, tc.rules)
+			if tc.ok && err != nil {
+				t.Fatalf("a convergent policy was rejected: %v", err)
+			}
+			if !tc.ok && err == nil {
+				t.Fatal("a policy that cannot converge was accepted")
+			}
+		})
+	}
+}
+
+// The check runs the real Scrub, so a rule with a candidate validator is judged
+// exactly as it will be in production: a replacement that matches the pattern but
+// fails the validator is not a match and must not be rejected.
+func TestConvergenceCheckHonoursValidators(t *testing.T) {
+	// Pattern matches any 16 digits; the validator accepts none of them, so nothing
+	// is ever really replaced and the policy converges trivially.
+	r := Rule{ID: "preset:card", Pattern: `\d{16}`, Replacement: "4111111111111111"}
+	r.valid = func(string) bool { return false }
+	if _, err := NewMatcher("[REDACTED]", []Rule{r}); err != nil {
+		t.Errorf("validator-gated rule wrongly reported as non-convergent: %v", err)
+	}
+}
