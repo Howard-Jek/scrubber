@@ -216,9 +216,11 @@ containers is not scrubbed. (Nested formats are handled recursively, e.g.
 ### Text encodings
 
 Leaves are classified by content, never by extension. UTF-8 (with or without a BOM),
-ASCII and Latin-1 scrub directly; **UTF-16** in either byte order, with or without a
-BOM, is decoded, scrubbed and written back in the same encoding, so a file keeps
-working wherever it was going. UTF-32 and genuinely binary content are passed through.
+ASCII and Latin-1 scrub directly; **UTF-16 and UTF-32** in either byte order, with or
+without a BOM, are decoded, scrubbed and written back in the same encoding, so a file
+keeps working wherever it was going. Genuinely binary content is passed through, as is
+text that is malformed in the encoding it claims — repairing it would rewrite bytes no
+match touched.
 
 Anything the tool declines to inspect is **named** with a machine-readable reason code
 in the report, the API and the UI. See [Coverage](#coverage-what-was-not-inspected).
@@ -242,7 +244,7 @@ label, the UI groups by, and you alert on:
 | code | what it means |
 | --- | --- |
 | `binary` | not text — correctly skipped |
-| `encoding-unsupported` | text in an encoding that cannot be round-tripped (UTF-32, malformed UTF-16) |
+| `encoding-unsupported` | text that cannot be round-tripped (malformed UTF-16 or UTF-32) |
 | `unsupported-format` | a container we can read but not rewrite (7z, rar, bzip2) |
 | `malformed` | corrupt, truncated or encrypted |
 | `expansion-budget` / `member-cap` / `depth-cap` | a guard refused to expand it |
@@ -682,12 +684,18 @@ There are three ways to change what gets scrubbed, from most transient to most p
 
 ## Notes & limitations (v1)
 
-- Text is handled as UTF-8 (with or without BOM), ASCII/Latin-1, and **UTF-16** in
-  either byte order, with or without a BOM. A UTF-16 file is scrubbed and written
+- Text is handled as UTF-8 (with or without BOM), ASCII/Latin-1, and **UTF-16 and
+  UTF-32** in either byte order, with or without a BOM. Each is scrubbed and written
   back in the encoding it arrived in, so whatever reads it next is unaffected.
-  UTF-32 is still treated as binary and passed through — reported by name with reason
-  `binary`, and the residual scan reads it at four-byte stride anyway, so a UTF-32 log
-  full of live data escalates the run to `incomplete-risky` rather than passing quietly.
+  Single-byte encodings beyond Latin-1 (cp1252, and ASCII-compatible multi-byte ones
+  such as Shift-JIS) pass through the matcher as bytes, so terms in the ASCII range —
+  which is what addresses, hostnames and keys are — still match.
+- Text that is **malformed** in the encoding it claims (an unpaired UTF-16 surrogate, a
+  UTF-32 code point past U+10FFFF, a length that is not a whole number of code units)
+  is refused rather than repaired: it is passed through untouched and reported with
+  reason `encoding-unsupported`. The residual scan reads it at one-, two- and
+  four-byte stride anyway, so such a file full of live data escalates the run to
+  `incomplete-risky` rather than passing quietly.
 - Expansion is bounded by the cumulative `--max-expand-bytes` budget for a whole
   input (nested streams and archive members draw from the same budget). Payloads
   above the spill threshold are held on disk under `TMPDIR`, so that budget bounds
