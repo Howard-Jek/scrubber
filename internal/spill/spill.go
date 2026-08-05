@@ -112,6 +112,13 @@ type Blob struct {
 	closed bool
 }
 
+// tempPrefix names every scratch file this package creates. Reclaim matches on it
+// to find files orphaned by a previous process, so the two must not drift apart.
+const (
+	tempPrefix  = "scrubber-"
+	tempPattern = tempPrefix + "*"
+)
+
 // Empty returns a zero-length blob.
 func Empty() *Blob { return &Blob{} }
 
@@ -123,7 +130,7 @@ func FromBytes(b []byte, p Policy) (*Blob, error) {
 	if n <= p.Threshold && reserve(n, p) {
 		return &Blob{mem: b, size: n}, nil
 	}
-	f, err := os.CreateTemp("", "scrubber-*")
+	f, err := os.CreateTemp("", tempPattern)
 	if err != nil {
 		return nil, fmt.Errorf("%w: %v", ErrSpill, err)
 	}
@@ -171,7 +178,7 @@ func FromReader(r io.Reader, max int64, p Policy) (*Blob, error) {
 	}
 
 	// More to come. Spill, still under the cap.
-	f, ferr := os.CreateTemp("", "scrubber-*")
+	f, ferr := os.CreateTemp("", tempPattern)
 	if ferr != nil {
 		return nil, fmt.Errorf("%w: %v", ErrSpill, ferr)
 	}
@@ -203,7 +210,7 @@ func FromReader(r io.Reader, max int64, p Policy) (*Blob, error) {
 // caller must close the writer, then call Done to publish the size. Used by the
 // repack path, which streams an archive out without ever holding it whole.
 func Create() (*Blob, *os.File, error) {
-	f, err := os.CreateTemp("", "scrubber-*")
+	f, err := os.CreateTemp("", tempPattern)
 	if err != nil {
 		return nil, nil, fmt.Errorf("%w: %v", ErrSpill, err)
 	}
