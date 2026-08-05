@@ -42,6 +42,8 @@ type Digest struct {
 	FilesTotal   int               `json:"files_total"`
 	Passthrough  int               `json:"passthrough"`
 	Passthroughs []PassthroughNote `json:"passthroughs,omitempty"`
+	BinarySkip   int               `json:"binary_skipped"`
+	BinarySkips  []PassthroughNote `json:"binary_skips,omitempty"`
 	BytesIn      int               `json:"bytes_in"`
 	BytesOut     int               `json:"bytes_out"`
 	StartedAt    time.Time         `json:"started_at,omitempty"`
@@ -60,6 +62,8 @@ func (r *Report) Digest() Digest {
 		FilesTotal:   r.Summary.FilesTotal,
 		Passthrough:  r.Summary.FilesPassthrough,
 		Passthroughs: r.Summary.Passthroughs,
+		BinarySkip:   r.Summary.FilesBinarySkip,
+		BinarySkips:  r.Summary.BinarySkips,
 		BytesIn:      r.BytesIn,
 		BytesOut:     r.BytesOut,
 		StartedAt:    r.StartedAt,
@@ -170,6 +174,14 @@ type Summary struct {
 	// Passthroughs names the files counted by FilesPassthrough (capped at
 	// maxPassthroughNotes entries).
 	Passthroughs []PassthroughNote `json:"passthroughs,omitempty"`
+	// BinarySkips names the files counted by FilesBinarySkip, same cap.
+	//
+	// A count alone is not enough, and that is what kept a real leak invisible:
+	// UTF-16 text was misread as binary, so an ordinary .txt log was emitted with
+	// every address still in it while the summary showed a bare "1 binary file
+	// skipped" and the UI showed a green check. Skipping a PNG is correct and
+	// skipping a log is a leak; you cannot tell those apart without the names.
+	BinarySkips []PassthroughNote `json:"binary_skips,omitempty"`
 	// MatchesByLabel is keyed by the replacement label (e.g. "[EMAIL]") rather than
 	// the rule ID. Rule IDs can embed literal values, so this is the safe breakdown
 	// to surface over a browser-facing / external API.
@@ -217,7 +229,8 @@ type summaryDelta struct {
 	matches     int
 	byRule      map[string]int
 	byLabel     map[string]int
-	passthrough bool // whether it appended a PassthroughNote
+	passthrough bool // whether it appended a Passthroughs note
+	binarySkip  bool // whether it appended a BinarySkips note
 	// retained is how much of the report-wide match budget this entry consumed, so
 	// undoing the entry gives the budget back rather than permanently spending it on
 	// a subtree that never reached the output.
@@ -259,6 +272,9 @@ func (r *Report) Rollback(mark int, path string, status Status, detail string, b
 		}
 		if d.passthrough && len(r.Summary.Passthroughs) > 0 {
 			r.Summary.Passthroughs = r.Summary.Passthroughs[:len(r.Summary.Passthroughs)-1]
+		}
+		if d.binarySkip && len(r.Summary.BinarySkips) > 0 {
+			r.Summary.BinarySkips = r.Summary.BinarySkips[:len(r.Summary.BinarySkips)-1]
 		}
 		r.retained -= d.retained
 		r.Summary.TotalMatches -= d.matches
@@ -363,6 +379,11 @@ func (r *Report) Record(path string, status Status, detail string, bytesIn, byte
 		r.Summary.FilesUnchanged++
 	case StatusBinarySkip:
 		r.Summary.FilesBinarySkip++
+		if len(r.Summary.BinarySkips) < maxPassthroughNotes {
+			r.Summary.BinarySkips = append(r.Summary.BinarySkips,
+				PassthroughNote{Path: path, Status: status, Reason: detail})
+			delta.binarySkip = true
+		}
 	case StatusPassthrough, StatusUnsupported, StatusGuardTripped:
 		r.Summary.FilesPassthrough++
 		if len(r.Summary.Passthroughs) < maxPassthroughNotes {
@@ -438,24 +459,37 @@ func (r *Report) Banner() string {
 
 	base := fmt.Sprintf("redacted %d matches across %d rules in %d file(s); %d binary file(s) skipped",
 		s.TotalMatches, len(s.MatchesByRule), s.FilesScrubbed, s.FilesBinarySkip)
-	if s.FilesPassthrough == 0 {
+	if s.FilesPassthrough == 0 && s.FilesBinarySkip == 0 {
 		return base
 	}
 
 	var b strings.Builder
-	fmt.Fprintf(&b, "WARNING: %d file(s) were emitted UNSCRUBBED and must be reviewed by hand:\n", s.FilesPassthrough)
-	for _, p := range s.Passthroughs {
-		fmt.Fprintf(&b, "  ! %s (%s)", p.Path, p.Status)
-		if p.Reason != "" {
-			fmt.Fprintf(&b, ": %s", p.Reason)
-		}
-		b.WriteByte('\n')
+	if s.FilesPassthrough > 0 {
+		fmt.Fprintf(&b, "WARNING: %d file(s) were emitted UNSCRUBBED and must be reviewed by hand:\n", s.FilesPassthrough)
+		listNotes(&b, "!", s.Passthroughs, s.FilesPassthrough)
 	}
-	if n := s.FilesPassthrough - len(s.Passthroughs); n > 0 {
-		fmt.Fprintf(&b, "  ... and %d more\n", n)
+	// Named, not just counted. A skipped PNG is routine and a skipped log is a leak,
+	// and a bare count cannot tell them apart — which is exactly how UTF-16 text went
+	// out unscrubbed while the run looked clean.
+	if s.FilesBinarySkip > 0 {
+		fmt.Fprintf(&b, "%d file(s) were skipped as binary and NOT scrubbed:\n", s.FilesBinarySkip)
+		listNotes(&b, "-", s.BinarySkips, s.FilesBinarySkip)
 	}
 	b.WriteString(base)
 	return b.String()
+}
+
+func listNotes(b *strings.Builder, bullet string, notes []PassthroughNote, total int) {
+	for _, p := range notes {
+		fmt.Fprintf(b, "  %s %s (%s)", bullet, p.Path, p.Status)
+		if p.Reason != "" {
+			fmt.Fprintf(b, ": %s", p.Reason)
+		}
+		b.WriteByte('\n')
+	}
+	if n := total - len(notes); n > 0 {
+		fmt.Fprintf(b, "  ... and %d more\n", n)
+	}
 }
 
 // RuleBreakdown returns the per-rule totals sorted by descending count, for the

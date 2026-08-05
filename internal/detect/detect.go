@@ -1,11 +1,11 @@
 // Package detect identifies archive/compression formats by content (magic bytes)
-// rather than by file extension, and distinguishes text from binary leaf files.
+// rather than by file extension. Deciding whether a leaf is text, and in which
+// encoding, belongs to internal/textenc.
 package detect
 
 import (
 	"bytes"
 	"encoding/binary"
-	"unicode/utf8"
 )
 
 // Format enumerates the container/compression formats the scrubber recognizes.
@@ -54,7 +54,7 @@ var (
 	sigZip      = []byte{'P', 'K', 0x03, 0x04}
 	sigZipEmpty = []byte{'P', 'K', 0x05, 0x06} // empty archive
 	sigGzip     = []byte{0x1f, 0x8b}
-	sigBzip2    = []byte{'B', 'Z', 'h'}
+	sigBzip2    = []byte{'B', 'Z', 'h'} // followed by a mandatory '1'-'9' level digit
 	sigXz       = []byte{0xfd, '7', 'z', 'X', 'Z', 0x00}
 	sigZstd     = []byte{0x28, 0xb5, 0x2f, 0xfd}
 	sig7z       = []byte{'7', 'z', 0xbc, 0xaf, 0x27, 0x1c}
@@ -73,7 +73,7 @@ func DetectFormat(header []byte) Format {
 		return Zip
 	case bytes.HasPrefix(header, sigGzip):
 		return Gzip
-	case bytes.HasPrefix(header, sigBzip2):
+	case isBzip2(header):
 		return Bzip2
 	case bytes.HasPrefix(header, sigXz):
 		return Xz
@@ -92,8 +92,25 @@ func DetectFormat(header []byte) Format {
 	}
 }
 
+// isBzip2 recognizes a bzip2 stream. "BZh" alone is three bytes of ordinary text,
+// so the block-size digit the format mandates after it is part of the signature:
+// without it, a log line beginning "BZh" is sent off to be decompressed, fails, and
+// is emitted unscrubbed.
+func isBzip2(header []byte) bool {
+	if len(header) < 4 || !bytes.HasPrefix(header, sigBzip2) {
+		return false
+	}
+	return header[3] >= '1' && header[3] <= '9'
+}
+
 // isZlib recognizes a raw zlib stream by its 2-byte header (CMF/FLG): the low
 // nibble of the first byte is 8 (deflate) and (CMF*256+FLG) is a multiple of 31.
+//
+// Two bytes is a weak signature and plain text satisfies it: any file starting with
+// 'H', 'X', 'h' or 'x' has a 1-in-31 chance on its second byte. There is no stronger
+// test available from the header alone — zlib has no magic number — so the pipeline
+// carries the other half of the fix: a payload detected as zlib that then fails to
+// inflate is retried as a text leaf rather than passed through unscrubbed.
 func isZlib(header []byte) bool {
 	if len(header) < 2 {
 		return false
@@ -156,55 +173,4 @@ func parseOctal(b []byte) int64 {
 		return -1
 	}
 	return n
-}
-
-// IsBinary reports whether a sample of file content looks like binary data and
-// should therefore be passed through untouched rather than scrubbed as text.
-//
-// Heuristic: a NUL byte is a strong binary signal; otherwise the sample must be
-// decodable as valid UTF-8 (after stripping a leading BOM) to be treated as text.
-// Empty content is treated as text (nothing to scrub, safe to pass through scrub).
-func IsBinary(sample []byte) bool {
-	if len(sample) == 0 {
-		return false
-	}
-	sample = stripBOM(sample)
-	if bytes.IndexByte(sample, 0x00) >= 0 {
-		return true
-	}
-	// Trim a possibly truncated final rune before validating UTF-8.
-	trimmed := sample
-	for len(trimmed) > 0 && !utf8.Valid(trimmed) {
-		if utf8.Valid(trimmed[:len(trimmed)-1]) || len(trimmed) == 1 {
-			break
-		}
-		trimmed = trimmed[:len(trimmed)-1]
-	}
-	if utf8.Valid(trimmed) {
-		return false
-	}
-	// Not valid UTF-8: count control bytes; many => binary.
-	var ctrl int
-	for _, b := range sample {
-		if b < 0x09 || (b > 0x0d && b < 0x20) {
-			ctrl++
-		}
-	}
-	return ctrl*100/len(sample) > 10
-}
-
-var (
-	bomUTF8    = []byte{0xef, 0xbb, 0xbf}
-	bomUTF16BE = []byte{0xfe, 0xff}
-	bomUTF16LE = []byte{0xff, 0xfe}
-)
-
-func stripBOM(b []byte) []byte {
-	switch {
-	case bytes.HasPrefix(b, bomUTF8):
-		return b[3:]
-	case bytes.HasPrefix(b, bomUTF16BE), bytes.HasPrefix(b, bomUTF16LE):
-		return b[2:]
-	}
-	return b
 }

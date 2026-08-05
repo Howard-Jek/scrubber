@@ -220,3 +220,26 @@ func TestReportBudgetReturnedOnRollback(t *testing.T) {
 		t.Errorf("retained = %d after rolling back every entry, want 0", r.retained)
 	}
 }
+
+// Rollback undoes a subtree whose repack failed. The named binary skips must unwind
+// with everything else, or a report lists a file as skipped inside a container that
+// was ultimately emitted whole.
+func TestRollbackUndoesNamedBinarySkips(t *testing.T) {
+	r := New("in", "out", AuditFull, false, "salt")
+	r.Record("bundle/app.log", StatusScrubbed, "utf-8", 10, 10, nil)
+
+	mark := r.Mark()
+	r.Record("bundle/inner.tar!logo.png", StatusBinarySkip, "detected binary content", 5, 5, nil)
+	if len(r.Summary.BinarySkips) != 1 || r.Summary.FilesBinarySkip != 1 {
+		t.Fatalf("skip was not recorded: %+v", r.Summary)
+	}
+
+	r.Rollback(mark, "bundle/inner.tar", StatusPassthrough, "could not rebuild tar", 5, 5)
+
+	if r.Summary.FilesBinarySkip != 0 {
+		t.Errorf("FilesBinarySkip = %d after rollback, want 0", r.Summary.FilesBinarySkip)
+	}
+	if len(r.Summary.BinarySkips) != 0 {
+		t.Errorf("BinarySkips still names %v after rollback", r.Summary.BinarySkips)
+	}
+}

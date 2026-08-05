@@ -211,6 +211,24 @@ Formats we can't fully round-trip are **passed through verbatim** and recorded a
 containers is not scrubbed. (Nested formats are handled recursively, e.g.
 `outer.tar.gz!inner.zip!app.log`.)
 
+### Text encodings
+
+Leaves are classified by content, never by extension. UTF-8 (with or without a BOM),
+ASCII and Latin-1 scrub directly; **UTF-16** in either byte order, with or without a
+BOM, is decoded, scrubbed and written back in the same encoding, so a file keeps
+working wherever it was going. UTF-32 and genuinely binary content are passed through.
+
+Anything the tool declines to inspect is **named** in the report, the API and the UI —
+`files_binary_skipped` with a `binary_skips` list alongside `files_passthrough`. That
+matters more than it sounds: UTF-16 text used to be misread as binary (every ASCII
+character carries a NUL in its high byte) and skipped, while the summary showed a bare
+count and the UI a green check. Skipping an image is routine; skipping a log is a leak,
+and a number on its own cannot tell you which happened.
+
+`--fail-on-unscrubbed` deliberately still keys on `files_passthrough` only. Binary
+skips are usually correct, and failing every bundle containing a PNG would train people
+to ignore the flag.
+
 ## Running as a service on OpenShift (`scrubberd`)
 
 The same engine runs as a MinIO/S3 bucket-driven service (`cmd/scrubberd`) for
@@ -582,8 +600,11 @@ There are three ways to change what gets scrubbed, from most transient to most p
 
 ## Notes & limitations (v1)
 
-- Text is handled as UTF-8 (with or without BOM) and ASCII/Latin-1. UTF-16/UTF-32
-  files contain NUL bytes and are therefore treated as binary and passed through.
+- Text is handled as UTF-8 (with or without BOM), ASCII/Latin-1, and **UTF-16** in
+  either byte order, with or without a BOM. A UTF-16 file is scrubbed and written
+  back in the encoding it arrived in, so whatever reads it next is unaffected.
+  UTF-32 is still treated as binary and passed through — reported by name, not
+  silently.
 - Expansion is bounded by the cumulative `--max-expand-bytes` budget for a whole
   input (nested streams and archive members draw from the same budget). Payloads
   above the spill threshold are held on disk under `TMPDIR`, so that budget bounds

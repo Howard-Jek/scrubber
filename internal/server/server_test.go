@@ -596,3 +596,33 @@ func TestQueueEndpointWithoutQueue(t *testing.T) {
 		t.Errorf("code=%d body=%v, want 200 with depth 0", code, body)
 	}
 }
+
+// A file skipped as binary has to reach the client. It never did: the digest carried
+// no field for it, so /api/status reported passthrough 0 and the UI drew a green
+// check over a bundle containing a log that was never inspected.
+func TestStatusReportsBinarySkips(t *testing.T) {
+	arc := newArchive()
+	b, err := json.Marshal(report.Digest{
+		InputKey: "k-bundle.tar.gz", OutputKey: "k-bundle.tar.gz",
+		Matches: 12, FilesTotal: 2, BytesIn: 1000, BytesOut: 900,
+		BinarySkip: 1,
+		BinarySkips: []report.PassthroughNote{{
+			Path: "logs/lux.txt", Status: report.StatusBinarySkip, Reason: "detected binary content"}},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	arc.put("reports", "k-bundle.tar.gz"+report.DigestSuffix, b, time.Now())
+
+	_, body := getJSON(t, newTestServer(metrics.NewJobLog(10), arc), "/api/status?key=k-bundle.tar.gz")
+	if got := body["binary_skipped"]; got != float64(1) {
+		t.Fatalf("binary_skipped = %v, want 1 — a skipped file the client cannot see is a silent leak", got)
+	}
+	paths, _ := body["binary_skip_paths"].([]any)
+	if len(paths) != 1 {
+		t.Fatalf("binary_skip_paths = %v, want the one skipped file named", body["binary_skip_paths"])
+	}
+	if p, _ := paths[0].(map[string]any); p["path"] != "logs/lux.txt" {
+		t.Errorf("wrong path surfaced: %v", paths[0])
+	}
+}

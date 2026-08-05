@@ -113,6 +113,11 @@ type Job struct {
 	Passthrough int `json:"passthrough"`
 	// PassthroughPaths names those files and why, for display.
 	PassthroughPaths []report.PassthroughNote `json:"passthrough_paths,omitempty"`
+	// BinarySkipped counts files skipped as binary, and BinarySkipPaths names them.
+	// Skipping a PNG is routine; skipping what turns out to be a text log is a leak,
+	// and a bare count cannot tell an operator which one happened.
+	BinarySkipped   int                      `json:"binary_skipped"`
+	BinarySkipPaths []report.PassthroughNote `json:"binary_skip_paths,omitempty"`
 
 	// FilesDone and CurrentFile give live progress while Status is "processing",
 	// so the UI can report what is actually happening instead of animating a bar
