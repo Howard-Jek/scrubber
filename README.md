@@ -143,7 +143,9 @@ rules could match the same span, the earlier one wins.
 | `--max-depth` | `16` | Maximum container nesting depth. |
 | `--max-expand-bytes` | `2147483648` | Cumulative decompressed bytes read per input. Enforced while reading, so it is a real bound — but payloads above the spill threshold are held on disk (`TMPDIR`), so it now bounds mostly scratch space rather than memory. |
 | `--max-ratio` | — | **Deprecated and ignored** (warns if set). See the bomb-resistance note under [Safety guarantees](#safety-guarantees). |
-| `--fail-on-unscrubbed` | `false` | Exit `3` if any file was emitted unscrubbed. |
+| `--fail-on-unscrubbed` | `false` | Exit `3` if **any** file was emitted without being inspected — binary, guard-tripped, unreadable or an unsupported container. |
+| `--fail-on-risky` | `false` | Exit `3` only when content that was *not* inspected is found to contain policy matches. The narrower gate for pipelines that legitimately carry images. |
+| `--verify-output` | `false` | Re-scan every scrubbed file to confirm the policy no longer matches it. Roughly doubles matcher work; see [Coverage](#coverage-what-was-not-inspected). |
 | `--verbose` | `false` | Print the per-rule breakdown to stderr. |
 
 ## The report (transparency)
@@ -218,16 +220,90 @@ ASCII and Latin-1 scrub directly; **UTF-16** in either byte order, with or witho
 BOM, is decoded, scrubbed and written back in the same encoding, so a file keeps
 working wherever it was going. UTF-32 and genuinely binary content are passed through.
 
-Anything the tool declines to inspect is **named** in the report, the API and the UI —
-`files_binary_skipped` with a `binary_skips` list alongside `files_passthrough`. That
-matters more than it sounds: UTF-16 text used to be misread as binary (every ASCII
-character carries a NUL in its high byte) and skipped, while the summary showed a bare
-count and the UI a green check. Skipping an image is routine; skipping a log is a leak,
-and a number on its own cannot tell you which happened.
+Anything the tool declines to inspect is **named** with a machine-readable reason code
+in the report, the API and the UI. See [Coverage](#coverage-what-was-not-inspected).
 
-`--fail-on-unscrubbed` deliberately still keys on `files_passthrough` only. Binary
-skips are usually correct, and failing every bundle containing a PNG would train people
-to ignore the flag.
+## Coverage: what was *not* inspected
+
+A scrubber that quietly skips a file is worse than one that fails, because the output
+still looks finished. Three bugs shipped in that shape — UTF-16 text read as binary,
+plain text mistaken for a zlib stream, text beginning `BZh` sent to the decompressor —
+and each was invisible afterwards for the same reason: "not scrubbed" was decided in
+four places that disagreed with each other. So it is decided in one place now.
+
+**Every file gets a disposition.** `Inspected` means the content reached the matcher
+and the output is clean. `NotInspected` means it did not, or it did and the policy
+still matches the result. There is no third answer and no default; adding a status
+without classifying it is a compile error (`report.Status.Disposition`).
+
+**Every hole gets a reason code.** Free text is for humans; the code is what metrics
+label, the UI groups by, and you alert on:
+
+| code | what it means |
+| --- | --- |
+| `binary` | not text — correctly skipped |
+| `encoding-unsupported` | text in an encoding that cannot be round-tripped (UTF-32, malformed UTF-16) |
+| `unsupported-format` | a container we can read but not rewrite (7z, rar, bzip2) |
+| `malformed` | corrupt, truncated or encrypted |
+| `expansion-budget` / `member-cap` / `depth-cap` | a guard refused to expand it |
+| `scratch-unavailable` | the pod could not spill to disk |
+| `repack-failed` | scrubbed, then could not be rebuilt — rolled back, emitted verbatim |
+| `residual-after-scrub` | scrubbed, and the policy still matches the result (only with `VERIFY_OUTPUT`) |
+| `unclassified` | **a tripwire.** Never written deliberately; it marks a hole whose author did not say why. The conformance corpus asserts zero of these. |
+
+**Whatever is skipped gets looked inside anyway.** Every guard above trusts a
+classification, and a wrong classification is invisible to everything derived from it.
+So `internal/residual` does not classify: it pulls printable runs straight out of the
+raw bytes at every code-unit width Latin text uses — one byte, UTF-16's two, UTF-32's
+four, either byte order — and runs the policy over them. A UTF-16 log misfiled as
+binary still contains a recognisable address, and this finds it without knowing what
+UTF-16 is. Bounded by `RESIDUAL_BUDGET` (default 64Mi per object); set it negative to
+disable, which removes the only check that does not depend on the pipeline being right.
+
+**And the run gets one verdict**, which every surface reads:
+
+| verdict | meaning | where the output goes |
+| --- | --- | --- |
+| `complete` | everything inspected | normal output key |
+| `incomplete` | something skipped, and scanning it found nothing | normal output key, named and flagged |
+| `incomplete-risky` | something skipped **and it contains policy matches** | diverted to `REVIEW_PREFIX` (default `review/`) |
+
+Diversion is the point: a flag only helps somebody who reads it, whereas a key under
+`review/` cannot be picked up by something looking for finished work. Harmless skips
+deliberately do *not* divert — if every bundle containing an image landed in the review
+queue, nobody would read it.
+
+**A policy that cannot converge is rejected when it loads.** If a rule replaces
+`secret` with `secret-[REDACTED]`, the "redacted" output still contains the term and
+every file it touches comes out half-scrubbed while reporting success. That is a
+property of the *policy*, not of any file, so `scrub.NewMatcher` refuses it before any
+data is touched (CLI: exit 2). The check runs the real matcher, so rules with candidate
+validators are judged exactly as they will be in production.
+
+`VERIFY_OUTPUT` (CLI `--verify-output`) additionally re-scans every scrubbed file to
+confirm the policy no longer matches it. It is **off by default**, and the reason is
+measured rather than assumed: it roughly doubles the matcher's work and cost ~70% of
+the drain rate on the 500 MiB shape in `scripts/memory-matrix.sh` — 139s against 237s.
+With the load-time check in place, what it still guards against is a bug inside the
+matcher itself, which is worth having available and not worth paying for on every
+object of every run.
+
+At the edges: the UI requires an explicit acknowledgement before it will download an
+`incomplete-risky` result, `--fail-on-unscrubbed` exits 3 on any hole (it used to
+ignore binary skips, so it was silent on exactly the case it exists for), and
+`--fail-on-risky` is the narrower gate for pipelines that legitimately carry images.
+
+> **One honest limit.** When the expansion budget refuses to decompress a container,
+> the residual scan sees only compressed bytes and finds nothing — so a too-large
+> bundle reports `incomplete`, not `incomplete-risky`, however much it contains.
+> Refusing to expand is precisely what stops anything looking inside. The hole is
+> still named with reason `expansion-budget`.
+
+**Adding a format or an encoding means adding rows to `internal/pipeline/corpus_test.go`** —
+one per shape, declaring its status, disposition and reason. A row that cannot be
+written, because the outcome has no reason code, is the design telling you the case is
+unclassified. The three bugs above are rows in it, and reverting any of their fixes
+fails the table.
 
 ## Running as a service on OpenShift (`scrubberd`)
 
@@ -375,6 +451,9 @@ Resolution per object, highest precedence first:
 `WORKERS` (clamped to 1), `QUEUE_MAX` (default `10000`), `FINALIZE_GRACE` (default `15s`),
 `MAX_OBJECT_BYTES` (default 640Mi), `MAX_EXPAND_BYTES` (default 1536Mi),
 `SPILL_THRESHOLD` (default 4Mi), `SPILL_RESIDENT_MAX` (default 64Mi),
+`RESIDUAL_BUDGET` (default 64Mi; negative disables the residual scan),
+`VERIFY_OUTPUT` (default `false`; re-scans scrubbed output, ~70% slower),
+`REVIEW_PREFIX` (default `review/`; empty disables diverting risky results),
 `AUDIT_LEVEL` (`full`|`counts`|`off`, default `counts`),
 `REDACT_REPORTS` (default `false`), `SCRUB_FILENAMES` (default `true`), `PORT` (default `8080`).
 
@@ -408,9 +487,9 @@ deployment, and how to export the image into an air-gapped environment.
 **Deploy on OpenShift:**
 ```sh
 # 1. build + push the image (air-gap: override BASE_*_IMAGE / GOPROXY to Artifactory mirrors)
-podman build -f deploy/Containerfile -t <artifactory>/docker-local/scrubberd:0.4.0 .
-podman push <artifactory>/docker-local/scrubberd:0.4.0
-#    (air-gapped: transfer dist/scrubberd-0.4.0.tar and `podman load -i` on the target)
+podman build -f deploy/Containerfile -t <artifactory>/docker-local/scrubberd:0.5.0 .
+podman push <artifactory>/docker-local/scrubberd:0.5.0
+#    (air-gapped: transfer dist/scrubberd-0.5.0.tar and `podman load -i` on the target)
 
 # 2. prereqs: MinIO creds Secret + named-policy ConfigMap
 oc create secret generic scrubber-secret \
@@ -442,6 +521,9 @@ distributed object claim and is a documented follow-up).
 | --- | --- |
 | `scrubber_queue_depth` | objects waiting, plus the one in flight |
 | `scrubber_inflight_objects` | objects being scrubbed right now (0 or 1) |
+| `scrubber_object_verdict_total{verdict}` | objects by coverage verdict — **the series to alert on** |
+| `scrubber_files_not_inspected_total{reason}` | files emitted uninspected, by reason code. A code appearing that you have not seen before is a new failure mode |
+| `scrubber_residual_hits_total` | policy matches found inside content that was NOT inspected |
 | `scrubber_queue_wait_seconds` | arrival → start of scrubbing |
 | `scrubber_object_latency_seconds` | arrival → finished; what a user actually waits |
 
@@ -596,15 +678,16 @@ There are three ways to change what gets scrubbed, from most transient to most p
 | `0` | Success. |
 | `1` | Fatal I/O error (e.g. input unreadable). Output may not have been written. |
 | `2` | Invalid usage or invalid terms file. **No input was touched.** |
-| `3` | Completed, but some files were emitted unscrubbed (only with `--fail-on-unscrubbed`). |
+| `3` | Completed, but some files were emitted without being inspected (only with `--fail-on-unscrubbed` or `--fail-on-risky`). |
 
 ## Notes & limitations (v1)
 
 - Text is handled as UTF-8 (with or without BOM), ASCII/Latin-1, and **UTF-16** in
   either byte order, with or without a BOM. A UTF-16 file is scrubbed and written
   back in the encoding it arrived in, so whatever reads it next is unaffected.
-  UTF-32 is still treated as binary and passed through — reported by name, not
-  silently.
+  UTF-32 is still treated as binary and passed through — reported by name with reason
+  `binary`, and the residual scan reads it at four-byte stride anyway, so a UTF-32 log
+  full of live data escalates the run to `incomplete-risky` rather than passing quietly.
 - Expansion is bounded by the cumulative `--max-expand-bytes` budget for a whole
   input (nested streams and archive members draw from the same budget). Payloads
   above the spill threshold are held on disk under `TMPDIR`, so that budget bounds
@@ -620,6 +703,11 @@ There are three ways to change what gets scrubbed, from most transient to most p
   no per-tenant fairness: a single user who uploads a large batch does hold up the
   users behind them until it drains. Round-robin between uploaders would need a
   tenant identity, which the service does not have (there is no app auth).
+- The residual scan is a signal, not a proof. It can produce false positives on
+  genuine binary (an image whose bytes happen to spell an IP address) and it cannot
+  see inside content a guard refused to decompress. It is deliberately tuned to say
+  "look at this" rather than to be authoritative, because the alternative — a check
+  precise enough to trust blindly — is the thing that keeps turning out to be wrong.
 - Shelling out to a system `7z`/`xz`, and length-preserving / hashing replacement
   modes, are intentionally out of scope for v1.
 

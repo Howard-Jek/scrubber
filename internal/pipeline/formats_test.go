@@ -290,7 +290,7 @@ func TestExpansionBudgetStopsBomb(t *testing.T) {
 	if got := rep.Summary.Passthroughs[0].Status; got != report.StatusGuardTripped {
 		t.Errorf("status = %q, want %q", got, report.StatusGuardTripped)
 	}
-	t.Logf("recorded: %s", rep.Summary.Passthroughs[0].Reason)
+	t.Logf("recorded: %s", rep.Summary.Passthroughs[0].Detail)
 }
 
 // TestZipBudgetStopsBomb covers the zip path specifically: entries are

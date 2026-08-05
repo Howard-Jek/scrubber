@@ -145,7 +145,7 @@ func TestRollbackUndoesTruncatedFile(t *testing.T) {
 	r := New("in.tar", "out.tar", AuditFull, false, "salt")
 	mark := r.Mark()
 	r.Record("bundle.tar!a.log", StatusScrubbed, "", 100, 90, manyMatches(maxMatchesPerFile*2))
-	r.Rollback(mark, "bundle.tar", StatusPassthrough, "could not rebuild", 100, 100)
+	r.Rollback(mark, "bundle.tar", StatusPassthrough, ReasonRepackFailed, "could not rebuild", 100, 100)
 
 	if r.Summary.TotalMatches != 0 {
 		t.Errorf("TotalMatches = %d after rollback, want 0", r.Summary.TotalMatches)
@@ -215,7 +215,7 @@ func TestReportBudgetReturnedOnRollback(t *testing.T) {
 	if spent == 0 {
 		t.Fatal("expected the retention budget to be consumed")
 	}
-	r.Rollback(mark, "bundle.tar", StatusPassthrough, "could not rebuild", 100, 100)
+	r.Rollback(mark, "bundle.tar", StatusPassthrough, ReasonRepackFailed, "could not rebuild", 100, 100)
 	if r.retained != 0 {
 		t.Errorf("retained = %d after rolling back every entry, want 0", r.retained)
 	}
@@ -234,7 +234,7 @@ func TestRollbackUndoesNamedBinarySkips(t *testing.T) {
 		t.Fatalf("skip was not recorded: %+v", r.Summary)
 	}
 
-	r.Rollback(mark, "bundle/inner.tar", StatusPassthrough, "could not rebuild tar", 5, 5)
+	r.Rollback(mark, "bundle/inner.tar", StatusPassthrough, ReasonRepackFailed, "could not rebuild tar", 5, 5)
 
 	if r.Summary.FilesBinarySkip != 0 {
 		t.Errorf("FilesBinarySkip = %d after rollback, want 0", r.Summary.FilesBinarySkip)

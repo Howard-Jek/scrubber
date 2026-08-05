@@ -80,9 +80,9 @@ func TestDecodeYieldsIdenticalText(t *testing.T) {
 		{"utf-16le", utf16Bytes(t, want, false, false)},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
-			got, ok := Decode(tc.data, Sniff(tc.data))
-			if !ok {
-				t.Fatal("Decode refused a well-formed payload")
+			got, refusal := Decode(tc.data, Sniff(tc.data))
+			if refusal != RefusalNone {
+				t.Fatalf("Decode refused a well-formed payload: refusal %v", refusal)
 			}
 			// A BOM decodes to U+FEFF and is preserved; strip it for the comparison.
 			if got = strings.TrimPrefix(got, "\ufeff"); got != want {
@@ -106,9 +106,9 @@ func TestRoundTripIsByteIdentical(t *testing.T) {
 	for _, enc := range []Encoding{UTF8, UTF16LE, UTF16BE} {
 		for _, s := range texts {
 			data := Encode(s, enc)
-			got, ok := Decode(data, enc)
-			if !ok {
-				t.Fatalf("%v: Decode refused what Encode produced for %q", enc, s)
+			got, refusal := Decode(data, enc)
+			if refusal != RefusalNone {
+				t.Fatalf("%v: Decode refused what Encode produced for %q (refusal %v)", enc, s, refusal)
 			}
 			if got != s {
 				t.Errorf("%v: text round trip differs\n got %q\nwant %q", enc, got, s)
@@ -135,8 +135,8 @@ func TestDecodeRefusesMalformed(t *testing.T) {
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
-			if _, ok := Decode(tc.data, UTF16LE); ok {
-				t.Error("Decode accepted malformed UTF-16; it must refuse rather than repair")
+			if _, refusal := Decode(tc.data, UTF16LE); refusal != RefusalMalformed {
+				t.Errorf("refusal = %v, want RefusalMalformed: it must refuse rather than repair", refusal)
 			}
 		})
 	}
@@ -151,8 +151,9 @@ func TestDecodeRefusesBinaryThatHappensToDecode(t *testing.T) {
 		buf.WriteByte(byte(i % 0x20)) // control characters only
 		buf.WriteByte(0x00)
 	}
-	if _, ok := Decode(buf.Bytes(), UTF16LE); ok {
-		t.Error("Decode accepted control-character soup as text")
+	if _, refusal := Decode(buf.Bytes(), UTF16LE); refusal != RefusalNotText {
+		t.Errorf("refusal = %v, want RefusalNotText: control-character soup is a binary file, "+
+			"not an encoding we failed at, and the reason code an operator sees must say so", refusal)
 	}
 }
 
@@ -181,8 +182,8 @@ func FuzzRoundTrip(f *testing.F) {
 		if enc == Binary {
 			return
 		}
-		text, ok := Decode(data, enc)
-		if !ok {
+		text, refusal := Decode(data, enc)
+		if refusal != RefusalNone {
 			return
 		}
 		if got := Encode(text, enc); !bytes.Equal(got, data) {

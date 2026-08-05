@@ -136,6 +136,19 @@ func sniffUTF16NoBOM(sample []byte) (Encoding, bool) {
 	return Binary, false
 }
 
+// Refusal says why Decode would not hand back text. The distinction matters
+// downstream: "well-formed but not text" is an ordinary binary file and should be
+// reported as one, while "not well-formed in this encoding" is a genuine encoding
+// problem an operator may want to chase. Collapsing them would put PNGs in the same
+// bucket as truncated UTF-16 and make the reason codes useless for triage.
+type Refusal int
+
+const (
+	RefusalNone      Refusal = iota // the payload decoded and is text
+	RefusalMalformed                // not well-formed in this encoding
+	RefusalNotText                  // decoded cleanly, but the result is control characters
+)
+
 // Decode converts a payload to a Go string, reporting whether it really is enc.
 //
 // UTF8 is the identity case and is never re-examined: Sniff already judged the
@@ -147,18 +160,24 @@ func sniffUTF16NoBOM(sample []byte) (Encoding, bool) {
 // text: a binary payload with NULs on alternating bytes can decode cleanly into
 // control-character soup, and scrubbing a match out of that would corrupt a file the
 // tool was supposed to leave alone.
-func Decode(data []byte, enc Encoding) (string, bool) {
+func Decode(data []byte, enc Encoding) (string, Refusal) {
 	switch enc {
 	case UTF8:
-		return string(data), true
+		return string(data), RefusalNone
 	case UTF16LE, UTF16BE:
 		s, ok := decodeUTF16(data, enc == UTF16BE)
-		if !ok || looksBinaryText(s) {
-			return "", false
+		if !ok {
+			return "", RefusalMalformed
 		}
-		return s, true
+		if looksBinaryText(s) {
+			// Binary with NULs on alternating bytes decodes as well-formed UTF-16 and
+			// then turns out to be control characters. It is a binary file that
+			// happened to fit the shape, not text we failed to handle.
+			return "", RefusalNotText
+		}
+		return s, RefusalNone
 	default:
-		return "", false
+		return "", RefusalNotText
 	}
 }
 

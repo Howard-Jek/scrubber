@@ -43,7 +43,9 @@ func run(args []string) int {
 		maxRatio    = fs.Int("max-ratio", 0, "DEPRECATED, ignored: expansion-ratio limits reject ordinary logs (see --max-expand-bytes)")
 		scrubNames  = fs.Bool("scrub-names", true, "also scrub archive member names/paths, not just contents")
 		verbose     = fs.Bool("verbose", false, "print the per-rule breakdown to stderr")
-		failUnscrub = fs.Bool("fail-on-unscrubbed", false, "exit 3 if any file was emitted unscrubbed (guard-tripped, unreadable, or unsupported container)")
+		failUnscrub = fs.Bool("fail-on-unscrubbed", false, "exit 3 if any file was emitted without being inspected (binary, guard-tripped, unreadable, or an unsupported container)")
+		failRisky   = fs.Bool("fail-on-risky", false, "exit 3 only when content that was NOT inspected is found to contain policy matches")
+		verifyOut   = fs.Bool("verify-output", false, "re-scan every scrubbed file to confirm the policy no longer matches it (roughly doubles matcher work)")
 	)
 	if err := fs.Parse(args); err != nil {
 		return 2
@@ -103,6 +105,7 @@ func run(args []string) int {
 			MaxDepth:      *maxDepth,
 			MaxTotalBytes: *maxBytes,
 			MaxMembers:    100000,
+			VerifyOutput:  *verifyOut,
 		},
 	}
 
@@ -128,7 +131,17 @@ func run(args []string) int {
 			fmt.Fprintln(os.Stderr, line)
 		}
 	}
+	// --fail-on-unscrubbed now asks the coverage question. It used to read
+	// FilesPassthrough, which excluded binary skips, so a UTF-16 log misread as
+	// binary left it silent — the flag reported clean on precisely the case it
+	// exists to catch.
 	if *failUnscrub && rep.HasUnscrubbed() {
+		return 3
+	}
+	// --fail-on-risky is the narrower gate for pipelines that legitimately carry
+	// images and cannot fail on every one: it fires only when the skipped content
+	// was scanned and found to contain the very data the policy removes.
+	if *failRisky && rep.Summary.Verdict().NeedsReview() {
 		return 3
 	}
 	return 0

@@ -331,7 +331,7 @@ func TestNestedBzip2IsPassedThroughAndReported(t *testing.T) {
 	for _, p := range rep.Summary.Passthroughs {
 		if strings.Contains(p.Path, "old.log.bz2") {
 			found = true
-			t.Logf("recorded: %s (%s) %s", p.Path, p.Status, p.Reason)
+			t.Logf("recorded: %s (%s/%s) %s", p.Path, p.Status, p.Code, p.Detail)
 		}
 	}
 	if !found {
@@ -407,7 +407,7 @@ func TestNestedBudgetIsCumulative(t *testing.T) {
 	if !repTight.HasUnscrubbed() {
 		t.Fatalf("tight budget was not enforced across the nested members")
 	}
-	t.Logf("tight-budget refusal: %s", repTight.Summary.Passthroughs[0].Reason)
+	t.Logf("tight-budget refusal: %s", repTight.Summary.Passthroughs[0].Detail)
 }
 
 // TestNestedNoChangeIsByteIdentical checks the fidelity guarantee under nesting:
@@ -548,7 +548,7 @@ func TestRollbackRestoresSummaryExactly(t *testing.T) {
 		_, drop := m.Scrub("AcmeCorp goes away 10.0.0.1")
 		rep.Record("gone.log", report.StatusScrubbed, "", 10, 10, drop)
 		rep.Record("gone2.log", report.StatusUnsupported, "nope", 10, 10, nil)
-		rep.Rollback(mark, "container", report.StatusUnsupported, "cannot rewrite", 10, 10)
+		rep.Rollback(mark, "container", report.StatusUnsupported, report.ReasonRepackFailed, "cannot rewrite", 10, 10)
 
 		if rep.Summary.TotalMatches != before.TotalMatches {
 			t.Errorf("audit=%v: TotalMatches = %d, want %d", lvl, rep.Summary.TotalMatches, before.TotalMatches)

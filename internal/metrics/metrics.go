@@ -14,13 +14,16 @@ import (
 
 // Metrics bundles the collectors updated as objects are processed.
 type Metrics struct {
-	Objects     *prometheus.CounterVec // by status
-	Matches     prometheus.Counter
-	Passthrough prometheus.Counter
-	Errors      prometheus.Counter
-	BytesIn     prometheus.Counter
-	BytesOut    prometheus.Counter
-	Duration    prometheus.Histogram
+	Objects      *prometheus.CounterVec // by status
+	Verdicts     *prometheus.CounterVec // by coverage verdict
+	NotInspected *prometheus.CounterVec // files not covered by the scrub, by reason
+	Residual     prometheus.Counter
+	Matches      prometheus.Counter
+	Passthrough  prometheus.Counter
+	Errors       prometheus.Counter
+	BytesIn      prometheus.Counter
+	BytesOut     prometheus.Counter
+	Duration     prometheus.Histogram
 
 	// QueueWait is how long an object sat in the queue before its scrub started.
 	QueueWait prometheus.Histogram
@@ -37,6 +40,20 @@ func New(reg prometheus.Registerer) *Metrics {
 		Objects: prometheus.NewCounterVec(prometheus.CounterOpts{
 			Name: "scrubber_objects_total", Help: "Objects processed, by outcome status.",
 		}, []string{"status"}),
+		// Verdicts is the series to alert on. objects_total{status} says whether
+		// processing succeeded; this says whether the *result* is trustworthy, which
+		// is a different question and the one that went unanswered for three bugs.
+		Verdicts: prometheus.NewCounterVec(prometheus.CounterOpts{
+			Name: "scrubber_object_verdict_total", Help: "Objects by coverage verdict (complete|incomplete|incomplete-risky).",
+		}, []string{"verdict"}),
+		// NotInspected breaks the coverage holes down by reason code. A reason
+		// appearing here that nobody has seen before is the signal that a new failure
+		// mode exists — which previously required a human to notice a file looked odd.
+		NotInspected: prometheus.NewCounterVec(prometheus.CounterOpts{
+			Name: "scrubber_files_not_inspected_total", Help: "Files emitted without being covered by the scrub, by reason.",
+		}, []string{"reason"}),
+		Residual: prometheus.NewCounter(prometheus.CounterOpts{
+			Name: "scrubber_residual_hits_total", Help: "Policy matches found inside content that was NOT inspected."}),
 		Matches:     prometheus.NewCounter(prometheus.CounterOpts{Name: "scrubber_matches_total", Help: "Total replacements made."}),
 		Passthrough: prometheus.NewCounter(prometheus.CounterOpts{Name: "scrubber_passthrough_total", Help: "Files passed through unchanged (binary/corrupt/unsupported)."}),
 		Errors:      prometheus.NewCounter(prometheus.CounterOpts{Name: "scrubber_errors_total", Help: "Objects that failed processing at the top level."}),
@@ -57,7 +74,17 @@ func New(reg prometheus.Registerer) *Metrics {
 			Buckets: prometheus.ExponentialBuckets(1, 2, 10),
 		}),
 	}
-	reg.MustRegister(m.Objects, m.Matches, m.Passthrough, m.Errors, m.BytesIn, m.BytesOut,
+	// Seed the label sets so a dashboard shows a zero rather than a missing series:
+	// "no incomplete runs" and "this metric does not exist yet" look identical
+	// otherwise, and the second one is what you get on a fresh pod.
+	for _, v := range []report.Verdict{report.VerdictComplete, report.VerdictIncomplete, report.VerdictIncompleteRisky} {
+		m.Verdicts.WithLabelValues(string(v)).Add(0)
+	}
+	for _, r := range report.AllReasons {
+		m.NotInspected.WithLabelValues(string(r)).Add(0)
+	}
+	reg.MustRegister(m.Objects, m.Verdicts, m.NotInspected, m.Residual,
+		m.Matches, m.Passthrough, m.Errors, m.BytesIn, m.BytesOut,
 		m.Duration, m.QueueWait, m.Latency)
 	return m
 }
@@ -118,6 +145,13 @@ type Job struct {
 	// and a bare count cannot tell an operator which one happened.
 	BinarySkipped   int                      `json:"binary_skipped"`
 	BinarySkipPaths []report.PassthroughNote `json:"binary_skip_paths,omitempty"`
+	// Verdict is the coverage answer for the whole object, and NotInspected names
+	// every file behind it. The UI keys its warning and its download gate on these.
+	Verdict         report.Verdict `json:"verdict,omitempty"`
+	NotInspected    int            `json:"files_not_inspected"`
+	NotInspectedSet []report.Note  `json:"not_inspected,omitempty"`
+	ResidualHits    int            `json:"residual_hits"`
+	ResidualSamples []string       `json:"residual_samples,omitempty"`
 
 	// FilesDone and CurrentFile give live progress while Status is "processing",
 	// so the UI can report what is actually happening instead of animating a bar

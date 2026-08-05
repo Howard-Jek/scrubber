@@ -8,9 +8,11 @@ import (
 	"fmt"
 	"io"
 	"os"
+	"strings"
 	"testing"
 
 	"github.com/howard/scrubber/internal/pipeline"
+	"github.com/howard/scrubber/internal/report"
 	"github.com/howard/scrubber/internal/spill"
 	"github.com/howard/scrubber/internal/store"
 )
@@ -164,4 +166,69 @@ type panicOnPut struct{ store.ObjectStore }
 
 func (p panicOnPut) PutStream(_ context.Context, _, _ string, _ io.Reader, _ int64, _ string) error {
 	panic("injected failure while writing the scrubbed output")
+}
+
+// The failure handler: a result whose uninspected content contains policy matches
+// must not land where a consumer looks for finished work. Flagging alone was already
+// tried and is not enough — a flag only helps somebody who reads it.
+func TestRiskyResultIsDivertedForReview(t *testing.T) {
+	ms := newMemStore("input", "output", "reports")
+	// A UTF-32 log: not a format the scrubber can read, and full of live secrets.
+	// It is skipped, the residual scan sees the addresses inside it, and that is
+	// what should move the output.
+	var utf32 []byte
+	utf32 = append(utf32, 0xff, 0xfe, 0x00, 0x00)
+	for _, r := range strings.Repeat("hi from AcmeCorp, mail bob@acme.test\n", 20) {
+		utf32 = append(utf32, byte(r), byte(r>>8), byte(r>>16), byte(r>>24))
+	}
+	ms.Put(context.Background(), "input", "lux.txt", utf32, "")
+
+	w := newTestWorker(t, ms)
+	w.runOnce(context.Background())
+
+	if ms.has("output", "lux.txt") {
+		t.Error("a risky result was written to the normal output key")
+	}
+	if !ms.has("output", "review/lux.txt") {
+		t.Fatal("expected the result under the review prefix")
+	}
+
+	jobs := w.jobs.Recent()
+	if len(jobs) == 0 {
+		t.Fatal("no job recorded")
+	}
+	j := jobs[0]
+	if j.Verdict != report.VerdictIncompleteRisky {
+		t.Errorf("verdict = %q, want %q", j.Verdict, report.VerdictIncompleteRisky)
+	}
+	if j.ResidualHits == 0 {
+		t.Error("the residual scan should have found the addresses inside the skipped file")
+	}
+	if j.OutputKey != "review/lux.txt" {
+		t.Errorf("output key = %q; the client must be told where it actually landed", j.OutputKey)
+	}
+}
+
+// A bundle that skips only genuinely harmless content stays in the normal output.
+// If every bundle containing an image diverted, the review prefix would fill with
+// noise and stop meaning anything.
+func TestHarmlessSkipIsNotDiverted(t *testing.T) {
+	ms := newMemStore("input", "output", "reports")
+	// Genuinely binary: a PNG header and pseudo-random bytes, with nothing in it
+	// the policy would match under any reading.
+	body := []byte("\x89PNG\r\n\x1a\n")
+	for i := 0; i < 4096; i++ {
+		body = append(body, byte(i*7+i/3))
+	}
+	ms.Put(context.Background(), "input", "logo.png", body, "")
+
+	w := newTestWorker(t, ms)
+	w.runOnce(context.Background())
+
+	if !ms.has("output", "logo.png") {
+		t.Error("a harmless skip should stay in the normal output")
+	}
+	if ms.has("output", "review/logo.png") {
+		t.Error("a harmless skip must not be diverted, or the review prefix becomes noise")
+	}
 }

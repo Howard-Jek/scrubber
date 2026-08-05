@@ -4,6 +4,7 @@
 package scrub
 
 import (
+	"fmt"
 	"regexp"
 	"strings"
 )
@@ -57,11 +58,50 @@ func NewMatcher(defaultReplacement string, rules []Rule) (*Matcher, error) {
 	if err != nil {
 		return nil, err
 	}
-	return &Matcher{
+	m := &Matcher{
 		rules:              rules,
 		combined:           combined,
 		defaultReplacement: defaultReplacement,
-	}, nil
+	}
+	if err := m.checkConverges(); err != nil {
+		return nil, err
+	}
+	return m, nil
+}
+
+// checkConverges rejects a policy whose own output still matches it.
+//
+// If a rule replaces "secret" with "secret-[REDACTED]", scrubbing never finishes the
+// job: the result still contains the term, and every downstream surface reports the
+// file as scrubbed anyway. That is a half-scrubbed document, and it is a property of
+// the *policy*, not of any particular file — so it is caught here, once, when the
+// policy loads, rather than by re-scanning every leaf at runtime. Measured, that
+// runtime check cost ~70% of the drain rate on a one-CPU pod; this costs one pass over
+// a handful of short strings and fails before any data is touched.
+//
+// The check runs the real Scrub rather than matching the combined pattern directly,
+// so rules with candidate validators (a card number that fails its Luhn check is not
+// a match) are judged exactly as they will be in production, with no second
+// implementation to drift.
+func (m *Matcher) checkConverges() error {
+	seen := map[string]bool{}
+	for i := range m.rules {
+		rep := m.rules[i].Replacement
+		if rep == "" {
+			rep = m.defaultReplacement
+		}
+		if seen[rep] {
+			continue
+		}
+		seen[rep] = true
+		if _, matches := m.Scrub(rep); len(matches) > 0 {
+			return fmt.Errorf("policy does not converge: the replacement %q for rule %q is itself "+
+				"matched by rule %q, so scrubbing its own output would find the term again and the "+
+				"file would be emitted only partly redacted. Choose a replacement no rule matches",
+				rep, m.rules[i].ID, matches[0].RuleID)
+		}
+	}
+	return nil
 }
 
 // RuleCount returns the number of compiled rules.

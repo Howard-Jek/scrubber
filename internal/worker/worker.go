@@ -70,7 +70,12 @@ type Config struct {
 	Audit         report.AuditLevel
 	RedactReports bool
 	ScrubNames    bool // also scrub archive member names/paths and the output object key
-	Limits        pipeline.Limits
+	// ReviewPrefix is where a result lands when the residual scan finds policy
+	// matches inside content the scrub did not inspect. Separating those physically
+	// is the point: a key under this prefix cannot be picked up by something looking
+	// for a finished bundle. Empty disables diversion and leaves the flagging alone.
+	ReviewPrefix string
+	Limits       pipeline.Limits
 }
 
 // termsSuffix marks a per-object override file: "<key>.terms.json".
@@ -125,6 +130,9 @@ func min(a, b int) int {
 func New(s store.ObjectStore, p *policy.Registry, m *metrics.Metrics, jl *metrics.JobLog, cfg Config, log *slog.Logger) *Worker {
 	if cfg.ProcessedPrefix == "" {
 		cfg.ProcessedPrefix = "processed/"
+	}
+	if cfg.ReviewPrefix == "" {
+		cfg.ReviewPrefix = "review/"
 	}
 	// Clamped rather than defaulted. Honouring a larger value would let a single
 	// config line reintroduce concurrent scrubs behind a queue that claims to have
@@ -524,6 +532,20 @@ func (w *Worker) processObject(ctx context.Context, o store.Object) {
 	rep.BytesIn = int(inSize)
 	rep.BytesOut = int(out.Size())
 
+	// The verdict decides where this lands. A result whose skipped parts contain
+	// policy matches goes to the review prefix rather than the place a consumer
+	// looks for finished work — flagging alone has already been shown not to be
+	// enough, because a flag only helps someone who reads it.
+	verdict := rep.Summary.Verdict()
+	if verdict.NeedsReview() && w.cfg.ReviewPrefix != "" {
+		outKey = w.cfg.ReviewPrefix + outKey
+		job.OutputKey = outKey
+		rep.OutputKey = outKey
+		w.log.Warn("result diverted for review: content that was NOT inspected contains policy matches",
+			"key", o.Key, "output_key", outKey, "residual_hits", rep.Summary.ResidualHits,
+			"samples", strings.Join(rep.Summary.ResidualSamples, "; "))
+	}
+
 	job.Phase = "writing"
 	job.FilesDone = filesDone
 	w.jobs.Upsert(job)
@@ -616,34 +638,48 @@ func (w *Worker) processObject(ctx context.Context, o store.Object) {
 	job.PassthroughPaths = sum.Passthroughs
 	job.BinarySkipped = sum.FilesBinarySkip
 	job.BinarySkipPaths = sum.BinarySkips
+	job.Verdict = verdict
+	job.NotInspected = sum.FilesNotInspected
+	job.NotInspectedSet = sum.NotInspected
+	job.ResidualHits = sum.ResidualHits
+	job.ResidualSamples = sum.ResidualSamples
 	record(job)
 
-	// Name every file that came out uninspected, in both categories. A count on its
-	// own is not actionable: skipping an image is routine and skipping a log is a
-	// leak, and UTF-16 text was misread as binary and left with its contents intact
-	// while this line said "binary_skipped=1" and moved on.
-	if sum.FilesBinarySkip > 0 {
-		w.log.Info("files skipped as binary and NOT scrubbed",
-			"key", o.Key, "count", sum.FilesBinarySkip, "paths", noteList(sum.BinarySkips))
+	w.metrics.Verdicts.WithLabelValues(string(verdict)).Inc()
+	w.metrics.Residual.Add(float64(sum.ResidualHits))
+	for reason, n := range sum.ByReason {
+		w.metrics.NotInspected.WithLabelValues(string(reason)).Add(float64(n))
 	}
-	if sum.FilesPassthrough > 0 {
-		// Not a clean result: part of the bundle left the pipeline uninspected.
-		// Log it at warn with the offending paths so it is visible without having
-		// to open the report object.
-		w.log.Warn("scrubbed WITH UNSCRUBBED FILES; manual review required",
-			"key", o.Key, "policy", res.Name, "matches", sum.TotalMatches,
-			"unscrubbed_files", sum.FilesPassthrough, "paths", noteList(sum.Passthroughs))
-		return
+
+	// One line, keyed on the verdict. This used to be two conditions that classified
+	// outcomes differently from HasUnscrubbed, which is how a run could log "file not
+	// scrubbed" and still report itself clean.
+	switch verdict {
+	case report.VerdictComplete:
+		w.log.Info("scrubbed", "key", o.Key, "policy", res.Name, "verdict", verdict,
+			"matches", sum.TotalMatches, "changed", changed)
+	case report.VerdictIncomplete:
+		w.log.Warn("scrubbed WITH UNINSPECTED FILES; review before sharing",
+			"key", o.Key, "policy", res.Name, "verdict", verdict, "matches", sum.TotalMatches,
+			"not_inspected", sum.FilesNotInspected, "paths", noteList(sum.NotInspected))
+	default:
+		w.log.Error("scrubbed WITH UNINSPECTED FILES THAT CONTAIN MATCHES; diverted for review",
+			"key", o.Key, "policy", res.Name, "verdict", verdict, "matches", sum.TotalMatches,
+			"not_inspected", sum.FilesNotInspected, "residual_hits", sum.ResidualHits,
+			"paths", noteList(sum.NotInspected))
 	}
-	w.log.Info("scrubbed", "key", o.Key, "policy", res.Name, "matches", sum.TotalMatches,
-		"binary_skipped", sum.FilesBinarySkip, "changed", changed)
 }
 
-// noteList renders skipped-file notes for a log line.
-func noteList(notes []report.PassthroughNote) string {
+// noteList renders uninspected-file notes for a log line, leading with the reason
+// code so the line greps cleanly and a new failure mode is visible as a new code.
+func noteList(notes []report.Note) string {
 	parts := make([]string, 0, len(notes))
 	for _, p := range notes {
-		parts = append(parts, fmt.Sprintf("%s (%s: %s)", p.Path, p.Status, p.Reason))
+		s := fmt.Sprintf("%s [%s] %s", p.Path, p.Code, p.Detail)
+		if p.Residual != "" {
+			s += fmt.Sprintf(" — CONTAINS %s", p.Residual)
+		}
+		parts = append(parts, s)
 	}
 	return strings.Join(parts, "; ")
 }
