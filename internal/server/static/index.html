@@ -355,7 +355,7 @@
 
     function finish(s,key){
       clearInterval(tick); meta.style.display='none';
-      var secs=((Date.now()-start)/1000).toFixed(1), pt=s.passthrough||0;
+      var secs=((Date.now()-start)/1000).toFixed(1), pt=s.passthrough||0, bs=s.binary_skipped||0;
       // A bundle containing files the pipeline never inspected is NOT a success.
       // Showing a green check here is how unscrubbed data gets shared by mistake.
       if(pt>0){
@@ -369,20 +369,34 @@
       var chips=Object.keys(bl).map(function(l){return '<span style="font-family:var(--font-mono); font-size:12px; color:var(--color-text-secondary); background:var(--color-background-secondary); padding:3px 8px; border-radius:var(--border-radius-md);">'+esc(l)+' ×'+bl[l]+'</span>';}).join('');
       var cards=[['Matches',s.matches||0],['Bytes in',s.bytes_in||0],['Bytes out',s.bytes_out||0]].map(function(c){
         return '<div style="background:var(--color-background-secondary); border-radius:var(--border-radius-md); padding:10px 12px;"><div style="font-size:12px; color:var(--color-text-secondary);">'+c[0]+'</div><div style="font-size:22px; font-weight:500; color:var(--color-text-primary);">'+c[1]+'</div></div>';}).join('');
-      // Name the files that were passed through, so "review it by hand" is
+      // Name the files that came out uninspected, so "review it by hand" is
       // actionable rather than a vague caveat.
-      var warn='';
-      if(pt>0){
-        var rows=(s.passthrough_paths||[]).map(function(p){
+      function fileRows(list,total){
+        var rows=(list||[]).map(function(p){
           return '<div style="font-family:var(--font-mono); font-size:11px; color:var(--color-text-primary); padding:4px 0; border-bottom:0.5px solid var(--color-border-tertiary);">'
             +esc(p.path)+'<div style="color:var(--color-text-tertiary); margin-top:2px;">'+esc(p.status)+(p.reason?' — '+esc(p.reason):'')+'</div></div>';
         }).join('');
-        var more=pt-(s.passthrough_paths||[]).length;
+        var more=total-(list||[]).length;
         if(more>0) rows+='<div style="font-size:11px; color:var(--color-text-tertiary); padding-top:6px;">…and '+more+' more</div>';
+        return rows;
+      }
+      var warn='';
+      if(pt>0){
         warn='<div style="margin-top:12px; padding:10px 12px; border-radius:var(--border-radius-md); background:var(--color-background-warning); border:0.5px solid var(--color-border-warning);">'
           +'<div style="font-size:12px; font-weight:500; color:var(--color-text-warning); display:flex; align-items:center; gap:6px;">'
           +'<svg class="icn" style="font-size:14px;" aria-hidden="true"><use href="#i-alert-triangle"/></svg>Emitted without scrubbing — review before sharing</div>'
-          +'<div style="margin-top:8px;">'+rows+'</div></div>';
+          +'<div style="margin-top:8px;">'+fileRows(s.passthrough_paths,pt)+'</div></div>';
+      }
+      // Binary skips are listed too, in a quieter style. Skipping an image is normal
+      // and should not read as a failure, but it must be visible: a text file wrongly
+      // classified as binary leaves with its contents intact, and while this count was
+      // hidden that is exactly what happened to UTF-16 logs.
+      if(bs>0){
+        warn+='<div style="margin-top:12px; padding:10px 12px; border-radius:var(--border-radius-md); background:var(--color-background-secondary); border:0.5px solid var(--color-border-tertiary);">'
+          +'<div style="font-size:12px; font-weight:500; color:var(--color-text-secondary); display:flex; align-items:center; gap:6px;">'
+          +'<svg class="icn" style="font-size:14px;" aria-hidden="true"><use href="#i-file-search"/></svg>'
+          +bs+' file'+(bs===1?'':'s')+' skipped as binary — not scrubbed</div>'
+          +'<div style="margin-top:8px;">'+fileRows(s.binary_skip_paths,bs)+'</div></div>';
       }
       done.innerHTML=
         warn
@@ -482,12 +496,13 @@
       return;
     }
     histEl.innerHTML=runs.map(function(r){
-      var pt=r.passthrough||0;
+      var pt=r.passthrough||0, bs=r.binary_skipped||0;
       var badge = r.status==='unreadable'
         ? '<span style="font-size:11px; color:var(--color-text-danger);">report unreadable</span>'
         : (pt>0
           ? '<span style="font-size:11px; color:var(--color-text-warning); background:var(--color-background-warning); padding:2px 8px; border-radius:999px; white-space:nowrap;">'+pt+' not scrubbed</span>'
-          : '<span style="font-size:11px; color:var(--color-text-success); background:var(--color-background-success); padding:2px 8px; border-radius:999px; white-space:nowrap;">'+(r.matches||0)+' redacted</span>');
+          : '<span style="font-size:11px; color:var(--color-text-success); background:var(--color-background-success); padding:2px 8px; border-radius:999px; white-space:nowrap;">'+(r.matches||0)+' redacted</span>')
+        +(bs>0 ? '<span style="font-size:11px; color:var(--color-text-secondary); background:var(--color-background-secondary); padding:2px 8px; border-radius:999px; white-space:nowrap;">'+bs+' skipped</span>' : '');
       return '<div style="display:flex; align-items:center; gap:10px; padding:9px 0; border-top:0.5px solid var(--color-border-tertiary);">'
         +'<svg class="icn" style="font-size:17px; color:var(--color-text-tertiary);" aria-hidden="true"><use href="#i-file-check"/></svg>'
         +'<div style="min-width:0; flex:1;">'

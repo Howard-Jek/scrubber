@@ -1,11 +1,49 @@
-# Handover — queue + disk spill
+# Handover
 
 What changed, what I verified here, and the two things only you can do (build the
 image on your machine and export it to your isolated environment).
 
 ---
 
-## What changed
+## Latest: UTF-16 text was being skipped entirely (image 0.4.0)
+
+**The bug.** Two `.txt` files, same content, same policy: the UTF-8 one scrubbed, the
+UTF-16 one came back untouched. The binary check called anything binary the moment it
+saw a NUL byte, and UTF-16 is more than half NUL bytes — ASCII `A` is `41 00` — so
+every UTF-16 file tripped it on byte two. That is also why the size looked wrong: UTF-16
+spends two bytes per character, so a 1.5 M character log is 3 MB on disk. On Windows
+this is the *default*: PowerShell's `>` and `Out-File`, and Notepad's "Save as Unicode",
+all write UTF-16LE.
+
+**And nothing told you.** A binary skip was counted separately from a passthrough, so
+`--fail-on-unscrubbed` stayed quiet, the API had no field for it, and the UI drew a
+green check over a bundle containing a log that was never inspected.
+
+**Fixed.** UTF-16 in either byte order, with or without a BOM, is now decoded, scrubbed
+and written back *in the same encoding* — the output stays usable by whatever reads it.
+Malformed UTF-16 is refused rather than repaired, so a file we rewrite differs from its
+input only where a match was replaced. Every skipped file is now named in the report,
+the API, the run banner, the worker log and the UI.
+
+Two smaller paths to the same symptom went with it: a text file starting `x `, `H,` or
+`h$` was mistaken for a zlib stream (13 two-byte prefixes collide) and emitted
+unscrubbed — it is now retried as text when inflation fails; and bzip2 detection now
+requires the digit the format mandates after `BZh`, so a line starting "BZhang" is not
+sent to the decompressor.
+
+**What to check on your side:** upload `lux.txt` itself. It should come back
+`scrubbed`, and the report's `detail` for it will name the encoding it found
+(`utf-16le`, most likely) — that is the answer to "what actually is this file?" without
+hex-dumping it. If it still comes back untouched, the report now names it under
+`binary_skips` with a reason, and that reason is what I need.
+
+```sh
+./scripts/encoding-check.sh    # the same proof, end to end, on your machine
+```
+
+---
+
+## Earlier: queue + disk spill (image 0.3.0)
 
 Four parts, all on one branch.
 
@@ -77,14 +115,14 @@ access to your filesystem. These run on your machine:
 
 ```sh
 git pull
-docker build -f deploy/Containerfile -t scrubberd:0.3.0 .
-docker save -o ~/Desktop/scrubberd-0.3.0.tar scrubberd:0.3.0
+docker build -f deploy/Containerfile -t scrubberd:0.4.0 .
+docker save -o ~/Desktop/scrubberd-0.4.0.tar scrubberd:0.4.0
 ```
 
 On the isolated side:
 
 ```sh
-docker load -i scrubberd-0.3.0.tar
+docker load -i scrubberd-0.4.0.tar
 ```
 
 If your air-gapped registry mirrors its own base images, build with them instead —
@@ -95,7 +133,7 @@ docker build -f deploy/Containerfile \
   --build-arg BASE_BUILD_IMAGE=<artifactory>/docker-public/golang:1.25 \
   --build-arg BASE_RUNTIME_IMAGE=<artifactory>/docker-public/ubi9/ubi-micro:latest \
   --build-arg GOPROXY=https://<artifactory>/artifactory/api/go/go-remote \
-  -t <artifactory>/docker-local/scrubberd:0.3.0 .
+  -t <artifactory>/docker-local/scrubberd:0.4.0 .
 ```
 
 Add `--platform linux/amd64` if you are building on an Apple-silicon Mac for an x86

@@ -614,23 +614,38 @@ func (w *Worker) processObject(ctx context.Context, o store.Object) {
 	job.ByLabel = sum.MatchesByLabel
 	job.Passthrough = sum.FilesPassthrough
 	job.PassthroughPaths = sum.Passthroughs
+	job.BinarySkipped = sum.FilesBinarySkip
+	job.BinarySkipPaths = sum.BinarySkips
 	record(job)
 
+	// Name every file that came out uninspected, in both categories. A count on its
+	// own is not actionable: skipping an image is routine and skipping a log is a
+	// leak, and UTF-16 text was misread as binary and left with its contents intact
+	// while this line said "binary_skipped=1" and moved on.
+	if sum.FilesBinarySkip > 0 {
+		w.log.Info("files skipped as binary and NOT scrubbed",
+			"key", o.Key, "count", sum.FilesBinarySkip, "paths", noteList(sum.BinarySkips))
+	}
 	if sum.FilesPassthrough > 0 {
 		// Not a clean result: part of the bundle left the pipeline uninspected.
 		// Log it at warn with the offending paths so it is visible without having
 		// to open the report object.
-		paths := make([]string, 0, len(sum.Passthroughs))
-		for _, p := range sum.Passthroughs {
-			paths = append(paths, fmt.Sprintf("%s (%s: %s)", p.Path, p.Status, p.Reason))
-		}
 		w.log.Warn("scrubbed WITH UNSCRUBBED FILES; manual review required",
 			"key", o.Key, "policy", res.Name, "matches", sum.TotalMatches,
-			"unscrubbed_files", sum.FilesPassthrough, "paths", strings.Join(paths, "; "))
+			"unscrubbed_files", sum.FilesPassthrough, "paths", noteList(sum.Passthroughs))
 		return
 	}
 	w.log.Info("scrubbed", "key", o.Key, "policy", res.Name, "matches", sum.TotalMatches,
 		"binary_skipped", sum.FilesBinarySkip, "changed", changed)
+}
+
+// noteList renders skipped-file notes for a log line.
+func noteList(notes []report.PassthroughNote) string {
+	parts := make([]string, 0, len(notes))
+	for _, p := range notes {
+		parts = append(parts, fmt.Sprintf("%s (%s: %s)", p.Path, p.Status, p.Reason))
+	}
+	return strings.Join(parts, "; ")
 }
 
 func (w *Worker) finish(ctx context.Context, key string) error {

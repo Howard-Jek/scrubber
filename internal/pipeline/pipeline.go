@@ -21,6 +21,7 @@ import (
 	"github.com/howard/scrubber/internal/report"
 	"github.com/howard/scrubber/internal/scrub"
 	"github.com/howard/scrubber/internal/spill"
+	"github.com/howard/scrubber/internal/textenc"
 )
 
 // Limits bounds resource use to defuse decompression bombs and quines.
@@ -247,7 +248,8 @@ func (e *Engine) handleLeaf(path string, in *spill.Blob) (*spill.Blob, bool) {
 			fmt.Sprintf("could not read payload: %v", err), in)
 		return in, false
 	}
-	if detect.IsBinary(sample) {
+	enc := textenc.Sniff(sample)
+	if enc == textenc.Binary {
 		e.recordSize(path, report.StatusBinarySkip, "detected binary content", in)
 		return in, false
 	}
@@ -262,18 +264,30 @@ func (e *Engine) handleLeaf(path string, in *spill.Blob) (*spill.Blob, bool) {
 			fmt.Sprintf("could not read payload: %v", err), in)
 		return in, false
 	}
-	scrubbed, matches := e.Matcher.Scrub(string(data))
-	if len(matches) == 0 {
-		e.recordSize(path, report.StatusUnchanged, "", in)
+	// Sniff judged 8KiB; Decode judges the whole payload and can still refuse. It
+	// does so for anything that would not re-encode to exactly these bytes, which
+	// keeps "we only changed what we redacted" true for UTF-16 as it already was for
+	// UTF-8. A refusal is the old behaviour: pass it through as binary.
+	text, ok := textenc.Decode(data, enc)
+	if !ok {
+		e.recordSize(path, report.StatusBinarySkip,
+			fmt.Sprintf("looked like %s but is not well-formed text; passed through unchanged", enc), in)
 		return in, false
 	}
-	out, err := e.stageNew(spill.FromBytes([]byte(scrubbed), e.Limits.Spill))
+	scrubbed, matches := e.Matcher.Scrub(text)
+	if len(matches) == 0 {
+		e.recordSize(path, report.StatusUnchanged, enc.String(), in)
+		return in, false
+	}
+	out, err := e.stageNew(spill.FromBytes(textenc.Encode(scrubbed, enc), e.Limits.Spill))
 	if err != nil {
 		e.recordSize(path, report.StatusPassthrough,
 			fmt.Sprintf("could not stage scrubbed payload: %v", err), in)
 		return in, false
 	}
-	e.Report.Record(path, report.StatusScrubbed, "", len(data), int(out.Size()), matches)
+	// The encoding goes in the detail so a report answers "what actually is this
+	// file?" without anyone having to hex-dump it.
+	e.Report.Record(path, report.StatusScrubbed, enc.String(), len(data), int(out.Size()), matches)
 	return out, true
 }
 
@@ -297,6 +311,13 @@ func (e *Engine) handleCompressed(f detect.Format, path string, in *spill.Blob, 
 		case errors.Is(err, spill.ErrSpill):
 			e.recordSize(path, report.StatusPassthrough,
 				fmt.Sprintf("could not stage decompressed %s to scratch storage (%v); passed through unchanged and NOT scrubbed", f, err), in)
+		case f == detect.Zlib:
+			// zlib has no magic number: it is recognised from two header bytes that
+			// ordinary text can satisfy, so a plain log beginning "H," or "xK" gets
+			// sent down this path and used to be emitted unscrubbed. Failing to
+			// inflate is the proof the guess was wrong, so retry it as what it
+			// actually is. A genuine zlib stream is unaffected — it inflates.
+			return e.handleLeaf(path, in)
 		default:
 			e.recordSize(path, report.StatusPassthrough,
 				fmt.Sprintf("could not decompress %s: %v", f, err), in)
