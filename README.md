@@ -408,9 +408,9 @@ deployment, and how to export the image into an air-gapped environment.
 **Deploy on OpenShift:**
 ```sh
 # 1. build + push the image (air-gap: override BASE_*_IMAGE / GOPROXY to Artifactory mirrors)
-podman build -f deploy/Containerfile -t <artifactory>/docker-local/scrubberd:0.3.0 .
-podman push <artifactory>/docker-local/scrubberd:0.3.0
-#    (air-gapped: transfer dist/scrubberd-0.3.0.tar and `podman load -i` on the target)
+podman build -f deploy/Containerfile -t <artifactory>/docker-local/scrubberd:0.4.0 .
+podman push <artifactory>/docker-local/scrubberd:0.4.0
+#    (air-gapped: transfer dist/scrubberd-0.4.0.tar and `podman load -i` on the target)
 
 # 2. prereqs: MinIO creds Secret + named-policy ConfigMap
 oc create secret generic scrubber-secret \

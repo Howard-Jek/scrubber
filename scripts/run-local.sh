@@ -9,7 +9,7 @@
 # http://localhost:9002 (minioadmin / minioadmin).
 set -euo pipefail
 
-IMAGE="${IMAGE:-scrubberd:0.3.0}"
+IMAGE="${IMAGE:-scrubberd:0.4.0}"
 NET=scrubnet
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 
