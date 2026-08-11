@@ -4,3 +4,6 @@
 *.out
 /scrubberd
 /scrubberd.exe
+
+# exported container images (docker save)
+/dist/
