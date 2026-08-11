@@ -12,6 +12,100 @@ For what to verify on your own cluster after taking a new image, see
 
 ## Unreleased
 
+### The progress bar was a timer, and it hid a real stall
+
+**The bug.** A user reported a 300 MB zip "stuck at unpacking 95% for over 1200
+seconds". Both halves of what they were shown were invented.
+
+There was no `unpacking` phase. The worker set `Phase = "scrubbing"` *before* the
+engine started, so throughout the expansion it reported the one thing that was
+certainly not happening. The word "Unpacking" came from the browser, inferred from
+`files_done === 0`.
+
+And the bar was a timer. Three branches handled progress; two had been fixed to
+stop animating, and the third had not:
+
+```js
+} else {                          // files_done === 0
+  creep=Math.min(95,creep+2);     // +2% every 1.2s poll, no server input
+  st.textContent=isArch?'Unpacking…':'Scrubbing…';
+}
+```
+
+Starting from 60 after upload, that reaches 95% in 42 seconds and holds there
+forever. A bundle that finishes in four minutes and one wedged on a backend read
+that never returns produce identical screens.
+
+**Why the gap existed at all.** A container is expanded in full before its first
+member reaches the matcher — `handleZip` calls `archive.ReadZip`, which
+materialises every member — so nothing can increment `FilesDone` until that
+completes. It is a genuine blind window, not an oversight in the reporting.
+
+**Fixed.** `unpacking` is a real phase, set before the engine runs and flipped to
+`scrubbing` by the first recorded leaf. `/api/status` carries `phase_seconds`
+alongside it, and the page holds the bar and shows elapsed time in the phase
+instead of creeping. Measured on a 1.37 GiB, 280-member zip at the shipped caps:
+the whole silent window — MinIO read plus full expansion — is **6.55 seconds**,
+1.5% of a 7m17s run. So the reported 1200 seconds was never unpacking.
+
+**Also new: `scrubber_inflight_phase_seconds`.** Nothing outside the process could
+distinguish slow from wedged. `/healthz` is a pure liveness signal that answers 200
+whatever the worker is doing, and making it fail on a long scrub would kill
+legitimate work. `/readyz` only reports that MinIO is reachable — and a stalled
+read leaves it green. The new gauge is a `GaugeFunc` read at scrape time, not a
+value the worker pushes, precisely because a stalled worker updates nothing: a
+pushed gauge would freeze at its last value and look healthy. `STALL_WARN_AFTER`
+(default 5m) logs the same condition for anyone reading pod logs rather than a
+dashboard. Neither ever kills the pod; what counts as too long depends on the
+bundles, which this process does not know.
+
+### Caps now size themselves against the pod
+
+**The problem.** Every cap was measured on a 2 GiB pod and compiled in as a
+default, which made 2 GiB the only size the service was tuned for. On a 4 or 8 GiB
+pod it left most of the memory idle and scrubbed no faster.
+
+Worse, the obvious workaround was a trap. Raising `SPILL_RESIDENT_MAX` and
+`SPILL_THRESHOLD` by hand to "use the new memory" stops members spilling, the live
+set climbs past `GOMEMLIMIT`, and the GC burns the single CPU the pod has — the
+exact pre-0.3.0 failure. Giving the pod more memory could make it slower.
+
+**Fixed.** The measured values are now a ratio to the pod they were measured on,
+and the ceiling is read from the cgroup (v2 `memory.max`, then v1
+`memory.limit_in_bytes`) at startup:
+
+| Pod memory | scale | `SPILL_THRESHOLD` | `SPILL_RESIDENT_MAX` | `GOMEMLIMIT` | `est_peak_rss` |
+| --- | --- | --- | --- | --- | --- |
+| 2 GiB | 1× | 4 MiB | 64 MiB | 1200 MiB | 513 MiB (25%) |
+| 4 GiB | 2× | 8 MiB | 128 MiB | 2400 MiB | 703 MiB (17%) |
+| 8 GiB | 4× | 16 MiB | 256 MiB | 4800 MiB | 1083 MiB (13%) |
+
+At 2 GiB every derived value is byte-identical to what shipped, so every published
+measurement stays valid. An explicit environment variable still overrides — and
+still freezes that value at whatever the pod was when it was typed, which is why
+the manifest now leaves them commented out rather than set.
+
+Scratch is deliberately *not* auto-detected: an emptyDir's `sizeLimit` is enforced
+by the kubelet, not the filesystem, so `statfs` inside the container reports the
+node's whole disk and would license a budget that gets the pod evicted. Declare it
+with the new `SCRATCH_BYTES`, which must equal the `/work` `sizeLimit`;
+`MAX_EXPAND_BYTES` and `MAX_OBJECT_BYTES` derive from it.
+
+**Measured.** The same 1.66 GiB-expanded zip, twice:
+
+| Pod | Caps | Result |
+| --- | --- | --- |
+| 2 GiB | expand 1536Mi | refused — `expansion-budget` after 5.3s, passed through unscrubbed |
+| 8 GiB + `SCRATCH_BYTES=12Gi` | expand 4.8Gi | **scrubbed**, `complete`, 39.2M matches, 8m38s, peak RSS ~890 MiB |
+
+Only `limits.memory` and `SCRATCH_BYTES` changed between those two runs. Per-member
+throughput was unchanged (0.64 vs 0.68 files/s): more memory buys capacity, not
+speed, which is CPU-bound on a one-core pod.
+
+**Known caveat.** Go derives `GOMAXPROCS` from the cgroup CPU limit only under
+cgroup v2. On a cgroup v1 node the startup log's `pod_cpus` shows the node's core
+count, not `limits.cpu`, and `GOMAXPROCS` should be set explicitly.
+
 ### `run-local.sh` was not executable on a fresh clone
 
 **The bug.** `scripts/run-local.sh` and `scripts/gen-notices.sh` were committed as mode

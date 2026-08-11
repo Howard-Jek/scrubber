@@ -252,6 +252,44 @@ The service logs `budget_bytes`, `est_peak_rss_bytes` and `scratch_bytes` at sta
 size `limits.memory` from the second and the `/work` `sizeLimit` from the third. Do not
 size a pod from `budget_bytes`; that is the mistake this section exists to prevent.
 
+### The caps size themselves against the pod
+
+Every number in this section was measured on a 2 GiB / 1 CPU pod, and for a while it was
+also compiled in as a default — which quietly made 2 GiB the only size the service was
+tuned for. On a larger pod it left most of the memory idle and scrubbed no faster, and
+the only recourse was to raise the spill knobs by hand. That is a trap: raise them far
+enough to matter and members stop spilling, the live set climbs past `GOMEMLIMIT`, and
+the GC burns the single CPU it has. Giving the pod more memory made it slower.
+
+So the measured values are stored as a *ratio* to the pod they were measured on, and the
+real ceiling is read from the cgroup (v2 `memory.max`, falling back to v1
+`memory.limit_in_bytes`) at startup:
+
+| Pod memory | `mem_scale` | `SPILL_THRESHOLD` | `SPILL_RESIDENT_MAX` | `GOMEMLIMIT` | `est_peak_rss` |
+| --- | --- | --- | --- | --- | --- |
+| 2 GiB | 1× | 4 MiB | 64 MiB | 1200 MiB | 513 MiB (25%) |
+| 4 GiB | 2× | 8 MiB | 128 MiB | 2400 MiB | 703 MiB (17%) |
+| 8 GiB | 4× | 16 MiB | 256 MiB | 4800 MiB | 1083 MiB (13%) |
+
+**At 2 GiB every derived value is byte-identical to what shipped**, so every measurement
+above stays valid. Change `limits.memory` and the caps follow.
+
+Two things this deliberately does not do. It does not size *scratch* — an emptyDir's
+`sizeLimit` is enforced by the kubelet, not the filesystem, so `statfs` inside the
+container reports the whole node's disk and would license a budget that gets the pod
+evicted; declare it with `SCRATCH_BYTES` instead. And it does not override an explicit
+environment variable: setting one still wins, and still freezes that value at whatever
+the pod was when you typed it.
+
+An undetectable limit (`pod_memory_bytes: 0` in the startup log) falls back to the
+measured 2 GiB defaults rather than extrapolating from a number nobody has.
+
+> **Check `pod_cpus` in the startup log.** Go derives `GOMAXPROCS` from the cgroup CPU
+> limit, but only under cgroup v2. On a cgroup v1 node it reports the *node's* core
+> count, so the runtime schedules many more threads than the pod has CPU for and pays
+> GC coordination overhead for them. If `pod_cpus` is much larger than your
+> `limits.cpu`, set `GOMAXPROCS` explicitly to match.
+
 **The multiplier depends on the shape of the object, not just its size.**
 `go test ./internal/pipeline -run TestMemoryMatrix` measures peak heap across container
 formats, member counts, match densities and compressibility. The worst case is not the
@@ -297,6 +335,39 @@ stops bounding memory and starts silently emitting unscrubbed files instead, whi
 like a pass if you only watch RSS — or if the service leaves a temp file behind, which
 would fill the `/work` emptyDir over days and get the pod evicted for a reason that looks
 nothing like its cause.
+
+### Where it actually fails
+
+Measured end to end against real MinIO, one 1-CPU process, with zips of log-shaped
+text. "Expanded" is the sum of member bodies; the compressed object is much smaller.
+
+| Pod | Caps in force | Bundle | Result |
+| --- | --- | --- | --- |
+| 2 GiB | expand 1536Mi, object 640Mi | 1.37 GiB expanded, 280 members | **scrubbed**, `complete`, 32.3M matches, 7m17s, peak RSS 130 MiB |
+| 2 GiB | same | 1.66 GiB expanded, 340 members | **refused** — `guard-tripped` / `expansion-budget` after 5.3s, emitted byte-for-byte, verdict `incomplete` |
+| 8 GiB | `SCRATCH_BYTES=12Gi` → expand 4.8Gi, object 2Gi | 1.66 GiB expanded, 340 members | **scrubbed**, `complete`, 39.2M matches, 8m38s, peak RSS ~890 MiB |
+
+Three things worth taking from this:
+
+- **The ceiling is the configured cap, not a cliff.** Nothing OOMs at the boundary.
+  Over-budget input trips a guard in seconds, is passed through verbatim and is named
+  with reason `expansion-budget`. Peak RSS at 2 GiB was 130 MiB — 6% of the pod — because
+  what bounds memory is the spill policy, not the bundle.
+- **Raising the pod raises the ceiling with no code or knob edits.** The identical object
+  that was refused at 2 GiB scrubbed completely at 8 GiB; only `limits.memory` and
+  `SCRATCH_BYTES` changed. Throughput per member was the same (0.64 vs 0.68 files/s) —
+  more memory buys *capacity*, not speed. Speed is CPU-bound and the pod has one core.
+- **The practical ceilings**, with the shipped ratios: roughly **640 MiB compressed /
+  1.5 GiB expanded at 2 GiB**, and **2 GiB compressed / 4.8 GiB expanded at 8 GiB with
+  12 GiB of scratch declared.**
+
+> ⚠️ **An over-budget bundle is flagged but not diverted.** The residual scan cannot see
+> inside a container the budget refused to decompress, so the run reports `incomplete`
+> rather than `incomplete-risky` and the output lands in the **normal** output bucket,
+> not under `review/`. It is named in the report with reason `expansion-budget`, but
+> nothing physically separates it from finished work. If your bundles approach the cap,
+> alert on `scrubber_files_not_inspected_total{reason="expansion-budget"}` rather than
+> relying on the review queue.
 
 > **What still does not fit.** A single archive *member* larger than the memory budget:
 > the leaf scrubber needs its payload contiguous in memory, so spilling does not help
@@ -356,10 +427,12 @@ Supplied as environment variables, in practice via a ConfigMap plus a Secret.
 | `WORKERS` | `1` | Clamped to 1; higher values warn and are ignored. |
 | `QUEUE_MAX` | `10000` | Cap on the in-memory pending set; the service warns when it truncates. |
 | `FINALIZE_GRACE` | `15s` | On shutdown, how long a finished object may keep writing its output. Keep inside `terminationGracePeriodSeconds`. |
-| `MAX_OBJECT_BYTES` | 640Mi | Ceiling on the uploaded (compressed) object. |
-| `MAX_EXPAND_BYTES` | 1536Mi | Cumulative decompressed bytes. Now mostly a **disk** bound. |
-| `SPILL_THRESHOLD` | 4Mi | Payloads above this go to `/work` individually. |
-| `SPILL_RESIDENT_MAX` | 64Mi | Aggregate in-memory budget. **This is what bounds RSS.** |
+| `SCRATCH_BYTES` | — | How much scratch one object may use. **Set this equal to the `/work` emptyDir `sizeLimit`.** `MAX_EXPAND_BYTES` and `MAX_OBJECT_BYTES` are derived from it. |
+| `MAX_OBJECT_BYTES` | *derived* | Ceiling on the uploaded (compressed) object. Derived as 41.7% of `MAX_EXPAND_BYTES`; 640Mi when `SCRATCH_BYTES` is unset. |
+| `MAX_EXPAND_BYTES` | *derived* | Cumulative decompressed bytes. Derived as `SCRATCH_BYTES / 2.5`; 1536Mi when unset. Mostly a **disk** bound. |
+| `SPILL_THRESHOLD` | *derived* | Payloads above this go to `/work` individually. Scaled from the pod's memory (4Mi at 2Gi), floored at 512Ki. |
+| `SPILL_RESIDENT_MAX` | *derived* | Aggregate in-memory budget. **This is what bounds RSS.** Scaled from the pod's memory (64Mi at 2Gi). |
+| `STALL_WARN_AFTER` | `5m` | How long the in-flight object may sit in one phase before the worker logs that it may be stalled. A log threshold, never a kill. Zero disables. |
 | `RESIDUAL_BUDGET` | 64Mi | Per-object budget for the residual scan; negative disables it. |
 | `VERIFY_OUTPUT` | `false` | Re-scan scrubbed output (~70% slower). |
 | `REVIEW_PREFIX` | `review/` | Where risky results are diverted; empty disables diverting. |
@@ -369,7 +442,7 @@ Supplied as environment variables, in practice via a ConfigMap plus a Secret.
 | `MAX_DEPTH` | `16` | Container nesting depth. |
 | `MAX_MEMBERS` | `100000` | Archive member cap. |
 | `HISTORY_MAX` | `100` | Past runs `/api/history` may return. |
-| `GOMEMLIMIT` | `1200MiB` | Soft GC target. Keep below `limits.memory`. |
+| `GOMEMLIMIT` | *derived* | Soft GC target, 58.6% of the detected pod memory (1200MiB at 2Gi). Keep below `limits.memory`. |
 | `LOG_LEVEL` | `info` | `debug` logs a line per file inside every bundle. |
 | `PORT` | `8080` | Listen port. |
 | `MINIO_PUBLIC_ENDPOINT` / `MINIO_PUBLIC_TLS` | — | Browser-reachable MinIO host, for rewriting presigned URLs. |
@@ -427,6 +500,7 @@ scale-out needs a distributed object claim and is a documented follow-up).
 | `scrubber_residual_hits_total` | Policy matches found inside content that was NOT inspected |
 | `scrubber_queue_wait_seconds` | Arrival → start of scrubbing |
 | `scrubber_object_latency_seconds` | Arrival → finished; what a user actually waits |
+| `scrubber_inflight_phase_seconds` | Seconds the in-flight object has spent in its current phase, 0 when idle. **The series that separates a slow object from a wedged one** — neither probe can, since `/healthz` answers 200 whatever the worker is doing and `/readyz` only says the backend is reachable |
 
 `scrubber_process_seconds` starts counting only once an object reaches the front of the
 queue, so it cannot show what someone behind a backlog experiences —
@@ -464,7 +538,28 @@ knows — and record where the output landed, so downloads keep working even whe
 scrubbing renamed the output.
 
 While a job is in flight the status response carries real progress (`files_done`,
-`current_file`, `phase`) rather than a client-side animation.
+`current_file`, `phase`, `phase_seconds`) rather than a client-side animation.
+
+**The phases, and why `unpacking` is named separately:**
+
+| Phase | What is happening | `files_done` |
+| --- | --- | --- |
+| `queued` | Waiting its turn. The bar deliberately does not move. | 0 |
+| `reading` | Streaming the object out of MinIO onto scratch. | 0 |
+| `unpacking` | Expanding the container. | 0 |
+| `scrubbing` | Members going through the matcher. | counts up |
+| `writing` | Output, report and digest being stored. | final |
+
+`unpacking` exists because it is the one stage that can report no per-file progress at
+all: a container is expanded in full before its first member reaches the matcher, so
+`files_done` is pinned at 0 for however long that takes. On a 1.4 GiB zip it is about six
+seconds; on a backend read that never returns it is unbounded.
+
+The page used to paper over that gap by advancing the bar 2% per poll to 95%, which it
+reached 42 seconds after upload and then held indefinitely. A bundle that finished in
+four minutes and one wedged forever looked identical, and the number on screen was a
+timer rather than a measurement. It now holds the bar and shows `phase_seconds`, which is
+real — and `scrubber_inflight_phase_seconds` exposes the same signal to alerting.
 
 **While an object is waiting**, `/api/status` returns `phase: "queued"` with
 `queue_position` and `queue_depth`, and the UI shows "Queued — 3 of 7". That answer comes

@@ -188,6 +188,15 @@
   var totals={}, labelRows={}, ruleData=[];
 
   function esc(s){return String(s).replace(/[&<>]/g,function(c){return{'&':'&amp;','<':'&lt;','>':'&gt;'}[c];});}
+  // Elapsed time in a phase that reports no other progress. Shown instead of a
+  // bar so a long unpack reads as "still working, 4m12s in" rather than as a
+  // percentage nothing measured.
+  function fmtDur(s){
+    if(s<60) return s+'s';
+    var m=Math.floor(s/60), r=s%60;
+    if(m<60) return m+'m'+(r<10?'0':'')+r+'s';
+    return Math.floor(m/60)+'h'+((m%60)<10?'0':'')+(m%60)+'m';
+  }
 
   // The policy can hold hundreds of terms. The list is filterable, grouped into
   // collapsible sections, scrolls within a fixed height, and caps how many rows
@@ -342,8 +351,16 @@
           st.textContent=(s.phase==='writing'?'Writing… ':'Scrubbing… ')+s.files_done+' file'+(s.files_done===1?'':'s');
           if(s.current_file) st.title=s.current_file;
         } else {
-          creep=Math.min(95,creep+2);
-          st.textContent=isArch?'Unpacking…':'Scrubbing…';
+          // Unpacking: a container is expanded in full before its first member is
+          // scrubbed, so there is no per-file progress to report yet and the bar
+          // must NOT invent any. It used to creep +2% per poll to 95%, which it
+          // reached 42s after upload and then held indefinitely — so a bundle that
+          // finished in four minutes and one wedged on a stalled backend read
+          // looked identical, and the number shown was a timer, not progress.
+          // Hold the bar and report the elapsed phase time, which is real.
+          var secs=Math.round(s.phase_seconds||0);
+          st.textContent=(isArch?'Unpacking':'Reading')+(secs?' — '+fmtDur(secs):'…');
+          st.title='No per-file progress is available until the container is fully expanded';
         }
         setp(creep);
         setTimeout(function(){poll(key,creep);},1200);

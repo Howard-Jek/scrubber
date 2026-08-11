@@ -105,6 +105,30 @@ func RegisterQueue(reg prometheus.Registerer, depth, inflight func() float64) {
 	)
 }
 
+// RegisterProgress publishes how long the in-flight object has been in its
+// current stage, and 0 when nothing is in flight.
+//
+// This is the series that distinguishes a slow object from a wedged one, and
+// until it existed there was no way to tell them apart from outside the process.
+// A liveness probe cannot: /healthz answers 200 whatever the worker is doing, and
+// making it fail on a long scrub would kill legitimate work — a large bundle
+// genuinely takes minutes. Per-file progress cannot either, because the stage
+// where objects actually wedge (expanding a container, or a backend read that
+// never returns) is precisely the one that reports no files.
+//
+// A GaugeFunc rather than a tracked value on purpose: a stalled worker updates
+// nothing, so a gauge it has to push would freeze at its last value and look
+// healthy. This one is read at scrape time and keeps climbing.
+//
+// Alert on it above the slowest scrub you are willing to call normal.
+func RegisterProgress(reg prometheus.Registerer, phaseSeconds func() float64) {
+	reg.MustRegister(prometheus.NewGaugeFunc(prometheus.GaugeOpts{
+		Name: "scrubber_inflight_phase_seconds",
+		Help: "Seconds the in-flight object has spent in its current phase (0 when idle). " +
+			"Climbing without bound means a stalled object, not a slow one.",
+	}, phaseSeconds))
+}
+
 // SinceClamped returns the elapsed time from t to now, never negative.
 //
 // Arrival times come from the object store's clock and the elapsed time is computed
@@ -158,9 +182,34 @@ type Job struct {
 	// on a timer.
 	FilesDone   int    `json:"files_done"`
 	CurrentFile string `json:"current_file,omitempty"`
-	// Phase is a coarse label for the current stage: "reading", "scrubbing",
-	// "writing". Empty once the job is finished.
+	// Phase is a coarse label for the current stage: "reading", "unpacking",
+	// "scrubbing", "writing". Empty once the job is finished.
+	//
+	// "unpacking" exists because it is the one stage that reports no per-file
+	// progress: a container is fully expanded before its first member can be
+	// scrubbed, so FilesDone stays 0 throughout however long it takes. Without a
+	// name for it the client could not tell "expanding a large archive" from
+	// "wedged", and invented a timer-driven bar to cover the gap.
 	Phase string `json:"phase,omitempty"`
+	// PhaseSince is when Phase was last set. It is what makes a stalled object
+	// diagnosable: a phase that has not changed for far longer than its work
+	// should take is the signal, and it is the only one available while
+	// FilesDone is pinned at 0.
+	PhaseSince time.Time `json:"-"`
+}
+
+// PhaseSeconds reports how long the job has been in its current phase.
+//
+// Zero when there is no phase to time: a finished job (Phase is cleared on
+// completion) or a record from a process that predates the stamp. Without the
+// Phase check a completed job keeps reporting a number that climbs forever, which
+// is exactly the kind of meaningless-but-plausible figure this field was added to
+// get rid of.
+func (j Job) PhaseSeconds() float64 {
+	if j.Phase == "" || j.PhaseSince.IsZero() {
+		return 0
+	}
+	return time.Since(j.PhaseSince).Seconds()
 }
 
 // Done reports whether the job reached a terminal state.

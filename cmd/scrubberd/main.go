@@ -13,6 +13,7 @@ import (
 	"net/http"
 	"os"
 	"os/signal"
+	"runtime/debug"
 	"strconv"
 	"strings"
 	"sync"
@@ -22,6 +23,7 @@ import (
 	"github.com/fsnotify/fsnotify"
 	"github.com/howard/scrubber/internal/metrics"
 	"github.com/howard/scrubber/internal/pipeline"
+	"github.com/howard/scrubber/internal/podres"
 	"github.com/howard/scrubber/internal/policy"
 	"github.com/howard/scrubber/internal/report"
 	"github.com/howard/scrubber/internal/server"
@@ -109,6 +111,39 @@ func realMain(log *slog.Logger) error {
 		return fmt.Errorf("AUDIT_LEVEL: %w", err)
 	}
 
+	// --- size the caps against the pod we actually got ---
+	//
+	// Every number below was measured on a 2 GiB / 1 CPU pod and then compiled in
+	// as a default, which silently made 2 GiB the only size the service was tuned
+	// for. On a 4 or 8 GiB pod it left most of the memory idle and scrubbed no
+	// faster; the operator's only recourse was to raise the spill knobs by hand,
+	// and raising them too far turns spilling off and reproduces the OOM the spill
+	// exists to prevent.
+	//
+	// So the measured values become a *ratio* to the pod they were measured on,
+	// and the ceiling is read from the cgroup at startup. At 2 GiB every derived
+	// value is byte-identical to what shipped, which keeps every published
+	// measurement valid; at 8 GiB they are 4x. An explicit environment variable
+	// still wins over all of it — this changes defaults, not policy.
+	res := podres.Detect()
+	memScale := podScale(res.MemoryBytes)
+	scaled := func(base int64) int64 { return int64(float64(base) * memScale) }
+
+	// Scratch is a separate ceiling and cannot be detected the same way: /work is
+	// an emptyDir whose sizeLimit is enforced by the kubelet, not by the
+	// filesystem, so statfs inside the container reports the whole node's disk and
+	// would license a budget that gets the pod evicted. It has to be declared.
+	// Unset means keep the shipped defaults rather than guess.
+	maxExpandDefault, maxObjectDefault := int64(1536<<20), int64(640<<20)
+	scratchBytes := envInt64("SCRATCH_BYTES", 0)
+	if scratchBytes > 0 {
+		maxExpandDefault = int64(float64(scratchBytes) / scratchFactor)
+		// Preserve the shipped ratio between the compressed-object ceiling and the
+		// expansion budget (640Mi of 1536Mi), so raising one raises the other and
+		// MAX_OBJECT_BYTES stays the limit a user hits first.
+		maxObjectDefault = int64(float64(maxExpandDefault) * shippedObjectShare)
+	}
+
 	wcfg := worker.Config{
 		InputBucket:     inputBucket,
 		OutputBucket:    mustEnv("OUTPUT_BUCKET"),
@@ -127,8 +162,9 @@ func realMain(log *slog.Logger) error {
 		QueueMax: envInt("QUEUE_MAX", 10000),
 		// Defaults match the shipped manifest. They used to disagree with it and
 		// with the README, which made the startup memory arithmetic unverifiable.
-		MaxObjectBytes: envInt64("MAX_OBJECT_BYTES", 640<<20),
+		MaxObjectBytes: envInt64("MAX_OBJECT_BYTES", maxObjectDefault),
 		FinalizeGrace:  envDuration("FINALIZE_GRACE", 15*time.Second),
+		StallWarnAfter: envDuration("STALL_WARN_AFTER", 5*time.Minute),
 		Audit:          audit,
 		RedactReports:  envBool("REDACT_REPORTS", false),
 		ScrubNames:     envBool("SCRUB_FILENAMES", true),
@@ -139,7 +175,7 @@ func realMain(log *slog.Logger) error {
 			// just limits.memory — an ephemeral-storage eviction kills a pod as dead
 			// as an OOM. See deploy/openshift-manifests.yaml for the arithmetic and
 			// scripts/memory-matrix.sh for how to re-derive it after any change.
-			MaxTotalBytes: envInt64("MAX_EXPAND_BYTES", 1536<<20),
+			MaxTotalBytes: envInt64("MAX_EXPAND_BYTES", maxExpandDefault),
 			MaxMembers:    envInt("MAX_MEMBERS", 100000),
 			// Bytes the residual scan may read across one object. Negative disables
 			// it, which removes the only check that does not depend on the pipeline's
@@ -156,8 +192,8 @@ func realMain(log *slog.Logger) error {
 				// in-memory payloads exceed SPILL_RESIDENT_MAX everything spills
 				// regardless of size. The second limit is the one that catches an
 				// archive of many small members, which the memory matrix ranks worst.
-				Threshold:   envInt64("SPILL_THRESHOLD", 4<<20),
-				ResidentMax: envInt64("SPILL_RESIDENT_MAX", 64<<20),
+				Threshold:   envInt64("SPILL_THRESHOLD", max64(scaled(4<<20), minSpillThreshold)),
+				ResidentMax: envInt64("SPILL_RESIDENT_MAX", scaled(64<<20)),
 			},
 		},
 	}
@@ -191,6 +227,20 @@ func realMain(log *slog.Logger) error {
 	sp := wcfg.Limits.Spill
 	estPeak := int64(float64(sp.ResidentMax+leafCopies*sp.Threshold)*peakRSSFactor) +
 		runtimeBaselineBytes + int64(wcfg.Limits.MaxMembers)*perMemberBytes
+	scratch := int64(scratchFactor * float64(wcfg.Limits.MaxTotalBytes))
+
+	// Let the GC know the ceiling too. Go applies GOMEMLIMIT from the environment
+	// at init, so setting it here would override an operator's explicit value —
+	// only derive one when they have not. Scaled from the same measured baseline
+	// as the spill policy: the two have to move together, because GOMEMLIMIT only
+	// holds while the live set fits underneath it, and the spill policy is what
+	// bounds the live set.
+	if os.Getenv("GOMEMLIMIT") == "" && res.MemoryBytes > 0 {
+		lim := scaled(1200 << 20)
+		debug.SetMemoryLimit(lim)
+		log.Info("derived GOMEMLIMIT from the detected pod memory", "bytes", lim)
+	}
+
 	log.Info("resource limits",
 		"max_object_bytes", wcfg.MaxObjectBytes,
 		"max_expand_bytes", wcfg.Limits.MaxTotalBytes,
@@ -201,7 +251,28 @@ func realMain(log *slog.Logger) error {
 		"queue_max", wcfg.QueueMax,
 		"budget_bytes", budget,
 		"est_peak_rss_bytes", estPeak,
-		"scratch_bytes", int64(scratchFactor*float64(wcfg.Limits.MaxTotalBytes)))
+		"scratch_bytes", scratch,
+		// What the sizing was derived from, so the numbers above can be checked
+		// rather than taken on faith. pod_memory_bytes 0 means detection failed
+		// and the measured 2 GiB defaults are in force.
+		"pod_memory_bytes", res.MemoryBytes,
+		"pod_memory_source", res.MemorySource,
+		"pod_cpus", res.CPUs,
+		"mem_scale", memScale)
+
+	// Two ways to get this wrong that are worth naming at startup rather than
+	// leaving to be discovered as an eviction or an OOM under load.
+	if res.MemoryBytes > 0 && estPeak > res.MemoryBytes*peakRSSGatePercent/100 {
+		log.Warn("estimated peak RSS is above the safe share of the pod's memory; "+
+			"lower SPILL_RESIDENT_MAX / SPILL_THRESHOLD / MAX_MEMBERS, or raise limits.memory",
+			"est_peak_rss_bytes", estPeak, "pod_memory_bytes", res.MemoryBytes,
+			"gate_percent", peakRSSGatePercent)
+	}
+	if scratchBytes > 0 && scratch > scratchBytes {
+		log.Warn("scratch needed for one object exceeds the declared SCRATCH_BYTES; "+
+			"an ephemeral-storage eviction kills the pod as dead as an OOM",
+			"scratch_bytes_needed", scratch, "scratch_bytes_declared", scratchBytes)
+	}
 
 	// Reclaim scratch stranded by a previous process before taking any work.
 	// Blob.Close removes spilled files, and a SIGKILL never runs it, so whatever
@@ -221,6 +292,11 @@ func realMain(log *slog.Logger) error {
 	metrics.RegisterQueue(promReg,
 		func() float64 { return float64(wk.Queue().Depth()) },
 		func() float64 { return float64(wk.Queue().Inflight()) })
+	// The series that separates "slow" from "wedged". Neither probe below can:
+	// /healthz is a pure liveness signal that answers 200 whatever the worker is
+	// doing, and /readyz only says the backend is reachable — a stalled read
+	// leaves both green indefinitely.
+	metrics.RegisterProgress(promReg, wk.InflightPhaseSeconds)
 
 	// --- control + browser API server ---
 	// Readiness is checked every few seconds by the kubelet. Probing MinIO on
@@ -285,6 +361,26 @@ func realMain(log *slog.Logger) error {
 	return err
 }
 
+// podScale converts a detected pod memory ceiling into the multiplier applied to
+// the defaults measured at baselineMemBytes.
+//
+// Returns 1 when the ceiling is unknown, which reproduces exactly the caps that
+// shipped: an undetectable limit must fall back to a measured configuration, not
+// to an extrapolation from a number nobody has.
+func podScale(memBytes int64) float64 {
+	if memBytes <= 0 {
+		return 1
+	}
+	return float64(memBytes) / float64(baselineMemBytes)
+}
+
+func max64(a, b int64) int64 {
+	if a > b {
+		return a
+	}
+	return b
+}
+
 const (
 	// readyProbeTimeout bounds a single backend reachability check.
 	readyProbeTimeout = 3 * time.Second
@@ -297,6 +393,25 @@ const (
 	// leafCopies is how many copies of a payload the leaf scrubber briefly holds:
 	// the bytes, the string the matcher needs, and the scrubbed result.
 	leafCopies = 3
+	// baselineMemBytes is the pod every default in this file was measured on. The
+	// caps are stored as a ratio to it rather than as absolutes, so a pod of a
+	// different size gets proportional caps instead of 2 GiB's. Changing this
+	// invalidates every published measurement — change the ratios instead.
+	baselineMemBytes = 2 << 30
+	// minSpillThreshold floors the per-payload spill threshold as it scales down.
+	// The threshold exists to keep an archive of many small members from creating
+	// one file per member; scaled linearly onto a very small pod it would fall low
+	// enough to do exactly that, trading memory pressure for inode pressure.
+	minSpillThreshold = 512 << 10
+	// shippedObjectShare is MAX_OBJECT_BYTES as a fraction of MAX_EXPAND_BYTES in
+	// the measured configuration (640Mi of 1536Mi). Held constant when the caps
+	// are derived from SCRATCH_BYTES so the compressed-object ceiling stays the
+	// limit a user hits first, which is the one with a clear error message.
+	shippedObjectShare = 640.0 / 1536.0
+	// peakRSSGatePercent is the share of pod memory the estimate may reach before
+	// startup warns. Matches the gate scripts/memory-matrix.sh fails on, so the
+	// service and the benchmark agree on what "too close" means.
+	peakRSSGatePercent = 60
 	// runtimeBaselineBytes is the Go runtime, the compiled policy and the HTTP
 	// server — what the process costs before it touches an object.
 	runtimeBaselineBytes = 128 << 20

@@ -516,7 +516,12 @@ func jobStatusPayload(j metrics.Job) map[string]any {
 		"files_done":        j.FilesDone,
 		"current_file":      j.CurrentFile,
 		"phase":             j.Phase,
-		"output_key":        j.OutputKey,
+		// How long this phase has lasted. During "unpacking" it is the only
+		// movement there is to report — FilesDone cannot advance until the
+		// container is fully expanded — so the client shows this instead of
+		// animating a bar it has no basis for.
+		"phase_seconds": j.PhaseSeconds(),
+		"output_key":    j.OutputKey,
 	}
 }
 

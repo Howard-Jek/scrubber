@@ -237,6 +237,38 @@ func TestStatusReportsLiveProgress(t *testing.T) {
 	}
 }
 
+// TestStatusReportsUnpackingPhase pins the contract the upload page relies on
+// while a container is being expanded.
+//
+// A container is unpacked in full before its first member reaches the matcher, so
+// FilesDone is pinned at 0 for that whole window however long it lasts. The page
+// used to fill the gap by advancing a bar 2% per poll to 95% — a timer, not
+// progress — which made a four-minute unpack and one wedged on a stalled backend
+// read look identical. The phase and how long it has lasted are the only real
+// signals here, so both must reach the client.
+func TestStatusReportsUnpackingPhase(t *testing.T) {
+	jobs := metrics.NewJobLog(10)
+	jobs.Upsert(metrics.Job{Key: "big.zip", Status: "processing", Phase: "unpacking",
+		FilesDone: 0, PhaseSince: time.Now().Add(-90 * time.Second), Timestamp: time.Now()})
+
+	h := newTestServer(jobs, newArchive())
+	_, body := getJSON(t, h, "/api/status?key=big.zip")
+
+	if body["phase"] != "unpacking" {
+		t.Errorf("phase = %v, want unpacking", body["phase"])
+	}
+	if body["files_done"] != float64(0) {
+		t.Errorf("files_done = %v, want 0", body["files_done"])
+	}
+	secs, ok := body["phase_seconds"].(float64)
+	if !ok {
+		t.Fatalf("phase_seconds missing or not a number: %v", body["phase_seconds"])
+	}
+	if secs < 60 {
+		t.Errorf("phase_seconds = %v, want >= 60 (the client shows this instead of a bar)", secs)
+	}
+}
+
 // TestStaleProcessingRecordFallsBackToStorage covers the case where this process
 // still believes an object is in flight — a worker that died mid-write, or one
 // re-processing the same object every poll because finalizing the input failed —

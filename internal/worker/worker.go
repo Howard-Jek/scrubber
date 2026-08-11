@@ -65,6 +65,14 @@ type Config struct {
 	// the process is already shutting down. Keep it inside the pod's
 	// terminationGracePeriodSeconds.
 	FinalizeGrace time.Duration
+	// StallWarnAfter is how long the in-flight object may sit in one phase before
+	// the worker starts logging that it may be stalled. Zero disables the check.
+	//
+	// It is a log threshold, never a kill: a large bundle legitimately spends many
+	// minutes in one phase, so anything that acted on this automatically would
+	// destroy real work. The judgement of what is too long belongs to whoever
+	// knows the bundles, which is not this process.
+	StallWarnAfter time.Duration
 	// Audit is how much per-match detail the stored report retains. See
 	// ParseAuditLevel: this is a memory setting as much as a disclosure one.
 	Audit         report.AuditLevel
@@ -193,14 +201,83 @@ func (w *Worker) Depth() int { return w.q.Depth() }
 // Snapshot returns the in-flight keys and up to limit pending keys, in queue order.
 func (w *Worker) Snapshot(limit int) (inflight, pending []string) { return w.q.Snapshot(limit) }
 
+// InflightPhaseSeconds reports how long the object being scrubbed has been in its
+// current phase, or 0 when nothing is in flight.
+//
+// Read on demand rather than published by the worker, because the case it exists
+// to expose is the worker not running: a value the worker had to push would stop
+// being updated by exactly the stall it is meant to reveal.
+func (w *Worker) InflightPhaseSeconds() float64 {
+	inflight, _ := w.q.Snapshot(0)
+	if len(inflight) == 0 {
+		return 0
+	}
+	j, ok := w.jobs.Get(inflight[0])
+	if !ok || j.Done() {
+		return 0
+	}
+	return j.PhaseSeconds()
+}
+
+// watchStalls logs when the in-flight object has sat in one phase longer than
+// StallWarnAfter, and again on each subsequent interval until it moves.
+//
+// The metric alone is enough for someone already watching a dashboard. This is
+// for the far more common case of reading the pod's logs after a user reports
+// that an upload is stuck: without it the log's last line is "processing object",
+// which is equally consistent with working and with wedged.
+func (w *Worker) watchStalls(ctx context.Context) {
+	every := w.cfg.StallWarnAfter
+	if every <= 0 {
+		return
+	}
+	t := time.NewTicker(every)
+	defer t.Stop()
+	warned := ""
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-t.C:
+			inflight, _ := w.q.Snapshot(0)
+			if len(inflight) == 0 {
+				warned = ""
+				continue
+			}
+			key := inflight[0]
+			j, ok := w.jobs.Get(key)
+			if !ok || j.Done() {
+				continue
+			}
+			secs := j.PhaseSeconds()
+			if secs < every.Seconds() {
+				// Phase changed recently: it is moving, just not quickly.
+				warned = ""
+				continue
+			}
+			stamp := key + "|" + j.Phase
+			level := "still"
+			if warned != stamp {
+				level = "now"
+				warned = stamp
+			}
+			w.log.Warn("object has not changed phase for an unusually long time; "+
+				"it may be stalled rather than slow",
+				"key", key, "phase", j.Phase, "phase_seconds", int64(secs),
+				"files_done", j.FilesDone, "state", level)
+		}
+	}
+}
+
 // Run starts the producer and the single consumer and returns once both have
 // stopped, which happens after ctx is cancelled. Callers should wait for it during
 // shutdown so the process does not exit while an object is mid-flight.
 func (w *Worker) Run(ctx context.Context) {
 	var wg sync.WaitGroup
-	wg.Add(2)
+	wg.Add(3)
 	go func() { defer wg.Done(); w.discover(ctx) }()
 	go func() { defer wg.Done(); w.consume(ctx) }()
+	go func() { defer wg.Done(); w.watchStalls(ctx) }()
 	wg.Wait()
 	w.log.Info("worker stopped")
 }
@@ -402,6 +479,7 @@ func (w *Worker) processObject(ctx context.Context, o store.Object) {
 	// "not found" and waited forever while the finished object sat in the bucket.
 	job.Status = "processing"
 	job.Phase = "reading"
+	job.PhaseSince = time.Now()
 	w.jobs.Upsert(job)
 	w.log.Info("processing object", "key", o.Key, "size", o.Size)
 
@@ -499,10 +577,24 @@ func (w *Worker) processObject(ctx context.Context, o store.Object) {
 
 	// Stream per-file progress: log every file as it is handled and keep the job
 	// record current so a polling client sees real movement through the bundle.
-	job.Phase = "scrubbing"
+	//
+	// The phase starts at "unpacking", not "scrubbing". A container is expanded in
+	// full before its first member reaches the matcher, so nothing can increment
+	// FilesDone until that finishes — on a 1.4 GiB zip that window is seconds, but
+	// on a stalled backend read it is unbounded. Claiming "scrubbing" through it
+	// told a client the one thing that was certainly not happening, and left it
+	// with no way to distinguish slow from wedged.
+	job.Phase = "unpacking"
+	job.PhaseSince = time.Now()
+	w.jobs.Upsert(job)
 	filesDone := 0
 	rep.OnFile(func(f report.FileEntry) {
 		filesDone++
+		if filesDone == 1 {
+			// First member out of the container: unpacking is demonstrably over.
+			job.Phase = "scrubbing"
+			job.PhaseSince = time.Now()
+		}
 		w.log.Debug("scrubbed file", "key", o.Key, "path", f.Path, "status", f.Status,
 			"bytes_in", f.BytesIn, "bytes_out", f.BytesOut, "detail", f.Detail)
 		if f.Status != report.StatusScrubbed && f.Status != report.StatusUnchanged {
@@ -547,6 +639,7 @@ func (w *Worker) processObject(ctx context.Context, o store.Object) {
 	}
 
 	job.Phase = "writing"
+	job.PhaseSince = time.Now()
 	job.FilesDone = filesDone
 	w.jobs.Upsert(job)
 

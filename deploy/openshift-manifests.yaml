@@ -64,13 +64,28 @@ data:
   QUEUE_MAX: "10000"              # cap on the in-memory pending set. Anything beyond
                                   # it stays in the bucket and is picked up later;
                                   # the service warns when it truncates.
+  # How long the in-flight object may sit in ONE phase before the worker starts
+  # logging that it may be stalled rather than slow. A log threshold, never a
+  # kill: a large bundle legitimately spends minutes in one phase. Pair it with an
+  # alert on scrubber_inflight_phase_seconds, which is the same signal as a metric.
+  STALL_WARN_AFTER: "5m"
   FINALIZE_GRACE: "15s"           # on shutdown, how long an object that has already
                                   # finished scrubbing may keep writing its output,
                                   # report and digest. Without this a SIGTERM lands
                                   # mid-object and discards a completed scrub, which
                                   # then has to be redone after the restart. Keep it
                                   # inside terminationGracePeriodSeconds below.
-  MAX_OBJECT_BYTES: "671088640"   # 640Mi compressed input. Larger objects are
+  # SCRATCH_BYTES declares how much scratch one object may use, and MUST match the
+  # /work emptyDir sizeLimit at the bottom of this file. It cannot be detected:
+  # an emptyDir's sizeLimit is enforced by the kubelet, not the filesystem, so
+  # statfs inside the container reports the whole node's disk and would license a
+  # budget that gets the pod evicted.
+  #
+  # MAX_EXPAND_BYTES and MAX_OBJECT_BYTES are derived from it (expansion =
+  # SCRATCH_BYTES / 2.5, object = 41.7% of that, the ratios the shipped numbers
+  # were measured at). Set either one explicitly below to override the derivation.
+  SCRATCH_BYTES: "4294967296"     # 4Gi — keep equal to the /work sizeLimit
+  # MAX_OBJECT_BYTES: "671088640"   # 640Mi compressed input. Larger objects are
                                   # skipped without being downloaded whole and
                                   # counted in scrubber_objects_total{status=
                                   # "too_large"}. Watch that counter: it is how you
@@ -78,7 +93,7 @@ data:
                                   # Raised from 64Mi, which rejected ordinary
                                   # bundles outright before the spill made them
                                   # processable.
-  MAX_EXPAND_BYTES: "1610612736"  # 1536Mi cumulative decompressed bytes per object,
+  # MAX_EXPAND_BYTES: "1610612736"  # 1536Mi cumulative decompressed bytes per object,
                                   # enforced *while* reading so it is a real budget
                                   # rather than a ratio heuristic. Members spill, so
                                   # this is now a DISK bound: keep the /work
@@ -87,11 +102,19 @@ data:
                                   # once for the decompressed tar, once for the
                                   # member bodies read out of it. Effective capacity
                                   # for a tar.gz is therefore ~768Mi of content.
-  SPILL_THRESHOLD: "4194304"      # 4Mi. Payloads larger than this go to /work on
+  # The two SPILL_* settings and GOMEMLIMIT are now DERIVED from the pod's own
+  # memory limit, read from the cgroup at startup. The values below are what a
+  # 2Gi pod derives; a 4Gi pod gets double and an 8Gi pod quadruple, with no edit
+  # here. They are left commented rather than deleted because setting either one
+  # explicitly is still the override — and note that doing so freezes it: a
+  # hard-coded SPILL_RESIDENT_MAX is exactly what stopped the service using a
+  # larger pod, and raising it far enough to matter turns spilling off and brings
+  # back the OOM the spill exists to prevent. Prefer changing limits.memory.
+  # SPILL_THRESHOLD: "4194304"      # 4Mi. Payloads larger than this go to /work on
                                   # their own. Below it they stay on the heap, which
                                   # keeps a 20000-member archive from creating 20000
                                   # files.
-  SPILL_RESIDENT_MAX: "67108864"  # 64Mi aggregate in-memory budget. This is the one
+  # SPILL_RESIDENT_MAX: "67108864"  # 64Mi aggregate in-memory budget. This is the one
                                   # that catches many-small-members bundles: each
                                   # payload is individually under the threshold while
                                   # together they would hold the whole archive. Once
@@ -125,7 +148,7 @@ data:
   # the measured peak is 445Mi (22% of the limit) with this target, across both worst
   # shapes: 90000 tiny members and a 500Mi incompressible bundle. This is the value
   # ./scripts/memory-matrix.sh measured at; change it and re-run that script.
-  GOMEMLIMIT: "1200MiB"
+  # GOMEMLIMIT: "1200MiB"          # derived as 58.6% of the detected pod memory
   # Web UI: browser uploads straight to MinIO via presigned URLs, so the browser
   # must be able to reach MinIO. Set these to MinIO's externally reachable host.
   # (MinIO also needs CORS allowing the scrubber Route origin.)
