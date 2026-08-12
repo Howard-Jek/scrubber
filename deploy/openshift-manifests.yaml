@@ -69,6 +69,14 @@ data:
   # kill: a large bundle legitimately spends minutes in one phase. Pair it with an
   # alert on scrubber_inflight_phase_seconds, which is the same signal as a metric.
   STALL_WARN_AFTER: "5m"
+  # Abandon an object-storage transfer that has moved NO bytes for this long, and
+  # bound the metadata calls (10x this for listings, which paginate). This is not
+  # a deadline on the transfer: a large object over a congested link legitimately
+  # takes minutes, and a deadline generous enough to allow that is too generous to
+  # catch a hang. What separates the two is whether anything is still arriving.
+  # Without it a connection that goes quiet mid-body blocks the single consumer
+  # forever, with the pod live and ready throughout.
+  TRANSFER_STALL_TIMEOUT: "60s"
   FINALIZE_GRACE: "15s"           # on shutdown, how long an object that has already
                                   # finished scrubbing may keep writing its output,
                                   # report and digest. Without this a SIGTERM lands

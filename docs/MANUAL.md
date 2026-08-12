@@ -433,6 +433,7 @@ Supplied as environment variables, in practice via a ConfigMap plus a Secret.
 | `SPILL_THRESHOLD` | *derived* | Payloads above this go to `/work` individually. Scaled from the pod's memory (4Mi at 2Gi), floored at 512Ki. |
 | `SPILL_RESIDENT_MAX` | *derived* | Aggregate in-memory budget. **This is what bounds RSS.** Scaled from the pod's memory (64Mi at 2Gi). |
 | `STALL_WARN_AFTER` | `5m` | How long the in-flight object may sit in one phase before the worker logs that it may be stalled. A log threshold, never a kill. Zero disables. |
+| `TRANSFER_STALL_TIMEOUT` | `60s` | Abandon an object-storage transfer that has moved **no bytes** for this long. Not a deadline on the transfer. Also bounds metadata calls (10× for listings). Negative disables, restoring an unbounded wait. |
 | `RESIDUAL_BUDGET` | 64Mi | Per-object budget for the residual scan; negative disables it. |
 | `VERIFY_OUTPUT` | `false` | Re-scan scrubbed output (~70% slower). |
 | `REVIEW_PREFIX` | `review/` | Where risky results are diverted; empty disables diverting. |

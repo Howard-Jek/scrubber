@@ -59,6 +59,77 @@ pushed gauge would freeze at its last value and look healthy. `STALL_WARN_AFTER`
 dashboard. Neither ever kills the pod; what counts as too long depends on the
 bundles, which this process does not know.
 
+### Object-storage transfers could wait forever
+
+**The bug.** Every MinIO call ran on the worker's long-lived context with no bound
+of its own. A connection that was established and then went quiet — a dropped path
+with no RST, a backend that stops writing mid-body, a load balancer blackholing an
+established flow — blocked the single consumer indefinitely.
+
+Nothing upstream noticed. `/healthz` is a pure liveness signal, `/readyz` reports a
+*new* connection succeeding, and every per-file counter is pinned at 0 because no
+file has been read yet. One such object wedged the whole queue behind it while the
+pod stayed live and ready. This is the shape a "stuck at unpacking" report takes
+when it is not actually unpacking.
+
+**Fixed** with a stall guard rather than a deadline. A deadline is the wrong tool:
+a large object over a congested link legitimately takes minutes, and any deadline
+generous enough to allow that is too generous to catch a hang worth catching. What
+separates slow from stalled is not elapsed time but whether *anything* is still
+arriving, so that is what is measured — `TRANSFER_STALL_TIMEOUT` (default 60s) of
+complete inactivity abandons the transfer.
+
+The guard's timer starts on construction rather than on the first byte, so a
+request that never produces a response header is caught by the same mechanism as
+one that dies halfway through the body.
+
+Applied to every path, not just the download that was reported:
+
+- **Reads** (`Get`, `GetLimited`, `GetLimitedTo`) watch bytes written out.
+- **Writes** (`Put`, `PutStream`) watch bytes read in — on an upload the payload is
+  already in hand, so the observable signal is the client no longer draining it.
+  This one matters more than it looks: it hangs *after* the object is scrubbed, so
+  the work is done, uncommitted, and the queue is blocked behind it.
+- **Metadata calls** (stat, copy, delete, bucket checks) get a flat deadline, since
+  they move no payload and have no progress to watch. Listings get 10× that, as
+  they paginate and the input bucket includes `processed/`.
+
+A stall is reported as its own thing, not a generic error: `store.ErrStalled`, the
+metric label `scrubber_objects_total{status="stalled"}`, and a log line saying the
+object stays in the input bucket and is retried on a later poll. Distinguishing it
+from an ordinary cancellation matters — both surface as `context.Canceled` from the
+copy, and reporting a shutdown as a backend stall, or the reverse, sends whoever
+reads the log to the wrong system.
+
+**Verified against a frozen backend** — `docker pause` on MinIO, which holds the
+connection open and simply stops moving bytes, which is the exact failure the guard
+is for. MinIO was frozen mid-scrub so the write landed on a dead backend, with
+`TRANSFER_STALL_TIMEOUT=10s`:
+
+```
+"msg":"object storage transfer stalled and was abandoned; the object stays in the
+       input bucket and is retried on a later poll"
+"err":"put output: transfer stalled after 1310720 bytes: nothing moved for the
+       stall timeout: Put \"http://.../scrub-output/med.zip\": context canceled"
+scrubber_objects_total{status="stalled"} 1
+```
+
+It fired 10s after the scrub completed and the write went nowhere, naming how far
+the upload had got. The input listing separately failed with `context deadline
+exceeded` at exactly 100s (10s × the listing factor). Before this change both would
+have waited forever.
+
+**The pod stayed `Up` and `/healthz` answered `ok` for the entire run.** That is the
+whole reason this needed its own metric: nothing about the pod's own health ever
+indicated a fault, and it never would have.
+
+**One rough edge, recorded not fixed.** A single `/api/status` request can make up
+to three bounded storage calls in series, so with the backend fully down it answers
+in ~3× the timeout — measured at 45s with a 15s setting, so ~180s at the 60s
+default. It *answers*, which is the property that matters and is a strict
+improvement on hanging, but it is a poor browser poll. A per-request budget on the
+API path would be the fix.
+
 ### Caps now size themselves against the pod
 
 **The problem.** Every cap was measured on a 2 GiB pod and compiled in as a

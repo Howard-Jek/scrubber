@@ -71,6 +71,11 @@ func realMain(log *slog.Logger) error {
 		Region:         os.Getenv("MINIO_REGION"),
 		PublicEndpoint: os.Getenv("MINIO_PUBLIC_ENDPOINT"),
 		PublicTLS:      envBool("MINIO_PUBLIC_TLS", true),
+		// Abandon a transfer that has moved no bytes for this long. Not a deadline
+		// on the transfer: a large object over a congested link legitimately takes
+		// minutes, and a deadline generous enough to allow that is too generous to
+		// catch a hang. Negative disables it, restoring the unbounded wait.
+		StallTimeout: envDuration("TRANSFER_STALL_TIMEOUT", 60*time.Second),
 	})
 	if err != nil {
 		return err

@@ -502,10 +502,30 @@ func (w *Worker) processObject(ctx context.Context, o store.Object) {
 
 	fail := func(err error) {
 		w.metrics.Errors.Inc()
-		w.metrics.Objects.WithLabelValues("error").Inc()
+		// A stalled transfer is counted under its own label, on whichever path it
+		// happened. It is not a fault of the object — retrying it is the right
+		// response, where an ordinary error usually means it will fail again — and
+		// it is the failure mode that used to present as no failure at all: the
+		// consumer blocked forever, every upload behind it queued, and the pod
+		// stayed live and ready throughout. Alert on this label.
+		//
+		// The write path matters at least as much as the read: it stalls *after*
+		// the object is scrubbed, so the work is done, uncommitted, and the queue
+		// is blocked behind it.
+		status := "error"
+		if errors.Is(err, store.ErrStalled) {
+			status = "stalled"
+		}
+		w.metrics.Objects.WithLabelValues(status).Inc()
 		job.Status = "error"
 		job.Error = err.Error()
 		record(job)
+		if status == "stalled" {
+			w.log.Error("object storage transfer stalled and was abandoned; the object "+
+				"stays in the input bucket and is retried on a later poll",
+				"key", o.Key, "err", err)
+			return
+		}
 		w.log.Error("process object", "key", o.Key, "err", err)
 	}
 
@@ -542,6 +562,7 @@ func (w *Worker) processObject(ctx context.Context, o store.Object) {
 			}
 			return
 		}
+		// A stall wrapped here still satisfies errors.Is, so fail classifies it.
 		fail(fmt.Errorf("get: %w", err))
 		return
 	}
