@@ -10,6 +10,97 @@ For what to verify on your own cluster after taking a new image, see
 
 ---
 
+## Unreleased
+
+### A stuck package no longer holds the queue: packages can be withdrawn
+
+The queue is strict FCFS with a single consumer and, until now, no way out of it.
+One object that could not make progress held up everyone behind it, and the only
+remedy was `oc exec` and `mc mv`.
+
+`POST /api/cancel`, surfaced as a **Withdraw** button on each upload card, handles
+both a queued object and one already mid-scrub.
+
+**Cancel has to reach the object, not the queue.** `Queue.Sync()` rebuilds the
+pending set wholesale from a bucket listing on every poll, so removing a key from
+memory withdraws nothing — the next listing puts it straight back. The durable
+disposition *is* the cancel: the input moves to `CANCELLED_PREFIX` (or is deleted
+under `PROCESSED_ACTION=delete`, honouring the deployment's retention policy). The
+in-memory mark only covers the seconds before that lands.
+
+**The walk had no way to be interrupted.** Nothing on the pipeline path takes a
+`context` — not `ProcessBlob`, `handleZip`, `handleTar`, `handleCompressed` or
+`handleLeaf` — so cancelling a context reaches only the object-storage calls that
+bracket the walk, and the multi-minute middle runs to completion regardless. The
+engine now polls an abort predicate between members. It is deliberately *not* wired
+to a context: shutdown cancels that context, and a predicate shutdown can trip
+would turn every SIGTERM into a silently discarded scrub.
+
+**An aborted walk must not repack, and this is the part worth reading twice.** The
+obvious implementation — each blob returns "unchanged" once the abort trips — is
+actively dangerous inside a container: members before the abort have been rewritten
+and members after it have not, so `changed` is still true, the container repacks,
+and a well-formed archive of a few scrubbed members and many **raw** ones goes to
+the output bucket under the ordinary key with a report that makes it look like a
+normal run. That is the worst outcome this service can produce. So an aborted
+container returns its **original input**, at every level, and `changed` collapses to
+false all the way up — even a bug in the worker's own check would then write the
+untouched input rather than a mixed bundle. Pinned by `TestAbortedWalkNeverRepacks`.
+
+**The commit is one atomic transition.** `commit(key)` answers "was this cancelled?"
+and closes the door to further cancels in a single critical section. Split in two, a
+cancel landing in the gap is answered "aborting" while the object it named is
+already being published — and the shutdown-detach branch would then finish it
+anyway. After `commit` returns true a concurrent cancel is truthfully told
+`too-late` (409), never 200.
+
+**Security, stated plainly.** The browser API has no authentication. `/api/queue`
+returns up to 50 live pending keys and `/api/history` returns every recent input
+key, so an unscoped cancel endpoint is a two-line loop that durably evacuates the
+queue for every user, with no way back short of moving objects by hand. Therefore:
+
+- `/api/uploads` now issues a `cancel_token` — an HMAC over the key with a
+  per-process secret — and `/api/cancel` requires it. Not authentication, but it
+  reduces the blast radius from "every key the API prints" to "keys this browser
+  uploaded", with no identity plumbing the service does not have.
+- `ALLOW_CANCEL_ANY` (default **false**) drops that requirement. It exists because
+  clearing someone else's stuck object is the operator's actual need. It should
+  only be enabled behind real authentication.
+- `Content-Type: application/json` is required, so a cross-origin form POST cannot
+  fire the endpoint; keys containing `/` are rejected, so a caller cannot name an
+  object under `processed/`, `review/` or `cancelled/`.
+
+Verified end to end against a real service: an in-flight scrub of a 1.37 GiB zip
+aborted **2.2s** after the request, wrote no output, left its input intact at
+`cancelled/second.zip`, drained `/work` to zero and freed the queue; a queued object
+was withdrawn to `cancelled/` and never ran. The token gate returns 403 without a
+token, and a form content type returns 415.
+
+### A stalled transfer is retryable, not a failure
+
+A stall set `job.Status = "error"`, which the upload page treats as terminal: it
+stopped polling and went red. But the object stays in the input bucket and *is*
+retried, so a transient backend blip showed as a permanent failure for work that
+completed a minute later, with nothing to tell the user it had. It is now
+`retrying`, carrying `retry_in_seconds`, and the page keeps polling.
+
+### A stalled object no longer retakes the head of the queue
+
+Backoff was only applied to failed *finalizes*. A stalled object got none, and
+because ordering is by `LastModified` — by definition the oldest in the bucket — it
+returned to the **head** every cycle, so everything behind it paid the stall timeout
+again on every round. One unreadable object could throttle everybody. The existing
+backoff now covers both paths (`deferRetry`, renamed from `noteFinalizeFailed`).
+
+### Listings get their own timeout
+
+`LIST_TIMEOUT` (default 90s), separate from `TRANSFER_STALL_TIMEOUT`. It was derived
+as 10× the stall timeout, which put it at **ten minutes** by default — long enough
+that a dead backend looked idle rather than broken. A listing's honest duration
+scales with the bucket, not the network, so it deserves its own number.
+
+---
+
 ## Image 0.6.0 — nothing waits forever, and the caps follow the pod
 
 Everything below came out of one report: a 300 MB zip "stuck at unpacking 95% for

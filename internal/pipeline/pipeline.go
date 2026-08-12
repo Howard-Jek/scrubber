@@ -87,6 +87,19 @@ type Engine struct {
 	Limits     Limits
 	ScrubNames bool // also scrub archive member names / paths, not just contents
 
+	// Abort, when set, is polled during the walk. Returning true stops it.
+	//
+	// The walk is otherwise uninterruptible: no function on this path takes a
+	// context, so a cancelled request reaches only the store calls that bracket
+	// it, and the multi-minute middle — expanding and scrubbing a large container
+	// — runs to completion regardless. This is the seam that makes an in-flight
+	// cancel mean anything.
+	//
+	// It must NOT be wired to a context's Done channel. Shutdown cancels that
+	// context, and an abort predicate that shutdown can trip would silently turn
+	// every SIGTERM into a discarded scrub.
+	Abort func() bool
+
 	// budget is the remaining cumulative expansion allowance, reset on each
 	// depth-0 Process call.
 	budget int64
@@ -105,6 +118,29 @@ type Engine struct {
 	// whole object. Non-zero is what turns a merely incomplete run into a risky one.
 	residualHits   int
 	residualLabels map[string]int
+
+	// aborted latches once Abort first returns true, so the whole walk agrees on
+	// one answer. Polling the predicate directly at each site would let a walk see
+	// "not aborted" at one level and "aborted" at the next, which is precisely how
+	// a container ends up half-rewritten.
+	aborted bool
+}
+
+// Aborted reports whether the walk has been told to stop, latching the first true
+// answer.
+//
+// Latching is what makes the guarantee below hold: once any level of the walk has
+// seen the abort, every enclosing container returns unchanged, so `changed`
+// collapses to false all the way up and the caller is handed back its original
+// input rather than a partial rebuild.
+func (e *Engine) Aborted() bool {
+	if e.aborted {
+		return true
+	}
+	if e.Abort != nil && e.Abort() {
+		e.aborted = true
+	}
+	return e.aborted
 }
 
 // ResidualFindings reports what the safety net found in content this walk did not
@@ -257,6 +293,15 @@ func (e *Engine) ProcessBlob(path string, in *spill.Blob, depth int) (*spill.Blo
 			e.residualLeft = DefaultResidualBudget
 		}
 		e.residualHits, e.residualLabels = 0, nil
+	}
+	// Nothing below this point runs once the walk is aborted, and every level
+	// returns its input unchanged. Deliberately no e.skip() call: skip records a
+	// coverage hole and runs a residual scan over the payload, which on an abort
+	// would spend the budget scanning content nobody will ship and could flip the
+	// verdict to incomplete-risky, diverting a cancelled object into the review
+	// queue. A cancelled object produces no output and no verdict at all.
+	if e.Aborted() {
+		return in, false
 	}
 	if depth > e.Limits.MaxDepth {
 		e.skip(path, report.StatusGuardTripped, report.ReasonDepthCap,
@@ -523,6 +568,11 @@ func (e *Engine) handleTar(path string, in *spill.Blob, depth int) (*spill.Blob,
 			changed = true
 		}
 	}
+	// See handleZip: an aborted walk must return its input, never a rebuild mixing
+	// scrubbed members with raw ones.
+	if e.Aborted() {
+		return in, false
+	}
 	if !changed {
 		return in, false
 	}
@@ -570,6 +620,15 @@ func (e *Engine) handleZip(path string, in *spill.Blob, depth int) (*spill.Blob,
 			members[i].Body = out
 			changed = true
 		}
+	}
+	// An aborted walk must not repack. Members before the abort were rewritten and
+	// members after it were not, so repacking here would build a well-formed zip of
+	// mixed scrubbed and RAW content and hand it back as changed — a bundle of
+	// mostly-unscrubbed sensitive logs that looks like a finished scrub. Returning
+	// the original input instead collapses `changed` to false at every enclosing
+	// level, so the worker receives its own input back and there is nothing to ship.
+	if e.Aborted() {
+		return in, false
 	}
 	if !changed {
 		return in, false

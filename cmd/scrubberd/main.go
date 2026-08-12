@@ -76,6 +76,12 @@ func realMain(log *slog.Logger) error {
 		// minutes, and a deadline generous enough to allow that is too generous to
 		// catch a hang. Negative disables it, restoring the unbounded wait.
 		StallTimeout: envDuration("TRANSFER_STALL_TIMEOUT", 60*time.Second),
+		// Listings get their own bound: a listing's honest duration scales with the
+		// bucket rather than with the network, since it paginates and the input
+		// bucket includes processed/. It used to be derived as 10x the stall
+		// timeout, which put it at ten minutes by default — long enough that a dead
+		// backend looked idle rather than broken.
+		ListTimeout: envDuration("LIST_TIMEOUT", 90*time.Second),
 	})
 	if err != nil {
 		return err
@@ -159,8 +165,11 @@ func realMain(log *slog.Logger) error {
 		// contain policy matches. Set empty to keep everything in one place and rely
 		// on the flagging alone.
 		ReviewPrefix: envDefault("REVIEW_PREFIX", "review/"),
-		Action:       worker.ProcessedAction(envDefault("PROCESSED_ACTION", "move")),
-		PollInterval: envDuration("POLL_INTERVAL", 15*time.Second),
+		// Where a withdrawn input lands under PROCESSED_ACTION=move. Never empty:
+		// eligibility prefix-matches on it and "" is a prefix of every key.
+		CancelledPrefix: envDefault("CANCELLED_PREFIX", "cancelled/"),
+		Action:          worker.ProcessedAction(envDefault("PROCESSED_ACTION", "move")),
+		PollInterval:    envDuration("POLL_INTERVAL", 15*time.Second),
 		// Clamped to 1 by worker.New. Read from the environment anyway so an
 		// operator who set it higher gets told it is being ignored.
 		Workers:  envInt("WORKERS", 1),
@@ -331,6 +340,19 @@ func realMain(log *slog.Logger) error {
 			ReportsBucket: mustEnv("REPORTS_BUCKET"),
 			UploadExpiry:  envDuration("UPLOAD_EXPIRY", 15*time.Minute),
 			HistoryMax:    envInt("HISTORY_MAX", 100),
+			Canceller:     wk,
+			// Cancelling is on by default, matching ALLOW_POLICY_EDIT: the operators
+			// are insiders and a stuck object blocking the queue is their problem to
+			// clear. A cancel still needs the token this server minted for that key
+			// at upload time.
+			AllowCancel: envBool("ALLOW_CANCEL", true),
+			// Cancelling an object this client did not upload is OFF by default and
+			// should stay off unless there is real authentication in front of the
+			// Route. /api/queue and /api/history both publish live input keys, so
+			// with no auth this turns a two-line loop into a durable, restart-
+			// surviving evacuation of every user's work.
+			AllowCancelAny: envBool("ALLOW_CANCEL_ANY", false),
+			CancelBudget:   envDuration("CANCEL_BUDGET", 60*time.Second),
 			// Total object-storage time one HTTP request may spend. The store
 			// bounds each call; this bounds their sum, which is what a browser
 			// polling every second actually experiences. Negative disables it.

@@ -22,6 +22,7 @@ import (
 	"runtime/debug"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/howard/scrubber/internal/metrics"
@@ -83,7 +84,18 @@ type Config struct {
 	// is the point: a key under this prefix cannot be picked up by something looking
 	// for a finished bundle. Empty disables diversion and leaves the flagging alone.
 	ReviewPrefix string
-	Limits       pipeline.Limits
+	// CancelledPrefix is where a cancelled input is moved, under Action "move".
+	// Cancelling never destroys an upload on a move-configured deployment: the
+	// bundle is the user's only copy of logs they were preparing to send out, and
+	// the operator's reason for cancelling is usually that it is stuck, not that it
+	// is unwanted. Under Action "delete" cancel deletes, because a deployment that
+	// asked for inputs to be destroyed did not ask for an exception.
+	//
+	// Must not be empty: strings.HasPrefix(key, "") is true for every key, which
+	// would make the eligibility check reject the entire bucket. New() defaults it
+	// and eligible() re-checks defensively.
+	CancelledPrefix string
+	Limits          pipeline.Limits
 }
 
 // termsSuffix marks a per-object override file: "<key>.terms.json".
@@ -115,11 +127,39 @@ type Worker struct {
 	mu         sync.Mutex
 	deferUntil map[string]time.Time
 	attempts   map[string]int
+
+	// cancelled marks keys an operator has withdrawn. It is consulted by
+	// eligible(), which is the single chokepoint every key passes on every poll,
+	// so it suppresses a key in the seconds between the cancel being accepted and
+	// the durable move landing. It is NOT itself the cancel: it is per-process and
+	// empty after a restart, so the durable disposition below is what actually
+	// withdraws an object.
+	cancelled map[string]time.Time
+	// running describes the object being scrubbed right now, or nil when idle.
+	// There is exactly one consumer, so this is a single value rather than a map.
+	running *inflight
 }
 
-// finalizeBackoff returns how long to hold an object back after n consecutive
+// inflight is the handle a cancel needs on the object currently being scrubbed.
+type inflight struct {
+	key string
+	// abort cancels the object's context, which reaches the object-storage calls
+	// bracketing the walk.
+	abort context.CancelFunc
+	// flag is the predicate the pipeline polls. It is separate from the context on
+	// purpose: the walk takes no context and cannot be interrupted by one, and a
+	// predicate wired to a context would let SIGTERM masquerade as a cancel and
+	// silently discard finished work.
+	flag *atomic.Bool
+	// committed records that the scrubbed output has been written to the output
+	// bucket. After that a cancel cannot un-deliver it, and saying otherwise would
+	// tell an operator their data was withdrawn when it was published.
+	committed bool
+}
+
+// retryBackoff returns how long to hold an object back after n consecutive
 // failures to mark it processed, capped so it still retries occasionally.
-func finalizeBackoff(n int) time.Duration {
+func retryBackoff(n int) time.Duration {
 	d := time.Duration(1<<min(n, 6)) * time.Second // 2s .. 64s
 	if d > time.Minute {
 		d = time.Minute
@@ -141,6 +181,12 @@ func New(s store.ObjectStore, p *policy.Registry, m *metrics.Metrics, jl *metric
 	}
 	if cfg.ReviewPrefix == "" {
 		cfg.ReviewPrefix = "review/"
+	}
+	// Never leave this empty: eligible() prefix-matches on it, and every string
+	// has the empty string as a prefix, so an empty value would reject the whole
+	// input bucket and the service would silently stop scrubbing anything.
+	if cfg.CancelledPrefix == "" {
+		cfg.CancelledPrefix = "cancelled/"
 	}
 	// Clamped rather than defaulted. Honouring a larger value would let a single
 	// config line reintroduce concurrent scrubs behind a queue that claims to have
@@ -164,6 +210,7 @@ func New(s store.ObjectStore, p *policy.Registry, m *metrics.Metrics, jl *metric
 		nudge:      make(chan struct{}, 1),
 		deferUntil: map[string]time.Time{},
 		attempts:   map[string]int{},
+		cancelled:  map[string]time.Time{},
 	}
 }
 
@@ -383,6 +430,15 @@ func (w *Worker) sweepDeferrals(present map[string]struct{}) {
 			delete(w.attempts, k)
 		}
 	}
+	// Cancellation marks are swept on the same rule. Once the key is gone from the
+	// listing the durable disposition has landed and the mark has done its job;
+	// keeping it would mean a later upload that happens to reuse the key inherits
+	// a withdrawal it never asked for and is silently never scrubbed.
+	for k := range w.cancelled {
+		if _, ok := present[k]; !ok {
+			delete(w.cancelled, k)
+		}
+	}
 }
 
 // consume is the single consumer: take the head of the queue, scrub it to
@@ -430,8 +486,21 @@ func (w *Worker) eligible(o store.Object, now time.Time) bool {
 	if strings.HasPrefix(o.Key, w.cfg.ProcessedPrefix) {
 		return false
 	}
+	// A withdrawn object lives under this prefix. Guarded against an empty value
+	// as well as defaulted in New, because every string has "" as a prefix and the
+	// failure mode is the entire bucket silently becoming ineligible.
+	if w.cfg.CancelledPrefix != "" && strings.HasPrefix(o.Key, w.cfg.CancelledPrefix) {
+		return false
+	}
 	w.mu.Lock()
 	defer w.mu.Unlock()
+	if _, off := w.cancelled[o.Key]; off {
+		// Cancelled, but the durable move may not have landed yet. This is the only
+		// thing covering that window: Sync() rebuilds the pending set wholesale from
+		// the listing, so without it a discovery running between the mark and the
+		// move re-queues the object and the consumer starts scrubbing it again.
+		return false
+	}
 	if until, held := w.deferUntil[o.Key]; held && now.Before(until) {
 		return false // finalization failed recently; wait out the backoff
 	}
@@ -440,20 +509,161 @@ func (w *Worker) eligible(o store.Object, now time.Time) bool {
 	return true
 }
 
-// noteFinalized clears any backoff state for a key that completed cleanly.
-func (w *Worker) noteFinalized(key string) {
+// CancelOutcome is what a cancel request achieved. The distinction matters to the
+// caller: an operator told "cancelled" and an operator told "too late" need to do
+// different things next.
+type CancelOutcome string
+
+const (
+	// CancelWithdrawn: the object was not being scrubbed. It is marked and its
+	// input has been disposed of, so it will never run.
+	CancelWithdrawn CancelOutcome = "withdrawn"
+	// CancelAborting: the object was in flight and has been told to stop. The
+	// worker disposes of the input once the walk unwinds, which is not instant —
+	// the walk polls the abort predicate between members.
+	CancelAborting CancelOutcome = "aborting"
+	// CancelTooLate: the scrubbed output was already written to the output bucket.
+	// Nothing is withdrawn, and claiming otherwise would tell an operator their
+	// data was pulled back when it was published.
+	CancelTooLate CancelOutcome = "too-late"
+	// CancelNotFound: no such object in the input bucket.
+	CancelNotFound CancelOutcome = "not-found"
+)
+
+// Cancel withdraws an object, whether it is queued or being scrubbed right now.
+//
+// The whole transition happens under one lock acquisition. Splitting it — read the
+// state, decide, then act — is the bug this design exists to avoid: a cancel that
+// lands between the worker's last cancellation check and its commit would be told
+// "aborting" while the object it named was already on its way to the output bucket.
+// One critical section means there is no third outcome to fall into.
+// Cancel implements the server's Canceller. It returns a string rather than the
+// typed outcome so the server package keeps no dependency on the worker.
+func (w *Worker) Cancel(ctx context.Context, key string) (string, error) {
+	o, err := w.cancel(ctx, key)
+	return string(o), err
+}
+
+func (w *Worker) cancel(ctx context.Context, key string) (CancelOutcome, error) {
+	w.mu.Lock()
+	if w.running != nil && w.running.key == key {
+		if w.running.committed {
+			w.mu.Unlock()
+			return CancelTooLate, nil
+		}
+		// Mark first, then signal. The mark is what stops discovery re-queueing the
+		// key while the walk unwinds; the signal is what makes the walk unwind at
+		// all. Disposal is deliberately left to the worker: two goroutines mutating
+		// the same input object is how a cancel races a finalize.
+		w.cancelled[key] = time.Now()
+		w.running.flag.Store(true)
+		abort := w.running.abort
+		w.mu.Unlock()
+		abort()
+		w.log.Warn("cancel accepted for the object being scrubbed; aborting the walk", "key", key)
+		return CancelAborting, nil
+	}
+	// Not in flight. Mark it before any I/O so that a discovery running right now
+	// cannot queue it in the window before the input is disposed of.
+	w.cancelled[key] = time.Now()
+	w.mu.Unlock()
+
+	if _, found, err := w.store.Stat(ctx, w.cfg.InputBucket, key); err != nil {
+		return "", fmt.Errorf("check input: %w", err)
+	} else if !found {
+		// Nothing to withdraw. Do not keep the mark: a later upload reusing this
+		// key would inherit it and be silently suppressed.
+		w.unmarkCancelled(key)
+		return CancelNotFound, nil
+	}
+	if err := w.disposeCancelled(ctx, key); err != nil {
+		w.unmarkCancelled(key)
+		return "", err
+	}
+	w.metrics.Objects.WithLabelValues("cancelled").Inc()
+	w.log.Warn("object withdrawn from the queue by request", "key", key)
+	return CancelWithdrawn, nil
+}
+
+// disposeCancelled makes the withdrawal durable. Until this lands the cancel is
+// only a per-process marker that a restart would forget, leaving the object in the
+// input bucket to be scrubbed as if nothing had happened.
+//
+// It honours Action rather than always moving: a deployment configured to delete
+// its inputs did not ask for cancelled ones to be kept, and quietly retaining them
+// would override the operator's own retention policy.
+func (w *Worker) disposeCancelled(ctx context.Context, key string) error {
+	if w.cfg.Action == ActionDelete {
+		return w.store.Delete(ctx, w.cfg.InputBucket, key)
+	}
+	return w.store.Move(ctx, w.cfg.InputBucket, key, w.cfg.CancelledPrefix+key)
+}
+
+// isCancelled reports whether a withdrawal has been accepted for key.
+func (w *Worker) isCancelled(key string) bool {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	_, ok := w.cancelled[key]
+	return ok
+}
+
+func (w *Worker) unmarkCancelled(key string) {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	delete(w.cancelled, key)
+}
+
+// beginInflight registers the running object so a cancel can reach it, and
+// reports false if the key was already withdrawn while it sat in the queue.
+func (w *Worker) beginInflight(key string, abort context.CancelFunc, flag *atomic.Bool) bool {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	if _, off := w.cancelled[key]; off {
+		return false
+	}
+	w.running = &inflight{key: key, abort: abort, flag: flag}
+	return true
+}
+
+// endInflight clears the registration.
+func (w *Worker) endInflight() {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	w.running = nil
+}
+
+// commit is the point of no return, and it is a single atomic transition on
+// purpose: it answers "was this cancelled?" and closes the door to further cancels
+// in one critical section. Checking and committing separately leaves a window in
+// which a cancel is accepted for an object that then publishes anyway.
+//
+// Returns false if the object has been cancelled and must not be delivered.
+func (w *Worker) commit(key string) bool {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	if _, off := w.cancelled[key]; off {
+		return false
+	}
+	if w.running != nil && w.running.key == key {
+		w.running.committed = true
+	}
+	return true
+}
+
+// clearDeferral clears any backoff state for a key that completed cleanly.
+func (w *Worker) clearDeferral(key string) {
 	w.mu.Lock()
 	defer w.mu.Unlock()
 	delete(w.deferUntil, key)
 	delete(w.attempts, key)
 }
 
-// noteFinalizeFailed records a failure and returns the backoff applied.
-func (w *Worker) noteFinalizeFailed(key string) time.Duration {
+// deferRetry records a failure and returns the backoff applied.
+func (w *Worker) deferRetry(key string) time.Duration {
 	w.mu.Lock()
 	defer w.mu.Unlock()
 	w.attempts[key]++
-	d := finalizeBackoff(w.attempts[key])
+	d := retryBackoff(w.attempts[key])
 	w.deferUntil[key] = time.Now().Add(d)
 	return d
 }
@@ -477,11 +687,51 @@ func (w *Worker) processObject(ctx context.Context, o store.Object) {
 	// written last, after the output object had already been stored, so a client
 	// polling in that window — or after a restart that lost the record — saw
 	// "not found" and waited forever while the finished object sat in the bucket.
+	// Register before any work so a cancel arriving in the first millisecond finds
+	// something to act on, and derive the object's own context so aborting it does
+	// not disturb the worker's.
+	//
+	// The abort flag is deliberately NOT derived from this context. The walk takes
+	// no context and polls the flag instead; wiring the flag to ctx.Done would make
+	// SIGTERM indistinguishable from a cancel and silently discard finished scrubs
+	// on every rollout.
+	var aborted atomic.Bool
+	ctx, abort := context.WithCancel(ctx)
+	defer abort()
+	if !w.beginInflight(o.Key, abort, &aborted) {
+		// Withdrawn while it waited in the queue. Nothing has been read, so there is
+		// nothing to undo; the input was already disposed of by Cancel.
+		w.log.Info("skipping object withdrawn before it started", "key", o.Key)
+		return
+	}
+	defer w.endInflight()
+
 	job.Status = "processing"
 	job.Phase = "reading"
 	job.PhaseSince = time.Now()
 	w.jobs.Upsert(job)
 	w.log.Info("processing object", "key", o.Key, "size", o.Size)
+
+	// cancelledExit records the withdrawal and disposes of the input. Called from
+	// every point the walk can unwind after a cancel.
+	cancelledExit := func() {
+		w.metrics.Objects.WithLabelValues("cancelled").Inc()
+		job.Status = "cancelled"
+		job.Phase = ""
+		job.Error = "withdrawn by request before the scrub completed"
+		record(job)
+		// Detached: the object's own context has just been cancelled by the abort,
+		// so the disposal would fail immediately on it.
+		dctx, dcancel := context.WithTimeout(context.WithoutCancel(ctx), w.cfg.FinalizeGrace)
+		defer dcancel()
+		if err := w.disposeCancelled(dctx, o.Key); err != nil {
+			d := w.deferRetry(o.Key)
+			w.log.Warn("could not dispose of a cancelled input; it stays in the bucket and is retried",
+				"key", o.Key, "err", err, "retry_in", d)
+			return
+		}
+		w.log.Warn("scrub aborted and input withdrawn", "key", o.Key)
+	}
 
 	// A panic in the pipeline must cost one object, not the whole service: without
 	// this the goroutine takes the process down, every in-flight upload is orphaned,
@@ -512,20 +762,31 @@ func (w *Worker) processObject(ctx context.Context, o store.Object) {
 		// The write path matters at least as much as the read: it stalls *after*
 		// the object is scrubbed, so the work is done, uncommitted, and the queue
 		// is blocked behind it.
-		status := "error"
 		if errors.Is(err, store.ErrStalled) {
-			status = "stalled"
+			// Held back with the same backoff a failed finalize gets. Without it the
+			// object keeps its original LastModified — by definition the oldest in
+			// the bucket — so it returns to the HEAD of the queue and every upload
+			// behind it pays the stall timeout again on every cycle. One unreadable
+			// object would throttle everybody.
+			d := w.deferRetry(o.Key)
+			w.metrics.Objects.WithLabelValues("stalled").Inc()
+			// "retrying", not "error". The object is still in the input bucket and
+			// will be picked up again; calling it an error makes the upload page
+			// give up and show a permanent failure for something that is very
+			// likely to succeed on the next attempt.
+			job.Status = "retrying"
+			job.RetryInSeconds = int(d.Round(time.Second).Seconds())
+			job.Error = err.Error()
+			record(job)
+			w.log.Error("object storage transfer stalled and was abandoned; the object "+
+				"stays in the input bucket and is retried after a backoff",
+				"key", o.Key, "err", err, "retry_in", d)
+			return
 		}
-		w.metrics.Objects.WithLabelValues(status).Inc()
+		w.metrics.Objects.WithLabelValues("error").Inc()
 		job.Status = "error"
 		job.Error = err.Error()
 		record(job)
-		if status == "stalled" {
-			w.log.Error("object storage transfer stalled and was abandoned; the object "+
-				"stays in the input bucket and is retried on a later poll",
-				"key", o.Key, "err", err)
-			return
-		}
 		w.log.Error("process object", "key", o.Key, "err", err)
 	}
 
@@ -554,11 +815,11 @@ func (w *Worker) processObject(ctx context.Context, o store.Object) {
 			record(job)
 			w.log.Warn("object too large; skipping", "key", o.Key, "limit", w.cfg.MaxObjectBytes)
 			if ferr := w.finish(ctx, o.Key); ferr != nil {
-				d := w.noteFinalizeFailed(o.Key)
+				d := w.deferRetry(o.Key)
 				w.log.Warn("could not move oversized input aside; deferring retry",
 					"key", o.Key, "err", ferr, "retry_in", d)
 			} else {
-				w.noteFinalized(o.Key)
+				w.clearDeferral(o.Key)
 			}
 			return
 		}
@@ -630,12 +891,25 @@ func (w *Worker) processObject(ctx context.Context, o store.Object) {
 		w.jobs.Upsert(j)
 	})
 
-	eng := &pipeline.Engine{Matcher: res.Matcher, Report: rep, Limits: w.cfg.Limits, ScrubNames: w.cfg.ScrubNames}
+	eng := &pipeline.Engine{
+		Matcher: res.Matcher, Report: rep, Limits: w.cfg.Limits, ScrubNames: w.cfg.ScrubNames,
+		// The only thing that can stop the walk. It polls this between members; an
+		// aborted walk returns every container unchanged rather than a partial
+		// rebuild, so `changed` collapses to false and there is nothing to deliver.
+		Abort: aborted.Load,
+	}
 	// Release every blob the walk staged. This runs before the panic recovery
 	// above (defers unwind last-registered-first), so a bug anywhere in the
 	// pipeline costs one object rather than a temp file that outlives it.
 	defer eng.Release()
 	out, changed := eng.ProcessBlob(o.Key, input, 0)
+	if eng.Aborted() {
+		// Withdrawn mid-walk. Everything staged is released by the defers above; no
+		// output, report or digest is written, and the verdict below is deliberately
+		// never computed — a cancelled object has no coverage answer to give.
+		cancelledExit()
+		return
+	}
 	if changed {
 		// ProcessBlob returns the input itself when nothing changed, so only close
 		// the result when it is genuinely a separate payload.
@@ -675,6 +949,22 @@ func (w *Worker) processObject(ctx context.Context, o store.Object) {
 		defer cancel()
 		w.log.Info("shutting down mid-object; persisting the finished result",
 			"key", o.Key, "grace", w.cfg.FinalizeGrace)
+	}
+
+	// The point of no return, and the last chance to honour a cancel.
+	//
+	// This is one atomic transition rather than a check followed by a write: a
+	// cancel landing between a separate check and this point would be answered
+	// "aborting" while the object it named was already being published. commit()
+	// answers "not cancelled" and closes the door in the same critical section, so
+	// after it returns true a concurrent Cancel is truthfully told "too late".
+	//
+	// It sits below the shutdown-detach branch on purpose. That branch exists so a
+	// SIGTERM does not discard finished work — but it must not also resurrect an
+	// object whose withdrawal was accepted moments earlier.
+	if !w.commit(o.Key) {
+		cancelledExit()
+		return
 	}
 
 	// Write scrubbed output under the (possibly scrubbed) key, streaming from
@@ -720,11 +1010,11 @@ func (w *Worker) processObject(ctx context.Context, o store.Object) {
 	// bucket and would otherwise be re-scrubbed on every poll forever, so hold it
 	// back with an increasing backoff instead of spinning.
 	if err := w.finish(ctx, o.Key); err != nil {
-		d := w.noteFinalizeFailed(o.Key)
+		d := w.deferRetry(o.Key)
 		w.log.Warn("could not mark input processed; deferring retry",
 			"key", o.Key, "err", err, "retry_in", d)
 	} else {
-		w.noteFinalized(o.Key)
+		w.clearDeferral(o.Key)
 	}
 	// Consume the override sidecar if it existed.
 	if len(overrideTerms) > 0 {

@@ -83,6 +83,36 @@ data:
   # page fans out to HISTORY_MAX reads. The browser repeats these every second, so
   # a fast degraded answer beats a slow true one.
   API_STORAGE_BUDGET: "5s"
+  # Bound on ONE bucket listing. Separate from the stall timeout because a
+  # listing's honest duration scales with the bucket -- it paginates, and the
+  # input bucket includes processed/ -- rather than with the network. It used to
+  # be derived as 10x the stall timeout, which put it at ten minutes by default:
+  # long enough that a dead backend looked idle rather than broken.
+  LIST_TIMEOUT: "90s"
+  # Withdrawing a package from the queue. The queue is strict FCFS with a single
+  # consumer, so one object that cannot make progress holds up everyone behind it;
+  # this is the escape hatch, surfaced as a Withdraw button on each upload card.
+  #
+  # A cancel must present the token /api/uploads minted for that exact key. That
+  # is not authentication -- the browser API has none -- but it scopes the endpoint
+  # to keys the caller was handed rather than to every key /api/queue and
+  # /api/history print.
+  ALLOW_CANCEL: "true"
+  # Removes that scoping, so ANY caller can withdraw ANY key. This is the operator
+  # path for clearing somebody else's stuck object. DO NOT enable it without real
+  # authentication in front of the Route: with no auth it is a two-line loop that
+  # durably evacuates the queue for every user.
+  ALLOW_CANCEL_ANY: "false"
+  # Where a withdrawn input is moved under PROCESSED_ACTION=move. Withdrawing does
+  # not destroy the upload: it is the user's own copy of logs they were preparing
+  # to send out, and the usual reason to withdraw is that it is stuck. Under
+  # PROCESSED_ACTION=delete a cancel deletes, honouring your retention policy.
+  # Must never be empty -- "" is a prefix of every key, which would make the whole
+  # input bucket ineligible and silently stop all scrubbing.
+  CANCELLED_PREFIX: "cancelled/"
+  # Storage time one cancel may take. Larger than API_STORAGE_BUDGET because the
+  # withdrawal is a server-side copy of a possibly large object.
+  CANCEL_BUDGET: "60s"
   FINALIZE_GRACE: "15s"           # on shutdown, how long an object that has already
                                   # finished scrubbing may keep writing its output,
                                   # report and digest. Without this a SIGTERM lands

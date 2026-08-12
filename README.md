@@ -173,6 +173,7 @@ understanding before you trust an output bundle.
 | `unsupported-format` | **no** | A container we can read but not rewrite (7z, rar, bzip2). |
 | `guard-tripped` | **no** | A size, depth or member-count guard refused to expand it. |
 | `residual-match` | **no** | Scrubbed, but the policy still matches the result. |
+| `cancelled` | **no** | Withdrawn from the queue by request. No output, report or digest is produced. |
 
 ### 3. Reason codes — *why* was it not inspected?
 

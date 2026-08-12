@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"errors"
+	"fmt"
 	"io"
 	"log/slog"
 	"os"
@@ -31,6 +32,9 @@ type memStore struct {
 	buckets map[string]map[string][]byte
 	at      map[string]time.Time // "bucket/key" -> LastModified
 	clock   time.Time
+	// stallReads makes every object read fail as store.ErrStalled, modelling a
+	// backend that accepts the request and then goes quiet.
+	stallReads bool
 }
 
 func newMemStore(names ...string) *memStore {
@@ -105,10 +109,24 @@ func (m *memStore) PutStream(ctx context.Context, bucket, key string, r io.Reade
 	return m.Put(ctx, bucket, key, data, ct)
 }
 
+func (m *memStore) Stat(_ context.Context, bucket, key string) (store.Object, bool, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	v, ok := m.buckets[bucket][key]
+	if !ok {
+		return store.Object{}, false, nil
+	}
+	return store.Object{Key: key, Size: int64(len(v)), LastModified: m.at[stamp(bucket, key)]}, true, nil
+}
+
 func (m *memStore) GetLimitedTo(_ context.Context, w io.Writer, bucket, key string, max int64) (int64, error) {
 	m.mu.Lock()
 	v, ok := m.buckets[bucket][key]
+	stall := m.stallReads
 	m.mu.Unlock()
+	if stall {
+		return 0, fmt.Errorf("%w after 0 bytes: nothing moved for the stall timeout", store.ErrStalled)
+	}
 	if !ok {
 		return 0, os.ErrNotExist
 	}
@@ -195,6 +213,62 @@ func newTestWorker(t *testing.T, ms *memStore) *Worker {
 		Limits: pipeline.DefaultLimits(),
 	}
 	return New(ms, testRegistry(t), m, jl, cfg, log)
+}
+
+// TestStalledReadIsRetryableAndStepsAside covers both halves of how a stalled
+// transfer must behave, because getting either one wrong is silently bad.
+//
+// It must be RETRYABLE: the object is still in the input bucket and will be picked
+// up again, so recording it as a terminal error made the upload page give up and
+// show a permanent failure for work that then completed on the next attempt.
+//
+// And it must STEP ASIDE: without a backoff the object keeps its original
+// LastModified, which is by definition the oldest in the bucket, so it returns to
+// the head of the queue and every upload behind it pays the stall timeout again on
+// every cycle. One unreadable object would throttle everybody.
+func TestStalledReadIsRetryableAndStepsAside(t *testing.T) {
+	ms := newMemStore("input", "output", "reports")
+	ms.Put(context.Background(), "input", "big.zip", []byte("hi from AcmeCorp\n"), "")
+	ms.stallReads = true
+
+	m := metrics.New(prometheus.NewRegistry())
+	jl := metrics.NewJobLog(10)
+	w := New(ms, testRegistry(t), m, jl,
+		Config{
+			InputBucket: "input", OutputBucket: "output", ReportsBucket: "reports",
+			Action: ActionMove, PollInterval: time.Hour, Workers: 1,
+			Limits: pipeline.DefaultLimits(),
+		},
+		slog.New(slog.NewTextHandler(io.Discard, nil)))
+	w.runOnce(context.Background())
+
+	j, ok := jl.Get("big.zip")
+	if !ok {
+		t.Fatal("no job recorded for the stalled object")
+	}
+	if j.Status != "retrying" {
+		t.Errorf("status = %q, want retrying (a stall is the backend's fault, not the object's)", j.Status)
+	}
+	if j.Done() {
+		t.Error("a retrying job must not be terminal, or the client stops waiting on work that will complete")
+	}
+	if j.RetryInSeconds <= 0 {
+		t.Errorf("RetryInSeconds = %d, want > 0 so the page can say when", j.RetryInSeconds)
+	}
+
+	// Still in the input bucket: nothing was moved aside, so it will be retried.
+	if !ms.has("input", "big.zip") {
+		t.Error("stalled input was consumed; it must stay for the retry")
+	}
+	if ms.has("output", "big.zip") {
+		t.Error("a stalled read must not produce output")
+	}
+
+	// And it is held back rather than immediately re-eligible at the head.
+	if w.eligible(store.Object{Key: "big.zip"}, time.Now()) {
+		t.Error("stalled object is immediately eligible again; it will retake the head of the queue " +
+			"every cycle and stall everything behind it")
+	}
 }
 
 func TestWorkerScrubsAndMoves(t *testing.T) {

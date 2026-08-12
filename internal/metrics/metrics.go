@@ -196,6 +196,10 @@ type Job struct {
 	// should take is the signal, and it is the only one available while
 	// FilesDone is pinned at 0.
 	PhaseSince time.Time `json:"-"`
+	// RetryInSeconds is how long the object is held back before its next attempt,
+	// set alongside Status "retrying". It is what lets the page say "retrying in
+	// 8s" instead of either giving up or claiming progress it cannot see.
+	RetryInSeconds int `json:"retry_in_seconds,omitempty"`
 }
 
 // PhaseSeconds reports how long the job has been in its current phase.
@@ -213,6 +217,11 @@ func (j Job) PhaseSeconds() float64 {
 }
 
 // Done reports whether the job reached a terminal state.
+//
+// "retrying" is deliberately not terminal. The object is still in the input bucket
+// and will be picked up again after its backoff, so a client must keep waiting on
+// it; treating a transient backend stall as terminal showed a permanent failure for
+// work that then completed a minute later, with nothing to tell the user it had.
 func (j Job) Done() bool {
 	return j.Status == "scrubbed" || j.Status == "error" || j.Status == "skipped"
 }

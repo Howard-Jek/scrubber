@@ -89,6 +89,32 @@ type Deps struct {
 	//
 	// Zero uses defaultStorageBudget.
 	StorageBudget time.Duration
+	// Canceller withdraws an object from the queue, or aborts it mid-scrub.
+	// Optional: nil disables the endpoint entirely.
+	Canceller Canceller
+	// AllowCancel enables POST /api/cancel at all.
+	AllowCancel bool
+	// AllowCancelAny drops the requirement that the caller present the cancel
+	// token this server minted for that key at upload time.
+	//
+	// It exists because clearing somebody else's stuck object is the operator's
+	// actual problem, and they will not have that client's token. It is off by
+	// default because the API has no authentication: /api/queue and /api/history
+	// both publish live input keys, so with this on, anyone who can reach the
+	// Route can durably evacuate the queue for every user in a loop.
+	AllowCancelAny bool
+	// CancelBudget bounds the storage work one cancel may do. Larger than
+	// StorageBudget because the disposition is a server-side copy of an object that
+	// may be hundreds of megabytes, and the caller wants a truthful answer more
+	// than a fast one. Zero uses defaultCancelBudget.
+	CancelBudget time.Duration
+}
+
+// Canceller withdraws an object. Implemented by the worker, which owns the queue
+// and the in-flight object; the server only routes to it.
+type Canceller interface {
+	// Cancel reports what it achieved: withdrawn, aborting, too-late or not-found.
+	Cancel(ctx context.Context, key string) (string, error)
 }
 
 // staleAfter is how long an in-flight job record is trusted on its own before
@@ -108,6 +134,12 @@ const queueSnapshotMax = 50
 // trouble, which is exactly when a fast degraded answer beats a slow true one.
 const defaultStorageBudget = 5 * time.Second
 
+// defaultCancelBudget bounds the storage work one cancel may do. Much larger than
+// the poll budget: withdrawing an object means a server-side copy of something
+// that may be hundreds of megabytes, and a caller who has just asked to destroy
+// work wants a truthful answer more than a fast one.
+const defaultCancelBudget = 60 * time.Second
+
 // Server holds the dependencies for the endpoints.
 type Server struct{ d Deps }
 
@@ -122,6 +154,9 @@ func New(d Deps) *Server {
 	if d.StorageBudget == 0 {
 		d.StorageBudget = defaultStorageBudget
 	}
+	if d.CancelBudget == 0 {
+		d.CancelBudget = defaultCancelBudget
+	}
 	return &Server{d: d}
 }
 
@@ -131,10 +166,16 @@ func New(d Deps) *Server {
 // It hangs off the request context, so a client that gives up still cancels the
 // work it started rather than leaving it to run against a struggling backend.
 func (s *Server) storageCtx(r *http.Request) (context.Context, context.CancelFunc) {
-	if s.d.StorageBudget < 0 {
+	return s.storageCtxFor(r, s.d.StorageBudget)
+}
+
+// storageCtxFor is storageCtx with an explicit budget, for the handlers whose work
+// is not browser-poll-shaped.
+func (s *Server) storageCtxFor(r *http.Request, budget time.Duration) (context.Context, context.CancelFunc) {
+	if budget < 0 {
 		return r.Context(), func() {}
 	}
-	return context.WithTimeout(r.Context(), s.d.StorageBudget)
+	return context.WithTimeout(r.Context(), budget)
 }
 
 // Handler returns the routed HTTP handler.
@@ -154,6 +195,7 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("/api/history", s.apiHistory)
 	mux.HandleFunc("/api/report", s.apiReport)
 	mux.HandleFunc("/api/queue", s.apiQueue)
+	mux.HandleFunc("/api/cancel", s.apiCancel)
 	// Static front page.
 	mux.HandleFunc("/", s.index)
 	return mux
@@ -234,7 +276,11 @@ func (s *Server) apiUpload(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "could not mint upload URL", http.StatusBadGateway)
 		return
 	}
-	writeJSON(w, map[string]any{"key": key, "url": url, "method": "PUT"})
+	// The cancel token goes out with the key that it authorises, and only here.
+	// This is the one moment the server knows the caller is the originator of this
+	// upload, so it is the only moment a capability for it can honestly be issued.
+	writeJSON(w, map[string]any{
+		"key": key, "url": url, "method": "PUT", "cancel_token": cancelToken(key)})
 }
 
 // apiStatus reports the outcome of a previously uploaded key (browser-safe fields).
@@ -606,7 +652,10 @@ func jobStatusPayload(j metrics.Job) map[string]any {
 		// container is fully expanded — so the client shows this instead of
 		// animating a bar it has no basis for.
 		"phase_seconds": j.PhaseSeconds(),
-		"output_key":    j.OutputKey,
+		// Set only with status "retrying": how long until the next attempt. The
+		// client shows it and keeps polling rather than reporting a failure.
+		"retry_in_seconds": j.RetryInSeconds,
+		"output_key":       j.OutputKey,
 	}
 }
 

@@ -434,6 +434,11 @@ Supplied as environment variables, in practice via a ConfigMap plus a Secret.
 | `SPILL_RESIDENT_MAX` | *derived* | Aggregate in-memory budget. **This is what bounds RSS.** Scaled from the pod's memory (64Mi at 2Gi). |
 | `STALL_WARN_AFTER` | `5m` | How long the in-flight object may sit in one phase before the worker logs that it may be stalled. A log threshold, never a kill. Zero disables. |
 | `TRANSFER_STALL_TIMEOUT` | `60s` | Abandon an object-storage transfer that has moved **no bytes** for this long. Not a deadline on the transfer. Also bounds metadata calls (10× for listings). Negative disables, restoring an unbounded wait. |
+| `ALLOW_CANCEL` | `true` | Enable `POST /api/cancel`. A cancel must still present the token this server minted for that key at upload time. |
+| `ALLOW_CANCEL_ANY` | `false` | Drop the token requirement, so any caller can withdraw any key. **Do not enable without real authentication in front of the Route** — `/api/queue` and `/api/history` both publish live input keys, so this turns a two-line loop into a durable evacuation of every user's work. It exists because clearing *somebody else's* stuck object is the operator's real need. |
+| `CANCELLED_PREFIX` | `cancelled/` | Where a withdrawn input is moved under `PROCESSED_ACTION=move`. Never empty — every string has `""` as a prefix, so an empty value would make the whole bucket ineligible. |
+| `CANCEL_BUDGET` | `60s` | Storage time one cancel may take. Larger than `API_STORAGE_BUDGET` because the withdrawal is a server-side copy of a possibly large object, and the caller wants a truthful answer more than a fast one. |
+| `LIST_TIMEOUT` | `90s` | Bound on one bucket listing. Separate from the stall timeout because a listing's honest duration scales with the bucket (it paginates, and the input bucket includes `processed/`) rather than with the network. Negative disables. |
 | `API_STORAGE_BUDGET` | `5s` | Total object-storage time **one HTTP request** may spend, shared across every call it makes. The per-call bound above is the safety net; this is what a browser polling every second experiences. On expiry `/api/status` answers `backend: "unreachable"`, `/api/history` returns `partial: true`, `/api/report` returns 504. Negative disables. |
 | `RESIDUAL_BUDGET` | 64Mi | Per-object budget for the residual scan; negative disables it. |
 | `VERIFY_OUTPUT` | `false` | Re-scan scrubbed output (~70% slower). |
@@ -580,6 +585,55 @@ Other endpoints:
 - `GET /api/report?key=…` — the full stored report for one run.
 - `GET /api/queue` — the object being scrubbed plus the head of the pending list, in
   order. Keys only.
+- `POST /api/cancel` — withdraw a package, queued or mid-scrub. See below.
+
+### Withdrawing a package
+
+The queue is strict FCFS with a single consumer, so one object that cannot make
+progress holds up everyone behind it. `POST /api/cancel` is the escape hatch, and
+the **Withdraw** button on each upload card is its front end.
+
+```
+POST /api/cancel   Content-Type: application/json
+{"key": "<input key>", "token": "<cancel_token from /api/uploads>"}
+```
+
+| Outcome | HTTP | Meaning |
+| --- | --- | --- |
+| `withdrawn` | 200 | It was not running. The input is disposed of; it will never be scrubbed. |
+| `aborting` | 202 | It was mid-scrub and has been told to stop. The walk halts between archive members — seconds, not instant. |
+| `too-late` | 409 | The scrubbed output was already written. **Nothing was withdrawn.** |
+| `not-found` | 404 | No such object in the input bucket. |
+
+**What "withdraw" does to the data.** Under `PROCESSED_ACTION=move` (the default)
+the input is moved to `CANCELLED_PREFIX`, not deleted — the bundle is the user's
+own copy of logs they were preparing to send out, and the usual reason to withdraw
+is that it is stuck, not that it is unwanted. Under `PROCESSED_ACTION=delete` it is
+deleted, because a deployment that asked for inputs to be destroyed did not ask for
+an exception. A withdrawn object produces **no output, no report and no digest**.
+
+**Why it must reach the object and not just the queue.** The in-memory queue is a
+derived view: `Sync()` rebuilds it wholesale from a bucket listing on every poll, so
+removing a key from memory withdraws nothing — the next listing puts it straight
+back. The durable disposition is the cancel; the in-memory mark only covers the
+seconds before it lands.
+
+**Two security properties worth understanding before you enable this**, because the
+browser API has no authentication of its own:
+
+- A cancel must present the token `/api/uploads` issued for that exact key. It is
+  not authentication — it proves nothing about who is asking — but it scopes the
+  endpoint to keys the caller was actually handed, rather than to every key
+  `/api/queue` and `/api/history` print. Without it, cancel is a two-line loop that
+  durably evacuates the queue for every user.
+- `ALLOW_CANCEL_ANY=true` removes that scoping. It is the operator path for
+  clearing someone else's stuck object, and it should only be on behind real
+  authentication.
+
+An aborted walk never repacks. Members scrubbed before the abort and members not
+yet reached would otherwise rebuild into a well-formed archive of mixed scrubbed
+and raw content — so every container returns its **original input** once the abort
+trips, `changed` collapses to false at every level, and there is nothing to ship.
 
 A run that contains files the pipeline could not inspect is shown as an amber **"N files
 NOT scrubbed"** state naming each file and why — never a green check.

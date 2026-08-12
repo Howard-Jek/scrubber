@@ -298,26 +298,70 @@
       '<div style="display:flex; align-items:center; gap:10px;">'
       +'<svg class="icn" style="font-size:20px; color:var(--color-text-secondary);" aria-hidden="true"><use href="#i-'+(isArch?'file-zip':'file-text')+'"/></svg>'
       +'<span style="font-family:var(--font-mono); font-size:13px; color:var(--color-text-primary); overflow:hidden; text-overflow:ellipsis; white-space:nowrap;">'+esc(file.name)+'</span>'
-      +'<span class="st" style="margin-left:auto; font-size:12px; color:var(--color-text-secondary); white-space:nowrap;">Uploading…</span></div>'
+      +'<span class="st" style="margin-left:auto; font-size:12px; color:var(--color-text-secondary); white-space:nowrap;">Uploading…</span>'
+      // Withdraw sits next to the status because that is where the eye already is
+      // when an upload looks stuck. Hidden until the object exists server-side:
+      // there is nothing to withdraw during the browser-to-MinIO PUT.
+      +'<button class="cx" type="button" title="Withdraw this package from the queue" '
+      +'style="display:none; margin-left:8px; padding:2px 9px; font-size:12px; cursor:pointer; '
+      +'background:transparent; color:var(--color-text-tertiary); '
+      +'border:0.5px solid var(--color-border-tertiary); border-radius:var(--border-radius-md);">Withdraw</button></div>'
       +'<div style="margin-top:10px; height:6px; background:var(--color-background-tertiary); border-radius:999px; overflow:hidden;"><div class="bar" style="height:100%; width:0%; background:var(--accent); border-radius:999px; transition:width .25s;"></div></div>'
       +'<div class="meta" style="display:flex; justify-content:space-between; margin-top:7px; font-size:12px; color:var(--color-text-tertiary);"><span class="pct">0%</span><span class="el">0.0s</span></div>'
       +'<div class="done"></div>';
     list.appendChild(card);
     var bar=card.querySelector('.bar'), st=card.querySelector('.st'), pct=card.querySelector('.pct'),
-        elp=card.querySelector('.el'), meta=card.querySelector('.meta'), done=card.querySelector('.done');
+        elp=card.querySelector('.el'), meta=card.querySelector('.meta'), done=card.querySelector('.done'),
+        cx=card.querySelector('.cx');
+    var cancelled=false;
     var tick=setInterval(function(){ elp.textContent=((Date.now()-start)/1000).toFixed(1)+'s'; },100);
     function setp(p){ p=Math.round(p); bar.style.width=p+'%'; pct.textContent=p+'%'; }
-    function fail(m){ clearInterval(tick); st.innerHTML='<span style="color:var(--color-text-danger)">'+esc(m)+'</span>'; bar.style.background='var(--color-text-danger)'; }
+    function fail(m){ clearInterval(tick); if(cx) cx.style.display='none'; st.innerHTML='<span style="color:var(--color-text-danger)">'+esc(m)+'</span>'; bar.style.background='var(--color-text-danger)'; }
 
     fetch('/api/uploads',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({name:file.name})})
       .then(function(r){ if(!r.ok) throw 0; return r.json(); })
       .then(function(u){
         var xhr=new XMLHttpRequest(); xhr.open('PUT',u.url);
         xhr.upload.onprogress=function(e){ if(e.lengthComputable) setp(e.loaded/e.total*55); };
-        xhr.onload=function(){ if(xhr.status>=200&&xhr.status<300){ st.textContent=isArch?'Unpacking…':'Scrubbing…'; setp(60); poll(u.key,60); } else fail('upload failed ('+xhr.status+')'); };
+        xhr.onload=function(){ if(xhr.status>=200&&xhr.status<300){ st.textContent=isArch?'Unpacking…':'Scrubbing…'; setp(60); armWithdraw(u.key,u.cancel_token); poll(u.key,60); } else fail('upload failed ('+xhr.status+')'); };
         xhr.onerror=function(){ fail('upload blocked (CORS?)'); };
         xhr.send(file);
       }).catch(function(){ fail('could not start upload'); });
+
+    // Withdraw the package. Only offered once the object exists server-side —
+    // during the browser-to-MinIO PUT there is nothing for the service to withdraw.
+    //
+    // The token came back from /api/uploads and is what scopes this to an upload
+    // this page actually made: the API has no authentication, and /api/queue and
+    // /api/history both publish live keys, so without it a cancel endpoint is a
+    // loop that clears everyone's work.
+    function armWithdraw(key,token){
+      cx.style.display='';
+      cx.onclick=function(){
+        if(!confirm('Withdraw this package?\n\nIt will be removed from the queue and not scrubbed. '
+          +'The uploaded file is moved aside, not deleted.')) return;
+        cx.disabled=true; cx.textContent='Withdrawing…';
+        fetch('/api/cancel',{method:'POST',headers:{'Content-Type':'application/json'},
+          body:JSON.stringify({key:key,token:token||''})})
+          .then(function(r){ return r.json().then(function(b){ return {ok:r.ok,code:r.status,body:b}; }); })
+          .then(function(res){
+            if(res.code===409){ // already delivered; the scrub finished first
+              cx.style.display='none';
+              st.textContent='Too late — the scrub already completed';
+              return;
+            }
+            if(!res.ok){ cx.disabled=false; cx.textContent='Withdraw';
+              st.textContent=(res.body&&res.body.error)||'could not withdraw'; return; }
+            cancelled=true;
+            cx.style.display='none';
+            clearInterval(tick);
+            bar.style.background='var(--color-text-tertiary)';
+            st.textContent=res.body.outcome==='aborting'
+              ? 'Aborting the scrub…' : 'Withdrawn';
+          })
+          .catch(function(){ cx.disabled=false; cx.textContent='Withdraw'; st.textContent='could not withdraw'; });
+      };
+    }
 
     // Poll until the server gives a terminal answer. Every non-terminal status is
     // handled explicitly; anything unrecognised stops the loop rather than
@@ -326,10 +370,30 @@
     // "keep waiting", so a lost record or a skipped object hung indefinitely.
     var netErrs=0, MAX_NET_ERRS=8;
     function poll(key,creep){
+      // A withdrawn card stops polling here rather than in every branch below.
+      // The server may still report "processing" for a moment while an in-flight
+      // walk unwinds, and re-rendering that over "Withdrawn" would look like the
+      // withdrawal had failed.
+      if(cancelled) return;
       fetch('/api/status?key='+encodeURIComponent(key)).then(function(r){return r.json();}).then(function(s){
         netErrs=0;
+        if(cancelled) return;
+        if(s.status==='cancelled'){ clearInterval(tick); cx.style.display='none';
+          bar.style.background='var(--color-text-tertiary)'; st.textContent='Withdrawn'; return; }
         if(s.status==='scrubbed'){ setp(100); finish(s,key); return; }
         if(s.status==='error'){ fail(s.error||'processing error'); return; }
+        // Retryable: the backend stalled, but the object is still in the input
+        // bucket and will be picked up again after a backoff. Keep polling and
+        // hold the bar. Treating this as terminal showed a permanent failure for
+        // work that then completed a minute later, with nothing to say it had.
+        if(s.status==='retrying'){
+          var wait=s.retry_in_seconds||0;
+          st.textContent='Storage stalled — retrying'+(wait?' in '+wait+'s':'')+'…';
+          st.title=s.error||'';
+          setp(creep);
+          setTimeout(function(){poll(key,creep);},1200);
+          return;
+        }
         if(s.status==='skipped'){ fail(s.error||'skipped (too large to process)'); return; }
         if(s.status==='unknown'){ fail(s.error||'no result recorded for this upload'); return; }
         if(s.status!=='processing'){ fail('unexpected status: '+s.status); return; }
@@ -379,6 +443,8 @@
 
     function finish(s,key){
       clearInterval(tick); meta.style.display='none';
+      // Nothing left to withdraw: the output is written.
+      if(cx) cx.style.display='none';
       var secs=((Date.now()-start)/1000).toFixed(1);
       // One coverage question, one answer. The UI used to read `passthrough`, which
       // excluded files skipped as binary — so a UTF-16 log that was never inspected

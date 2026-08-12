@@ -46,6 +46,10 @@ type ObjectStore interface {
 	// GetLimitedTo streams an object into w, reading at most max bytes and returning
 	// ErrTooLarge past that. It is GetLimited without the intermediate []byte.
 	GetLimitedTo(ctx context.Context, w io.Writer, bucket, key string, max int64) (int64, error)
+	// Stat reports whether an object exists without transferring it. Distinct from
+	// Exists, which returns the body: asking "is this still there?" about a
+	// several-hundred-megabyte upload must not download it.
+	Stat(ctx context.Context, bucket, key string) (Object, bool, error)
 	Move(ctx context.Context, bucket, srcKey, dstKey string) error
 	Delete(ctx context.Context, bucket, key string) error
 }
@@ -66,6 +70,13 @@ type Config struct {
 	// Zero uses defaultStallTimeout; negative disables the guard, which restores
 	// the unbounded wait and should only be used to prove one is happening.
 	StallTimeout time.Duration
+	// ListTimeout bounds one bucket listing. Separate from StallTimeout because a
+	// listing is the one call whose honest duration scales with the bucket rather
+	// than with the network: it paginates, and the input bucket includes
+	// processed/. It was previously derived as 10x StallTimeout, which made the
+	// default ten minutes — long enough that a dead backend looked idle rather
+	// than broken. Zero uses defaultListTimeout; negative disables the bound.
+	ListTimeout time.Duration
 }
 
 // Client is the concrete MinIO-backed ObjectStore.
@@ -73,6 +84,7 @@ type Client struct {
 	mc      *minio.Client // in-cluster endpoint, used for all object operations
 	presign *minio.Client // signs presigned URLs against the browser-reachable host
 	stall   time.Duration // per-transfer inactivity budget; <=0 disables
+	list    time.Duration // bound on one bucket listing; <=0 disables
 }
 
 // guard derives a cancellable context for one transfer and arms a stall watch on
@@ -108,17 +120,14 @@ func (c *Client) opCtx(ctx context.Context) (context.Context, context.CancelFunc
 }
 
 // listCtx bounds a listing, which unlike the other metadata calls legitimately
-// scales with the bucket: it paginates, and the input bucket includes processed/.
-// Given a much longer budget for that reason, but still a finite one.
+// scales with the bucket rather than with the network: it paginates, and the input
+// bucket includes processed/. It gets its own setting for that reason.
 func (c *Client) listCtx(ctx context.Context) (context.Context, context.CancelFunc) {
-	if c.stall <= 0 {
+	if c.list <= 0 {
 		return ctx, func() {}
 	}
-	return context.WithTimeout(ctx, c.stall*listTimeoutFactor)
+	return context.WithTimeout(ctx, c.list)
 }
-
-// listTimeoutFactor is how much longer a listing may take than a point operation.
-const listTimeoutFactor = 10
 
 // New builds a MinIO client from Config. When PublicEndpoint is set, a second
 // client is created bound to that host purely for presigning: SigV4 signs the host
@@ -161,7 +170,11 @@ func New(cfg Config) (*Client, error) {
 	if stall == 0 {
 		stall = defaultStallTimeout
 	}
-	return &Client{mc: mc, presign: presign, stall: stall}, nil
+	list := cfg.ListTimeout
+	if list == 0 {
+		list = defaultListTimeout
+	}
+	return &Client{mc: mc, presign: presign, stall: stall, list: list}, nil
 }
 
 // PresignPut returns a presigned URL a browser can PUT an object to directly.

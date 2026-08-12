@@ -32,6 +32,15 @@ var ErrStalled = errors.New("transfer stalled")
 // arriving, so that is what is measured.
 const defaultStallTimeout = 60 * time.Second
 
+// defaultListTimeout bounds one bucket listing.
+//
+// Sized against the listing rather than against the network: paginating a large
+// input bucket (which includes processed/) is legitimately slower than any point
+// operation, but not minutes-slower. The previous derivation of 10x the stall
+// timeout put this at ten minutes by default, during which a dead backend looked
+// idle rather than broken.
+const defaultListTimeout = 90 * time.Second
+
 // stallGuard cancels a transfer's context when nothing has moved for timeout.
 //
 // The timer starts on construction, not on the first byte, so a request that
