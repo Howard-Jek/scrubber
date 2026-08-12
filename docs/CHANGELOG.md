@@ -123,12 +123,40 @@ have waited forever.
 whole reason this needed its own metric: nothing about the pod's own health ever
 indicated a fault, and it never would have.
 
-**One rough edge, recorded not fixed.** A single `/api/status` request can make up
-to three bounded storage calls in series, so with the backend fully down it answers
-in ~3× the timeout — measured at 45s with a 15s setting, so ~180s at the 60s
-default. It *answers*, which is the property that matters and is a strict
-improvement on hanging, but it is a poor browser poll. A per-request budget on the
-API path would be the fix.
+### The browser API now has a latency budget, not just per-call bounds
+
+Bounding each storage call stops any one of them hanging forever but says nothing
+about their sum. A status poll makes up to three in series; a history page fans out
+to `HISTORY_MAX` digest reads eight at a time. With the backend down those answered
+in multiples of the per-call timeout — measured at 45s for one status poll with a
+15s setting, so ~180s at the 60s default, and roughly 13× that for a history page.
+For a request a browser repeats every second, a slow true answer is worse than a
+fast honest one.
+
+`API_STORAGE_BUDGET` (default 5s) is now a single deadline shared by every storage
+call one HTTP request makes, hung off the request context so a client that gives up
+also cancels the work it started. The per-call bounds remain as the safety net; this
+is the latency contract.
+
+What each endpoint does when it expires matters as much as the bound:
+
+- **`/api/status`** returns `status: processing` with `backend: "unreachable"`, and
+  the page shows "Storage not responding — retrying…". Falling through to `queued`
+  would be a guess, and it is the guess that reads as normal; `unknown` would make
+  the UI give up on an object that may be scrubbing perfectly well.
+- **`/api/history`** returns whatever it gathered with `partial: true`. A page that
+  silently shows six of twenty runs looks like the other fourteen never happened.
+  Entries lost to the budget are marked `unavailable`, not `unreadable` — the latter
+  is a claim about the run, and repeated across a page it reads as data loss.
+- **`/api/report`** returns 504, not 404. A missing report and an unreachable one
+  are different, and 404 tells the UI to stop asking for a report that exists.
+
+Measured against a frozen backend, per-call bound 60s, budget 5s:
+
+| Request | Before | After |
+| --- | --- | --- |
+| `/api/status` poll | 45s | **5.0s** |
+| `/api/history?n=50` | minutes | **5.0s** |
 
 ### Caps now size themselves against the pod
 

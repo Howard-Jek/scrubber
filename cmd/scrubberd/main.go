@@ -331,6 +331,10 @@ func realMain(log *slog.Logger) error {
 			ReportsBucket: mustEnv("REPORTS_BUCKET"),
 			UploadExpiry:  envDuration("UPLOAD_EXPIRY", 15*time.Minute),
 			HistoryMax:    envInt("HISTORY_MAX", 100),
+			// Total object-storage time one HTTP request may spend. The store
+			// bounds each call; this bounds their sum, which is what a browser
+			// polling every second actually experiences. Negative disables it.
+			StorageBudget: envDuration("API_STORAGE_BUDGET", 5*time.Second),
 		}).Handler(),
 		ReadHeaderTimeout: 10 * time.Second,
 	}

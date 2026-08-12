@@ -77,6 +77,18 @@ type Deps struct {
 	UploadExpiry  time.Duration
 	// HistoryMax caps the N a caller may request from /api/history.
 	HistoryMax int
+	// StorageBudget bounds *all* the object-storage work one HTTP request may do,
+	// as a single deadline shared by every call it makes.
+	//
+	// The store bounds each call individually, which stops any one of them hanging
+	// forever but says nothing about their sum. A status poll makes up to three in
+	// series and a history page fans out to HistoryMax reads eight at a time, so
+	// with the backend down those answer in multiples of the per-call timeout —
+	// minutes, for a request a browser repeats every second. The per-call bound is
+	// the safety net; this is the latency contract.
+	//
+	// Zero uses defaultStorageBudget.
+	StorageBudget time.Duration
 }
 
 // staleAfter is how long an in-flight job record is trusted on its own before
@@ -87,6 +99,14 @@ const staleAfter = 30 * time.Second
 // queueSnapshotMax caps how many pending keys /api/queue lists, so an operator
 // poking at a large backlog cannot pull a megabyte of key names.
 const queueSnapshotMax = 50
+
+// defaultStorageBudget is how long one request may spend on object storage in
+// total. Chosen against the client rather than the backend: the upload page polls
+// status roughly every second, so an answer that takes longer than a few seconds
+// is already stale when it arrives and the next poll is queued behind it. A
+// healthy lookup takes milliseconds; this only ever bites when the backend is in
+// trouble, which is exactly when a fast degraded answer beats a slow true one.
+const defaultStorageBudget = 5 * time.Second
 
 // Server holds the dependencies for the endpoints.
 type Server struct{ d Deps }
@@ -99,7 +119,22 @@ func New(d Deps) *Server {
 	if d.HistoryMax <= 0 {
 		d.HistoryMax = 100
 	}
+	if d.StorageBudget == 0 {
+		d.StorageBudget = defaultStorageBudget
+	}
 	return &Server{d: d}
+}
+
+// storageCtx derives the deadline shared by every object-storage call this
+// request makes. Negative disables it, leaving only the store's per-call bounds.
+//
+// It hangs off the request context, so a client that gives up still cancels the
+// work it started rather than leaving it to run against a struggling backend.
+func (s *Server) storageCtx(r *http.Request) (context.Context, context.CancelFunc) {
+	if s.d.StorageBudget < 0 {
+		return r.Context(), func() {}
+	}
+	return context.WithTimeout(r.Context(), s.d.StorageBudget)
 }
 
 // Handler returns the routed HTTP handler.
@@ -248,7 +283,11 @@ func (s *Server) apiStatus(w http.ResponseWriter, r *http.Request) {
 	// its record has been in-flight implausibly long (a wedged or re-looping
 	// object). Storage is authoritative — check it before reporting in-flight, so
 	// a client is never stranded on an object that actually completed.
-	if d, ok := s.digestFor(r.Context(), key); ok {
+	// One deadline from here down, shared by every storage call below.
+	ctx, cancel := s.storageCtx(r)
+	defer cancel()
+
+	if d, ok := s.digestFor(ctx, key); ok {
 		writeJSON(w, digestStatusPayload(d))
 		return
 	}
@@ -260,13 +299,29 @@ func (s *Server) apiStatus(w http.ResponseWriter, r *http.Request) {
 	// No record anywhere. Distinguish "still queued" from "we have lost track of
 	// it" so the UI can stop waiting instead of polling indefinitely.
 	if s.d.Archive != nil {
-		if _, found, err := s.d.Archive.Stat(r.Context(), s.d.InputBucket, key); err == nil && !found {
+		if _, found, err := s.d.Archive.Stat(ctx, s.d.InputBucket, key); err == nil && !found {
 			writeJSON(w, map[string]any{
 				"status": "unknown",
 				"error":  "no result recorded for this key; it may have expired or never been uploaded",
 			})
 			return
 		}
+	}
+
+	// The budget ran out, so nothing above could be answered from storage. Say so
+	// rather than falling through to "queued": a client told it is queued will
+	// wait quietly on an answer that is never coming, and one told "unknown" gives
+	// up on an object that may be scrubbing perfectly well. Neither is true — what
+	// is true is that the backend did not respond in time, and the right response
+	// to that is to keep polling and show it.
+	if ctx.Err() != nil {
+		writeJSON(w, map[string]any{
+			"status":     "processing",
+			"backend":    "unreachable",
+			"files_done": 0,
+			"error":      "object storage did not respond within the request budget; still retrying",
+		})
+		return
 	}
 
 	// The object is sitting in the input bucket and nothing knows about it yet, so
@@ -365,7 +420,13 @@ func (s *Server) apiHistory(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
-	objs, err := s.d.Archive.List(r.Context(), s.d.ReportsBucket, "")
+	// One deadline for the listing and every digest read fanned out below. Without
+	// it this request costs the per-call timeout times ceil(n/8) when the backend
+	// is down — minutes, for a page load.
+	ctx, cancel := s.storageCtx(r)
+	defer cancel()
+
+	objs, err := s.d.Archive.List(ctx, s.d.ReportsBucket, "")
 	if err != nil {
 		writeJSONStatus(w, http.StatusBadGateway, map[string]any{"error": "could not list reports"})
 		return
@@ -396,9 +457,17 @@ func (s *Server) apiHistory(w http.ResponseWriter, r *http.Request) {
 
 			key := strings.TrimSuffix(o.Key, report.DigestSuffix)
 			entry := map[string]any{"key": key, "at": o.LastModified}
-			raw, err := s.d.Archive.Get(r.Context(), s.d.ReportsBucket, o.Key)
+			raw, err := s.d.Archive.Get(ctx, s.d.ReportsBucket, o.Key)
 			if err != nil {
-				entry["status"] = "unreadable"
+				// Distinguish "this digest is corrupt" from "we ran out of time".
+				// Labelling a run unreadable is a claim about the run, and repeating
+				// it across a whole page would read as data loss rather than as a
+				// slow backend.
+				if ctx.Err() != nil {
+					entry["status"] = "unavailable"
+				} else {
+					entry["status"] = "unreadable"
+				}
 				runs[i] = entry
 				return
 			}
@@ -416,7 +485,14 @@ func (s *Server) apiHistory(w http.ResponseWriter, r *http.Request) {
 	}
 	wg.Wait()
 
-	writeJSON(w, map[string]any{"runs": runs, "n": n, "max": s.d.HistoryMax})
+	out := map[string]any{"runs": runs, "n": n, "max": s.d.HistoryMax}
+	if ctx.Err() != nil {
+		// Partial results, flagged. A page that silently shows six of twenty runs
+		// looks like the other fourteen never happened.
+		out["partial"] = true
+		out["error"] = "object storage did not respond within the request budget; some runs are missing"
+	}
+	writeJSON(w, out)
 }
 
 // apiReport returns the full stored report for a key, for the detail view.
@@ -426,8 +502,17 @@ func (s *Server) apiReport(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "missing key", http.StatusBadRequest)
 		return
 	}
-	rep, ok := s.reportFor(r.Context(), key)
+	ctx, cancel := s.storageCtx(r)
+	defer cancel()
+	rep, ok := s.reportFor(ctx, key)
 	if !ok {
+		// A budget expiry is not a missing report, and 404 would tell the UI to
+		// stop asking for one that exists.
+		if ctx.Err() != nil {
+			writeJSONStatus(w, http.StatusGatewayTimeout, map[string]any{
+				"error": "object storage did not respond within the request budget"})
+			return
+		}
 		writeJSONStatus(w, http.StatusNotFound, map[string]any{"error": "no report stored for this key"})
 		return
 	}

@@ -339,7 +339,14 @@
         // reach nearly full having done nothing, which reads as "almost there" to
         // someone who is actually twentieth in line. Hold the bar where the upload
         // left it and put the real state in the text instead.
-        if(s.phase==='queued'){
+        if(s.backend==='unreachable'){
+          // The service is up but could not reach object storage inside its
+          // budget. Keep polling and hold the bar: the scrub may be progressing
+          // perfectly well, we just cannot see it. Saying "queued" here would be
+          // a guess, and it is the guess that reads as normal.
+          st.textContent='Storage not responding — retrying…';
+          st.title=s.error||'';
+        } else if(s.phase==='queued'){
           creep=Math.min(creep,60);
           st.textContent=s.queue_position
             ? 'Queued — '+s.queue_position+' of '+s.queue_depth

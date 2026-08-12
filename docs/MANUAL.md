@@ -434,6 +434,7 @@ Supplied as environment variables, in practice via a ConfigMap plus a Secret.
 | `SPILL_RESIDENT_MAX` | *derived* | Aggregate in-memory budget. **This is what bounds RSS.** Scaled from the pod's memory (64Mi at 2Gi). |
 | `STALL_WARN_AFTER` | `5m` | How long the in-flight object may sit in one phase before the worker logs that it may be stalled. A log threshold, never a kill. Zero disables. |
 | `TRANSFER_STALL_TIMEOUT` | `60s` | Abandon an object-storage transfer that has moved **no bytes** for this long. Not a deadline on the transfer. Also bounds metadata calls (10× for listings). Negative disables, restoring an unbounded wait. |
+| `API_STORAGE_BUDGET` | `5s` | Total object-storage time **one HTTP request** may spend, shared across every call it makes. The per-call bound above is the safety net; this is what a browser polling every second experiences. On expiry `/api/status` answers `backend: "unreachable"`, `/api/history` returns `partial: true`, `/api/report` returns 504. Negative disables. |
 | `RESIDUAL_BUDGET` | 64Mi | Per-object budget for the residual scan; negative disables it. |
 | `VERIFY_OUTPUT` | `false` | Re-scan scrubbed output (~70% slower). |
 | `REVIEW_PREFIX` | `review/` | Where risky results are diverted; empty disables diverting. |

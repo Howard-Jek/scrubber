@@ -77,6 +77,12 @@ data:
   # Without it a connection that goes quiet mid-body blocks the single consumer
   # forever, with the pod live and ready throughout.
   TRANSFER_STALL_TIMEOUT: "60s"
+  # Total object-storage time ONE HTTP request may spend, shared by every call it
+  # makes. The per-call bound above stops any single call hanging; it says nothing
+  # about their sum, and a status poll makes up to three in series while a history
+  # page fans out to HISTORY_MAX reads. The browser repeats these every second, so
+  # a fast degraded answer beats a slow true one.
+  API_STORAGE_BUDGET: "5s"
   FINALIZE_GRACE: "15s"           # on shutdown, how long an object that has already
                                   # finished scrubbing may keep writing its output,
                                   # report and digest. Without this a SIGTERM lands

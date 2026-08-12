@@ -149,6 +149,18 @@ func newTestServerQ(jobs *metrics.JobLog, arc Archive, q QueueView, nudge func()
 	}).Handler()
 }
 
+// newTestServerWith builds a handler from a partly-filled Deps, filling in the
+// pieces every test needs. For cases that care about a specific dependency —
+// notably the storage budget — rather than the standard wiring.
+func newTestServerWith(d Deps) http.Handler {
+	d.Prom = prometheus.NewRegistry()
+	d.Presigner = fakePresigner{}
+	if d.Jobs == nil {
+		d.Jobs = metrics.NewJobLog(10)
+	}
+	return New(d).Handler()
+}
+
 func getJSON(t *testing.T, h http.Handler, path string) (int, map[string]any) {
 	t.Helper()
 	rec := httptest.NewRecorder()
@@ -266,6 +278,83 @@ func TestStatusReportsUnpackingPhase(t *testing.T) {
 	}
 	if secs < 60 {
 		t.Errorf("phase_seconds = %v, want >= 60 (the client shows this instead of a bar)", secs)
+	}
+}
+
+// hangingArchive blocks every call until its context is cancelled, modelling a
+// backend that accepts requests and then goes quiet.
+type hangingArchive struct{}
+
+func (hangingArchive) List(ctx context.Context, _, _ string) ([]store.Object, error) {
+	<-ctx.Done()
+	return nil, ctx.Err()
+}
+
+func (hangingArchive) Get(ctx context.Context, _, _ string) ([]byte, error) {
+	<-ctx.Done()
+	return nil, ctx.Err()
+}
+
+func (hangingArchive) Stat(ctx context.Context, _, _ string) (store.Object, bool, error) {
+	<-ctx.Done()
+	return store.Object{}, false, ctx.Err()
+}
+
+// TestStatusAnswersWithinBudgetWhenStorageHangs is the latency contract.
+//
+// The store bounds each call on its own, which stops any one hanging forever but
+// says nothing about their sum: a status lookup makes up to three in series, so
+// the per-call bound alone lets one poll take minutes. A browser repeats this
+// request every second, so a slow true answer is worse than a fast honest one.
+func TestStatusAnswersWithinBudgetWhenStorageHangs(t *testing.T) {
+	h := newTestServerWith(Deps{
+		Jobs:          metrics.NewJobLog(10),
+		Archive:       hangingArchive{},
+		InputBucket:   "input",
+		ReportsBucket: "reports",
+		StorageBudget: 150 * time.Millisecond,
+	})
+
+	start := time.Now()
+	_, body := getJSON(t, h, "/api/status?key=whatever.zip")
+	elapsed := time.Since(start)
+
+	// Generous ceiling: the point is that it is bounded at all, not the exact ms.
+	if elapsed > 2*time.Second {
+		t.Fatalf("status took %v with a 150ms budget; the budget is not shared across calls", elapsed)
+	}
+	// It must keep the client polling. "unknown" makes the UI give up on an object
+	// that may be scrubbing fine; "queued" is a guess that reads as normal.
+	if body["status"] != "processing" {
+		t.Errorf("status = %v, want processing (the client must keep polling)", body["status"])
+	}
+	if body["backend"] != "unreachable" {
+		t.Errorf("backend = %v, want unreachable — the degraded answer must say why",
+			body["backend"])
+	}
+}
+
+// TestHistoryReturnsPartialResultsWithinBudget pins the same contract for the
+// page load, which fans out to HistoryMax reads and would otherwise cost the
+// per-call timeout times ceil(n/8).
+func TestHistoryReturnsPartialResultsWithinBudget(t *testing.T) {
+	h := newTestServerWith(Deps{
+		Jobs:          metrics.NewJobLog(10),
+		Archive:       hangingArchive{},
+		ReportsBucket: "reports",
+		HistoryMax:    50,
+		StorageBudget: 150 * time.Millisecond,
+	})
+
+	start := time.Now()
+	code, _ := getJSON(t, h, "/api/history?n=50")
+	if elapsed := time.Since(start); elapsed > 2*time.Second {
+		t.Fatalf("history took %v with a 150ms budget", elapsed)
+	}
+	// The listing itself hangs here, so this is the bad-gateway path; what matters
+	// is that it answers rather than holding the connection open for minutes.
+	if code == 0 {
+		t.Error("history never answered")
 	}
 }
 
