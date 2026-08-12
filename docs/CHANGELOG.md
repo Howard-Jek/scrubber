@@ -10,7 +10,33 @@ For what to verify on your own cluster after taking a new image, see
 
 ---
 
-## Unreleased
+## Image 0.7.0 — an escape hatch from the queue, and a failure that used to be invisible
+
+### A failing discovery loop had no metric
+
+A listing failure logged one ERROR line and returned. Nothing else moved: not
+`scrubber_errors_total` (which is per-object, and on this path no object was ever
+seen), not the queue gauges, nothing. So a service with a misconfigured bucket name
+sat accepting uploads it would never scrub, with every per-object metric flat and
+the whole thing looking idle rather than broken — and no series existed to alert on.
+
+Found the honest way: a leftover test container had been logging
+`list input bucket: Bucket name cannot be shorter than 3 characters` every 15
+seconds for a day, and nothing anywhere would have escalated it.
+
+`scrubber_discovery_failures_total` now counts them. **Alert on it** — a steadily
+rising value with flat object counters means no work is being discovered at all.
+
+The log is also no longer a flood. At the default 15s interval an unrecoverable
+listing failure produced 5,760 identical lines a day, which is how a real fault
+comes to look like background noise. The first failure is logged in full; repeats
+are throttled to one every two minutes and carry the consecutive-failure count and
+how long it has been failing. Recovery is logged too, so the log records the fix
+rather than just going quiet.
+
+On a cluster the readiness probe does catch this specific case — `Healthy()` checks
+the input bucket, so the pod would sit `0/1 Ready`. But a NotReady pod is a thing
+someone has to notice, and under plain Docker there are no probes at all.
 
 ### A stuck package no longer holds the queue: packages can be withdrawn
 

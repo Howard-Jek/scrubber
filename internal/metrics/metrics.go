@@ -21,6 +21,16 @@ type Metrics struct {
 	Matches      prometheus.Counter
 	Passthrough  prometheus.Counter
 	Errors       prometheus.Counter
+	// DiscoveryFailures counts failed listings of the input bucket.
+	//
+	// It is separate from Errors, which is per-object: a discovery failure means no
+	// object was even seen, so every per-object counter stays flat and the service
+	// looks idle rather than broken. Without this the only evidence was a log line
+	// repeating on the poll interval, which is invisible to alerting and easy to
+	// mistake for noise — a misconfigured bucket name can sit in that state
+	// indefinitely, accepting uploads that are never scrubbed.
+	DiscoveryFailures prometheus.Counter
+
 	BytesIn      prometheus.Counter
 	BytesOut     prometheus.Counter
 	Duration     prometheus.Histogram
@@ -57,6 +67,11 @@ func New(reg prometheus.Registerer) *Metrics {
 		Matches:     prometheus.NewCounter(prometheus.CounterOpts{Name: "scrubber_matches_total", Help: "Total replacements made."}),
 		Passthrough: prometheus.NewCounter(prometheus.CounterOpts{Name: "scrubber_passthrough_total", Help: "Files passed through unchanged (binary/corrupt/unsupported)."}),
 		Errors:      prometheus.NewCounter(prometheus.CounterOpts{Name: "scrubber_errors_total", Help: "Objects that failed processing at the top level."}),
+		DiscoveryFailures: prometheus.NewCounter(prometheus.CounterOpts{
+			Name: "scrubber_discovery_failures_total",
+			Help: "Failed listings of the input bucket. Rising steadily means no work is " +
+				"being discovered at all, while every per-object metric stays flat.",
+		}),
 		BytesIn:     prometheus.NewCounter(prometheus.CounterOpts{Name: "scrubber_bytes_in_total", Help: "Total input bytes read."}),
 		BytesOut:    prometheus.NewCounter(prometheus.CounterOpts{Name: "scrubber_bytes_out_total", Help: "Total output bytes written."}),
 		Duration: prometheus.NewHistogram(prometheus.HistogramOpts{
@@ -83,8 +98,16 @@ func New(reg prometheus.Registerer) *Metrics {
 	for _, r := range report.AllReasons {
 		m.NotInspected.WithLabelValues(string(r)).Add(0)
 	}
+	// Object statuses need the same treatment, and had been missed. The operator
+	// guidance is to alert on scrubber_objects_total{status="stalled"} and
+	// {status="too_large"} — but an unseeded CounterVec emits no series at all
+	// until the label first fires, so those alerts would sit on a metric that does
+	// not exist and would look identical to "nothing has gone wrong".
+	for _, s := range ObjectStatuses {
+		m.Objects.WithLabelValues(s).Add(0)
+	}
 	reg.MustRegister(m.Objects, m.Verdicts, m.NotInspected, m.Residual,
-		m.Matches, m.Passthrough, m.Errors, m.BytesIn, m.BytesOut,
+		m.Matches, m.Passthrough, m.Errors, m.DiscoveryFailures, m.BytesIn, m.BytesOut,
 		m.Duration, m.QueueWait, m.Latency)
 	return m
 }
@@ -214,6 +237,21 @@ func (j Job) PhaseSeconds() float64 {
 		return 0
 	}
 	return time.Since(j.PhaseSince).Seconds()
+}
+
+// ObjectStatuses is every value scrubber_objects_total{status} can take.
+//
+// Declared rather than left implicit at the increment sites so the series can be
+// seeded at startup: a CounterVec emits nothing for a label combination until it
+// first fires, and an alert on a series that does not exist yet looks exactly like
+// an alert on a series that is healthily zero.
+var ObjectStatuses = []string{
+	"scrubbed",  // completed and delivered
+	"error",     // failed processing at the top level
+	"stalled",   // an object-storage transfer went quiet and was abandoned
+	"cancelled", // withdrawn from the queue by request
+	"too_large", // above MAX_OBJECT_BYTES; skipped without being downloaded
+	"panic",     // a bug in the pipeline; the object is skipped, the service continues
 }
 
 // Done reports whether the job reached a terminal state.

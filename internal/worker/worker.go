@@ -135,6 +135,10 @@ type Worker struct {
 	// empty after a restart, so the durable disposition below is what actually
 	// withdraws an object.
 	cancelled map[string]time.Time
+	// discovery failure run, for the metric and the log throttle.
+	discoveryFails    int
+	discoveryFailedAt time.Time
+	discoveryLoggedAt time.Time
 	// running describes the object being scrubbed right now, or nil when idle.
 	// There is exactly one consumer, so this is a single value rather than a map.
 	running *inflight
@@ -367,10 +371,11 @@ func (w *Worker) discoverOnce(ctx context.Context, reason string) {
 	objs, err := w.store.List(ctx, w.cfg.InputBucket, w.cfg.InputPrefix)
 	if err != nil {
 		if ctx.Err() == nil {
-			w.log.Error("list input bucket", "err", err)
+			w.noteDiscoveryFailure(err)
 		}
 		return
 	}
+	w.noteDiscoverySucceeded()
 
 	now := time.Now()
 	present := make(map[string]struct{}, len(objs))
@@ -412,6 +417,69 @@ func (w *Worker) orderKey(o store.Object, now time.Time) time.Time {
 	}
 	return o.LastModified
 }
+
+// noteDiscoveryFailure records a failed listing and logs it without flooding.
+//
+// A listing failure is usually not transient — a bucket that does not exist, a
+// name that is invalid, credentials that were revoked — so it repeats on every
+// poll for as long as the misconfiguration lasts. Logged unconditionally at the
+// default 15s interval that is 5,760 identical lines a day, which is how a real
+// fault comes to look like background noise and gets scrolled past.
+//
+// So: the first failure is logged in full, then repeats are throttled, and each
+// repeat carries how many consecutive failures there have been and for how long.
+// "still failing, 240 consecutive over 1h0m" is a sentence an operator can act on;
+// the same line 240 times is not.
+func (w *Worker) noteDiscoveryFailure(err error) {
+	w.metrics.DiscoveryFailures.Inc()
+
+	w.mu.Lock()
+	w.discoveryFails++
+	n := w.discoveryFails
+	if n == 1 {
+		w.discoveryFailedAt = time.Now()
+	}
+	since := time.Since(w.discoveryFailedAt)
+	quiet := time.Since(w.discoveryLoggedAt) < discoveryLogEvery && n > 1
+	if !quiet {
+		w.discoveryLoggedAt = time.Now()
+	}
+	w.mu.Unlock()
+
+	if quiet {
+		return
+	}
+	if n == 1 {
+		w.log.Error("could not list the input bucket; no new work can be discovered "+
+			"until this clears", "err", err)
+		return
+	}
+	// .String(), not the Duration itself: slog's JSON handler renders a Duration as
+	// raw nanoseconds, so "failing_for":3600000000000 is what an operator would
+	// have to decode in the middle of an incident.
+	w.log.Error("still cannot list the input bucket; NO uploads are being scrubbed",
+		"err", err, "consecutive_failures", n, "failing_for", since.Round(time.Second).String())
+}
+
+// noteDiscoverySucceeded clears the failure run and says so once, so the log
+// records the recovery rather than just going quiet.
+func (w *Worker) noteDiscoverySucceeded() {
+	w.mu.Lock()
+	n := w.discoveryFails
+	since := time.Since(w.discoveryFailedAt)
+	w.discoveryFails = 0
+	w.mu.Unlock()
+
+	if n > 0 {
+		w.log.Info("input bucket listing recovered",
+			"after_failures", n, "was_failing_for", since.Round(time.Second).String())
+	}
+}
+
+// discoveryLogEvery throttles the repeat message for a persistently failing
+// listing. Long enough that a wedged service does not drown its own log, short
+// enough that someone tailing it sees the problem within a couple of minutes.
+const discoveryLogEvery = 2 * time.Minute
 
 // sweepDeferrals drops backoff state for keys that are no longer in the bucket.
 // Without it the maps grow for the life of the process, and a key that reappears

@@ -460,9 +460,9 @@ Supplied as environment variables, in practice via a ConfigMap plus a Secret.
 
 ```sh
 # 1. build + push the image (air-gap: override BASE_*_IMAGE / GOPROXY to Artifactory mirrors)
-podman build -f deploy/Containerfile -t <artifactory>/docker-local/scrubberd:0.6.0 .
-podman push <artifactory>/docker-local/scrubberd:0.6.0
-#    (air-gapped: transfer dist/scrubberd-0.6.0.tar and `podman load -i` on the target)
+podman build -f deploy/Containerfile -t <artifactory>/docker-local/scrubberd:0.7.0 .
+podman push <artifactory>/docker-local/scrubberd:0.7.0
+#    (air-gapped: transfer dist/scrubberd-0.7.0.tar and `podman load -i` on the target)
 
 # 2. prereqs: MinIO creds Secret + named-policy ConfigMap
 oc create secret generic scrubber-secret \
@@ -505,6 +505,7 @@ scale-out needs a distributed object claim and is a documented follow-up).
 | `scrubber_object_verdict_total{verdict}` | Objects by coverage verdict — **the series to alert on** |
 | `scrubber_files_not_inspected_total{reason}` | Files emitted uninspected, by reason code. A code appearing that you have not seen before is a new failure mode |
 | `scrubber_residual_hits_total` | Policy matches found inside content that was NOT inspected |
+| `scrubber_discovery_failures_total` | Failed listings of the input bucket. **Alert on this** — rising steadily while every per-object counter stays flat means no work is being discovered at all, and the service looks idle rather than broken |
 | `scrubber_queue_wait_seconds` | Arrival → start of scrubbing |
 | `scrubber_object_latency_seconds` | Arrival → finished; what a user actually waits |
 | `scrubber_inflight_phase_seconds` | Seconds the in-flight object has spent in its current phase, 0 when idle. **The series that separates a slow object from a wedged one** — neither probe can, since `/healthz` answers 200 whatever the worker is doing and `/readyz` only says the backend is reachable |
