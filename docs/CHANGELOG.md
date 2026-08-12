@@ -10,7 +10,12 @@ For what to verify on your own cluster after taking a new image, see
 
 ---
 
-## Unreleased
+## Image 0.6.0 — nothing waits forever, and the caps follow the pod
+
+Everything below came out of one report: a 300 MB zip "stuck at unpacking 95% for
+over 1200 seconds". Chasing it turned up a display that could not distinguish slow
+from wedged, a service tuned for exactly one pod size, and — underneath both — a
+set of object-storage calls with no upper bound at all.
 
 ### The progress bar was a timer, and it hid a real stall
 

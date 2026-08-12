@@ -204,7 +204,7 @@ spec:
         - name: artifactory-pull   # only if pulling from a private Artifactory repo
       containers:
         - name: scrubberd
-          image: <ARTIFACTORY_DOCKER_HOST>/docker-local/scrubberd:0.5.0
+          image: <ARTIFACTORY_DOCKER_HOST>/docker-local/scrubberd:0.6.0
           ports:
             - containerPort: 8080
           envFrom:

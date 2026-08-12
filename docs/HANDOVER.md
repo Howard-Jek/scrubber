@@ -10,14 +10,14 @@ why*, see [CHANGELOG.md](CHANGELOG.md). For the full reference, see
 
 ```sh
 git pull
-docker build -f deploy/Containerfile -t scrubberd:0.5.0 .
-docker save -o dist/scrubberd-0.5.0.tar scrubberd:0.5.0
+docker build -f deploy/Containerfile -t scrubberd:0.6.0 .
+docker save -o dist/scrubberd-0.6.0.tar scrubberd:0.6.0
 ```
 
 On the isolated side:
 
 ```sh
-docker load -i scrubberd-0.5.0.tar
+docker load -i scrubberd-0.6.0.tar
 ```
 
 If your air-gapped registry mirrors its own base images, build with them instead — the
@@ -28,7 +28,7 @@ docker build -f deploy/Containerfile \
   --build-arg BASE_BUILD_IMAGE=<artifactory>/docker-public/golang:1.25 \
   --build-arg BASE_RUNTIME_IMAGE=<artifactory>/docker-public/ubi9/ubi-micro:latest \
   --build-arg GOPROXY=https://<artifactory>/artifactory/api/go/go-remote \
-  -t <artifactory>/docker-local/scrubberd:0.5.0 .
+  -t <artifactory>/docker-local/scrubberd:0.6.0 .
 ```
 
 > **Architecture.** The image is single-arch. Add `--platform linux/amd64` if you are
@@ -52,7 +52,7 @@ docker run --rm \
   -e MINIO_ENDPOINT=... -e MINIO_ACCESS_KEY=... -e MINIO_SECRET_KEY=... \
   -e INPUT_BUCKET=scrub-input -e OUTPUT_BUCKET=scrub-output -e REPORTS_BUCKET=scrub-reports \
   -e DEFAULT_POLICY=default \
-  scrubberd:0.5.0
+  scrubberd:0.6.0
 ```
 
 Expect `loaded policies`, then `control server listening`. `/healthz` and `/readyz` should
