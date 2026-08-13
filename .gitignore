@@ -7,3 +7,6 @@
 
 # exported container images (docker save)
 /dist/
+
+# macOS Finder metadata
+.DS_Store
