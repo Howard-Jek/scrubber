@@ -61,11 +61,30 @@ func realMain(log *slog.Logger) error {
 	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
 	defer stop()
 
+	// Every configuration fault below is collected here and reported together, once,
+	// before anything starts. See startupProblems for why that is worth the
+	// restructuring it costs.
+	probs := &startupProblems{}
+
+	// --- required configuration ---
+	//
+	// Read up front rather than inline, so a deployment missing four variables is told
+	// about four variables. Inline reads meant the first one aborted the process and
+	// the rest stayed invisible until the next restart.
+	var (
+		minioEndpoint = probs.req("MINIO_ENDPOINT", "host:port of the MinIO/S3 API, no scheme")
+		minioAccess   = probs.reqSecret("MINIO_ACCESS_KEY", "MinIO access key, from the scrubber-secret Secret")
+		minioSecret   = probs.reqSecret("MINIO_SECRET_KEY", "MinIO secret key, from the scrubber-secret Secret")
+		inputBucket   = probs.req("INPUT_BUCKET", "bucket the worker polls for new uploads")
+		outputBucket  = probs.req("OUTPUT_BUCKET", "bucket scrubbed results are written to")
+		reportsBucket = probs.req("REPORTS_BUCKET", "bucket per-object reports are written to")
+	)
+
 	// --- MinIO store ---
 	st, err := store.New(store.Config{
-		Endpoint:       mustEnv("MINIO_ENDPOINT"),
-		AccessKey:      mustEnv("MINIO_ACCESS_KEY"),
-		SecretKey:      mustEnv("MINIO_SECRET_KEY"),
+		Endpoint:       minioEndpoint,
+		AccessKey:      minioAccess,
+		SecretKey:      minioSecret,
 		UseTLS:         envBool("MINIO_USE_TLS", true),
 		CACert:         os.Getenv("MINIO_CA_CERT"),
 		Region:         os.Getenv("MINIO_REGION"),
@@ -84,81 +103,120 @@ func realMain(log *slog.Logger) error {
 		ListTimeout: envDuration("LIST_TIMEOUT", 90*time.Second),
 	})
 	if err != nil {
-		return err
+		probs.addf("the object-storage client could not be built."+NL+
+			"      Endpoint: %q"+NL+
+			"      Error:    %v"+NL+
+			"      Fix:      MINIO_ENDPOINT must be host:port with no scheme. If "+
+			"MINIO_USE_TLS is true, MINIO_CA_CERT must point at a readable PEM.",
+			minioEndpoint, err)
 	}
 
-	inputBucket := mustEnv("INPUT_BUCKET")
-	if envBool("ENSURE_BUCKETS", false) {
-		for _, b := range []string{inputBucket, mustEnv("OUTPUT_BUCKET"), mustEnv("REPORTS_BUCKET")} {
-			if err := st.EnsureBucket(ctx, b); err != nil {
-				return err
-			}
-		}
-	}
-
-	// --- policies (fail fast on any invalid policy) ---
+	// --- policies ---
 	policyDir := envDefault("POLICIES_DIR", "/etc/scrubber/policies")
 	prefixMap, err := parsePrefixMap(os.Getenv("PREFIX_POLICY_MAP"))
 	if err != nil {
-		return err
+		probs.addf("PREFIX_POLICY_MAP is not a usable value."+NL+
+			"      Value: %q"+NL+
+			"      Error: %v"+NL+
+			"      Fix:   a JSON object mapping key prefix to policy name; see the "+
+			"PREFIX_POLICY_MAP comment in the ConfigMap for an example. Unset routes "+
+			"everything to DEFAULT_POLICY.",
+			os.Getenv("PREFIX_POLICY_MAP"), err)
 	}
-	reg, err := policy.New(policyDir, os.Getenv("DEFAULT_POLICY"), prefixMap)
-	if err != nil {
-		return err
+	// Loaded before the gate so a broken policy ConfigMap is reported in the same
+	// breath as a missing bucket. It is also the one fault that would otherwise be
+	// discovered by the service running perfectly and scrubbing nothing.
+	var reg *policy.Registry
+	if reg, err = policy.New(policyDir, os.Getenv("DEFAULT_POLICY"), prefixMap); err != nil {
+		probs.addf("the policy set could not be loaded."+NL+
+			"      Directory:      %s"+NL+
+			"      DEFAULT_POLICY: %q"+NL+
+			"      Error:          %v"+NL+
+			"      Fix:            every *.json there must be a valid terms document, and "+
+			"DEFAULT_POLICY must name one of them without the .json suffix. Check the "+
+			"scrubber-policies ConfigMap is mounted at POLICIES_DIR.",
+			policyDir, os.Getenv("DEFAULT_POLICY"), err)
 	}
-	log.Info("loaded policies", "names", reg.Names())
-	go watchPolicies(ctx, policyDir, reg, log)
 
 	// --- metrics + worker ---
 	promReg := prometheus.NewRegistry()
 	m := metrics.New(promReg)
 	jobs := metrics.NewJobLog(envInt("JOBS_HISTORY", 200))
 
-	// Fail fast on a bad AUDIT_LEVEL rather than silently picking a default: the
-	// setting governs how much sensitive matched text the stored report retains, so
-	// a typo quietly resolving to "full" is exactly the wrong failure mode.
+	// A typo here resolving quietly to "full" would retain matched cleartext in every
+	// stored report, so it is a fault rather than a default.
 	audit, err := report.ParseAuditLevel(envDefault("AUDIT_LEVEL", "counts"))
 	if err != nil {
-		return fmt.Errorf("AUDIT_LEVEL: %w", err)
+		probs.addf("AUDIT_LEVEL is not one of the accepted values."+NL+
+			"      Value: %q"+NL+
+			"      Error: %v"+NL+
+			"      Fix:   use full, counts or off. It governs how much matched cleartext "+
+			"the stored report keeps, so it is not defaulted.",
+			envDefault("AUDIT_LEVEL", "counts"), err)
 	}
 
 	// --- size the caps against the pod we actually got ---
 	//
-	// Every number below was measured on a 2 GiB / 1 CPU pod and then compiled in
-	// as a default, which silently made 2 GiB the only size the service was tuned
-	// for. On a 4 or 8 GiB pod it left most of the memory idle and scrubbed no
-	// faster; the operator's only recourse was to raise the spill knobs by hand,
-	// and raising them too far turns spilling off and reproduces the OOM the spill
-	// exists to prevent.
+	// Every number here was measured on a 2 GiB / 1 CPU pod and then compiled in as
+	// a default, which silently made 2 GiB the only size the service was tuned for.
+	// On a larger pod it left the extra idle and scrubbed no faster; the operator's
+	// only recourse was to raise the knobs by hand, and raising the spill ones too
+	// far turns spilling off and reproduces the OOM the spill exists to prevent.
 	//
-	// So the measured values become a *ratio* to the pod they were measured on,
-	// and the ceiling is read from the cgroup at startup. At 2 GiB every derived
-	// value is byte-identical to what shipped, which keeps every published
-	// measurement valid; at 8 GiB they are 4x. An explicit environment variable
-	// still wins over all of it — this changes defaults, not policy.
+	// So the measured values are ratios to the pod they were measured on, and the
+	// ceilings are read at startup — from the Downward API where the manifest
+	// projects them, from the cgroup otherwise. See deriveCaps for which resource
+	// governs which cap and why the two must not be swapped. An explicit
+	// environment variable still wins over all of it: this changes defaults, not
+	// policy.
 	res := podres.Detect()
-	memScale := podScale(res.MemoryBytes)
+	c := deriveCaps(res)
+	memScale := c.memScale
 	scaled := func(base int64) int64 { return int64(float64(base) * memScale) }
+	scratchBytes, scratchSource := c.scratchBytes, c.scratchSource
+	maxExpandDefault, maxObjectDefault := c.expandBytes, c.objectBytes
 
-	// Scratch is a separate ceiling and cannot be detected the same way: /work is
-	// an emptyDir whose sizeLimit is enforced by the kubelet, not by the
-	// filesystem, so statfs inside the container reports the whole node's disk and
-	// would license a budget that gets the pod evicted. It has to be declared.
-	// Unset means keep the shipped defaults rather than guess.
-	maxExpandDefault, maxObjectDefault := int64(1536<<20), int64(640<<20)
-	scratchBytes := envInt64("SCRATCH_BYTES", 0)
-	if scratchBytes > 0 {
-		maxExpandDefault = int64(float64(scratchBytes) / scratchFactor)
-		// Preserve the shipped ratio between the compressed-object ceiling and the
-		// expansion budget (640Mi of 1536Mi), so raising one raises the other and
-		// MAX_OBJECT_BYTES stays the limit a user hits first.
-		maxObjectDefault = int64(float64(maxExpandDefault) * shippedObjectShare)
+	// A SCRATCH_BYTES that was set but did not survive parsing is the quietest way to
+	// misconfigure this service: detection falls through to the next source, the pod
+	// sizes itself from the default, and the only trace is a scratch_source an
+	// operator has no reason to be reading. Say it out loud instead.
+	// Tested against the raw value, not a trimmed one: a variable set to whitespace is
+	// set as far as the operator is concerned, and it is exactly the sort of value that
+	// gets there by accident.
+	if raw := os.Getenv("SCRATCH_BYTES"); raw != "" && scratchSource != "SCRATCH_BYTES" {
+		probs.addf("SCRATCH_BYTES is set but could not be read, so the expansion cap was "+
+			"NOT sized from it."+NL+
+			"      Value:      %q"+NL+
+			"      Sized from: %s (%d bytes)"+NL+
+			"      Fix:        write a plain byte count or a Kubernetes quantity, e.g. "+
+			"14Gi or 15032385536. This used to be a warning; it is fatal because a pod "+
+			"that ignores its own scratch declaration sizes itself from the default and "+
+			"refuses bundles it has the disk for.",
+			raw, scratchSource, scratchBytes)
+	}
+
+	expandBytes := envInt64(probs, "MAX_EXPAND_BYTES", maxExpandDefault)
+	// A backstop, and deliberately a redundant one: podres.ParseBytes already refuses
+	// any magnitude at or above the same sentinel, so on today's code paths this branch
+	// is unreachable and its warning cannot fire. That was checked, not assumed.
+	//
+	// It stays because the invariant is not local to either place. The read guards add
+	// one to their budget to tell "exactly at the limit" from "over it", so a budget
+	// near the top of the int64 range wraps negative, io.CopyN then copies nothing,
+	// every payload reads as EMPTY, and the object ships unscrubbed while the report
+	// certifies it complete. That failure is silent and total, and two independent
+	// limits now have to drift apart before it can return.
+	if expandBytes > maxExpandCeiling {
+		log.Warn("MAX_EXPAND_BYTES is implausibly large and has been clamped; "+
+			"the expansion budget is a disk bound, so size it from the declared scratch ceiling",
+			"requested", expandBytes, "clamped_to", int64(maxExpandCeiling))
+		expandBytes = maxExpandCeiling
 	}
 
 	wcfg := worker.Config{
 		InputBucket:     inputBucket,
-		OutputBucket:    mustEnv("OUTPUT_BUCKET"),
-		ReportsBucket:   mustEnv("REPORTS_BUCKET"),
+		OutputBucket:    outputBucket,
+		ReportsBucket:   reportsBucket,
 		InputPrefix:     os.Getenv("INPUT_PREFIX"),
 		ProcessedPrefix: envDefault("PROCESSED_PREFIX", "processed/"),
 		// Where a result lands when content the scrub did not inspect turns out to
@@ -176,7 +234,7 @@ func realMain(log *slog.Logger) error {
 		QueueMax: envInt("QUEUE_MAX", 10000),
 		// Defaults match the shipped manifest. They used to disagree with it and
 		// with the README, which made the startup memory arithmetic unverifiable.
-		MaxObjectBytes: envInt64("MAX_OBJECT_BYTES", maxObjectDefault),
+		MaxObjectBytes: envInt64(probs, "MAX_OBJECT_BYTES", maxObjectDefault),
 		FinalizeGrace:  envDuration("FINALIZE_GRACE", 15*time.Second),
 		StallWarnAfter: envDuration("STALL_WARN_AFTER", 5*time.Minute),
 		Audit:          audit,
@@ -184,18 +242,30 @@ func realMain(log *slog.Logger) error {
 		ScrubNames:     envBool("SCRUB_FILENAMES", true),
 		Limits: pipeline.Limits{
 			MaxDepth: envInt("MAX_DEPTH", 16),
-			// Archive members spill to scratch storage, so this now bounds mostly
-			// DISK rather than resident memory. Size the /work volume against it, not
-			// just limits.memory — an ephemeral-storage eviction kills a pod as dead
-			// as an OOM. See deploy/openshift-manifests.yaml for the arithmetic and
+			// Expanded CONTENT one object may hold, derived above from the declared
+			// scratch ceiling rather than from a compiled-in number. Since members
+			// spill this bounds DISK, and the disk actually touched is ~scratchFactor
+			// times it. Set it explicitly only to go BELOW what the declaration
+			// allows: setting it above is how a pod gets evicted for ephemeral
+			// storage, and startup warns when it does. See
+			// deploy/openshift-manifests.yaml for the arithmetic and
 			// scripts/memory-matrix.sh for how to re-derive it after any change.
-			MaxTotalBytes: envInt64("MAX_EXPAND_BYTES", maxExpandDefault),
+			MaxTotalBytes: expandBytes,
 			MaxMembers:    envInt("MAX_MEMBERS", 100000),
+			// The largest single text file this pod can hold contiguously, and the
+			// one cap that really is a function of limits.memory: the matcher needs
+			// its payload as a string, and Bytes/Decode/Scrub/Encode each keep a copy
+			// outside the spill accounting. Scaled from the same 2 GiB baseline as
+			// the spill knobs so it grows with the pod instead of pinning it.
+			//
+			// Without it, raising the expansion budget converts a clean guard trip
+			// into an OOM crash-loop on the first oversized log. Set 0 to disable.
+			MaxLeafBytes: envInt64(probs, "MAX_LEAF_BYTES", c.leafBytes),
 			// Bytes the residual scan may read across one object. Negative disables
 			// it, which removes the only check that does not depend on the pipeline's
 			// own classification being correct — the check that would have caught
 			// UTF-16 logs being filed as binary.
-			ResidualBudget: envInt64("RESIDUAL_BUDGET", pipeline.DefaultResidualBudget),
+			ResidualBudget: envInt64(probs, "RESIDUAL_BUDGET", pipeline.DefaultResidualBudget),
 			// Re-scan every scrubbed file to confirm the policy no longer matches it.
 			// Off by default because it roughly doubles matcher work (measured at ~70%
 			// of the drain rate) and the failure it catches is rejected at policy load
@@ -206,8 +276,8 @@ func realMain(log *slog.Logger) error {
 				// in-memory payloads exceed SPILL_RESIDENT_MAX everything spills
 				// regardless of size. The second limit is the one that catches an
 				// archive of many small members, which the memory matrix ranks worst.
-				Threshold:   envInt64("SPILL_THRESHOLD", max64(scaled(4<<20), minSpillThreshold)),
-				ResidentMax: envInt64("SPILL_RESIDENT_MAX", scaled(64<<20)),
+				Threshold:   envInt64(probs, "SPILL_THRESHOLD", max64(scaled(4<<20), minSpillThreshold)),
+				ResidentMax: envInt64(probs, "SPILL_RESIDENT_MAX", scaled(64<<20)),
 			},
 		},
 	}
@@ -215,31 +285,49 @@ func realMain(log *slog.Logger) error {
 		log.Warn("MAX_RATIO is ignored and can be removed from the config. " +
 			"An expansion-ratio limit cannot distinguish a decompression bomb from an " +
 			"ordinary log file (logs routinely compress 200:1 and beyond), and tripping " +
-			"it emitted the object UNSCRUBBED. Memory is now bounded by MAX_EXPAND_BYTES, " +
-			"enforced while decompressing.")
+			"it emitted the object UNSCRUBBED. Expansion is now bounded by MAX_EXPAND_BYTES, " +
+			"enforced while decompressing — which bounds scratch, not memory; memory is " +
+			"bounded by MAX_LEAF_BYTES and the SPILL_* pair.")
 	}
 	// Three different ceilings, and conflating them is how a pod gets killed:
 	//
 	//   budget_bytes  — what the expansion accounting caps. Since archive members
 	//                   spill, this bounds mostly DISK on the scratch volume.
-	//   est_peak_rss  — resident memory, which no longer tracks the expansion budget
-	//                   at all. Only the member being scrubbed is on the heap, so
-	//                   this is a function of the spill policy — the aggregate
-	//                   in-memory budget, plus a few multiples of the per-payload
-	//                   threshold for the leaf scrubber (which needs a contiguous
-	//                   string and therefore briefly holds several copies) — plus
-	//                   per-member bookkeeping, which spilling does not remove and
-	//                   which scales with MAX_MEMBERS, plus runtime baseline and
-	//                   GC slack.
+	//   est_peak_rss  — resident memory. Only the member being scrubbed is on the
+	//                   heap, so this is the aggregate in-memory spill budget, plus
+	//                   a few copies of the largest single file (the leaf scrubber
+	//                   needs a contiguous string, so MAX_LEAF_BYTES is what bounds
+	//                   this term — NOT the spill threshold, which Blob.Bytes reads
+	//                   straight past), plus per-member bookkeeping, which spilling
+	//                   does not remove and which scales with MAX_MEMBERS, plus
+	//                   runtime baseline and GC slack.
 	//   scratch_bytes — the disk a single object can occupy. A .tar.gz stages the
 	//                   decompressed container, the member bodies and the repacked
 	//                   result, so budget well above the expansion cap.
 	//
-	// Size limits.memory against est_peak_rss and the /work sizeLimit against
-	// scratch_bytes. Re-derive both with scripts/memory-matrix.sh after any change.
+	// Read these as CHECKS on the declaration, not as instructions for writing it.
+	// The /work sizeLimit is an input now — the expansion cap is derived by dividing
+	// it — so sizing the volume from scratch_bytes would be circular. scratch_bytes
+	// is normally scratch_declared echoed back, and the two diverge exactly when
+	// someone set MAX_EXPAND_BYTES by hand, which is what the warnings below are for.
+	//
+	// est_peak_rss is the one still worth sizing against: compare it to limits.memory
+	// and lower MAX_LEAF_BYTES, or raise the memory, if it is close. Re-derive both
+	// with scripts/memory-matrix.sh after any change.
 	budget := wcfg.MaxObjectBytes + wcfg.Limits.MaxTotalBytes
 	sp := wcfg.Limits.Spill
-	estPeak := int64(float64(sp.ResidentMax+leafCopies*sp.Threshold)*peakRSSFactor) +
+	// The leaf term used to be leafCopies*SPILL_THRESHOLD, which quietly assumed the
+	// spill threshold bounds the largest payload the matcher holds. It does not:
+	// Blob.Bytes reads a spilled leaf back in full whatever the threshold, so the
+	// estimate was short by the difference between 4Mi and the biggest file in the
+	// bundle — and that gap is exactly what OOM-kills a pod. MAX_LEAF_BYTES is the
+	// real bound; with the cap disabled the only bound left is the whole budget,
+	// and the gate below should say so rather than flatter the configuration.
+	leafBytes := wcfg.Limits.MaxLeafBytes
+	if leafBytes <= 0 {
+		leafBytes = wcfg.Limits.MaxTotalBytes
+	}
+	estPeak := int64(float64(sp.ResidentMax+leafCopies*leafBytes)*peakRSSFactor) +
 		runtimeBaselineBytes + int64(wcfg.Limits.MaxMembers)*perMemberBytes
 	scratch := int64(scratchFactor * float64(wcfg.Limits.MaxTotalBytes))
 
@@ -260,6 +348,10 @@ func realMain(log *slog.Logger) error {
 		"max_expand_bytes", wcfg.Limits.MaxTotalBytes,
 		"spill_threshold", sp.Threshold,
 		"spill_resident_max", sp.ResidentMax,
+		// The largest file that can actually be scrubbed, as opposed to the largest
+		// bundle that can be opened. Operators conflate the two and then wonder why a
+		// bundle came back "incomplete" on a pod with plenty of disk.
+		"max_leaf_bytes", wcfg.Limits.MaxLeafBytes,
 		"max_members", wcfg.Limits.MaxMembers,
 		"queue_concurrency", 1,
 		"queue_max", wcfg.QueueMax,
@@ -271,21 +363,73 @@ func realMain(log *slog.Logger) error {
 		// and the measured 2 GiB defaults are in force.
 		"pod_memory_bytes", res.MemoryBytes,
 		"pod_memory_source", res.MemorySource,
+		// The pair that governs how large a bundle may expand. scratch_source is
+		// the line to read first when max_expand_bytes is not what was expected:
+		// "default (undeclared)" means the manifest never told the pod how much
+		// /work it has, so it is sizing itself from the shipped 4Gi regardless of
+		// what the emptyDir actually grants.
+		"scratch_declared_bytes", scratchBytes,
+		"scratch_source", scratchSource,
 		"pod_cpus", res.CPUs,
 		"mem_scale", memScale)
 
 	// Two ways to get this wrong that are worth naming at startup rather than
 	// leaving to be discovered as an eviction or an OOM under load.
 	if res.MemoryBytes > 0 && estPeak > res.MemoryBytes*peakRSSGatePercent/100 {
-		log.Warn("estimated peak RSS is above the safe share of the pod's memory; "+
-			"lower SPILL_RESIDENT_MAX / SPILL_THRESHOLD / MAX_MEMBERS, or raise limits.memory",
-			"est_peak_rss_bytes", estPeak, "pod_memory_bytes", res.MemoryBytes,
-			"gate_percent", peakRSSGatePercent)
+		probs.sizing("estimated peak RSS is above the safe share of this pod's memory."+NL+
+			"      Estimated peak: %d bytes (%d MiB)"+NL+
+			"      Pod memory:     %d bytes (%d MiB), gate is %d%% of it"+NL+
+			"      Leaf term:      %d bytes (%d MiB) -- MAX_LEAF_BYTES is %d"+NL+
+			"      Fix:            lower MAX_LEAF_BYTES, SPILL_RESIDENT_MAX, "+
+			"SPILL_THRESHOLD or MAX_MEMBERS, or raise limits.memory. The leaf term "+
+			"usually dominates; MAX_LEAF_BYTES=0 disables the cap and falls back to the "+
+			"whole expansion budget, which no pod can hold contiguously.",
+			estPeak, estPeak>>20, res.MemoryBytes, res.MemoryBytes>>20,
+			peakRSSGatePercent, leafBytes, leafBytes>>20, wcfg.Limits.MaxLeafBytes)
 	}
-	if scratchBytes > 0 && scratch > scratchBytes {
-		log.Warn("scratch needed for one object exceeds the declared SCRATCH_BYTES; "+
-			"an ephemeral-storage eviction kills the pod as dead as an OOM",
-			"scratch_bytes_needed", scratch, "scratch_bytes_declared", scratchBytes)
+	if scratch > scratchBytes {
+		probs.sizing("one object can need more scratch than this pod has declared."+NL+
+			"      Needed:   %d bytes (%d MiB) -- %.1fx MAX_EXPAND_BYTES"+NL+
+			"      Declared: %d bytes (%d MiB), from %s"+NL+
+			"      Fix:      lower MAX_EXPAND_BYTES to at most %d, or raise all four "+
+			"scratch declarations together (the /work sizeLimit, limits and requests "+
+			"ephemeral-storage, and SCRATCH_BYTES). Left alone, a large bundle fills the "+
+			"volume and the kubelet evicts the pod mid-object -- no report, no reason "+
+			"code, and the same object is picked up again after the restart.",
+			scratch, scratch>>20, scratchFactor, scratchBytes, scratchBytes>>20,
+			scratchSource, int64(float64(scratchBytes)/scratchFactor))
+	}
+	// The reverse mistake, and it is the quiet one: an operator raises the volume
+	// and forgets that MAX_EXPAND_BYTES is pinned in the ConfigMap, so the pod keeps
+	// refusing bundles it now has the disk for — and refusing means emitting them
+	// UNSCRUBBED. Only worth saying when the gap is large enough to be an oversight
+	// rather than deliberate headroom.
+	if headroom := int64(float64(scratchBytes) / scratchFactor); wcfg.Limits.MaxTotalBytes*4 < headroom*3 {
+		log.Warn("MAX_EXPAND_BYTES is well below what the declared scratch allows; "+
+			"bundles are being refused (and passed through UNSCRUBBED) on a volume "+
+			"with room for them. Unset it to size from the declaration instead",
+			"max_expand_bytes", wcfg.Limits.MaxTotalBytes, "would_derive", headroom,
+			"scratch_bytes_declared", scratchBytes, "scratch_source", scratchSource)
+	}
+
+	// Nothing below this line runs on a misconfigured pod.
+	//
+	// Deliberately placed after every check rather than beside each one: the point of
+	// collecting problems is that an operator fixing a deployment gets the whole list,
+	// and that only works if the process reaches the end of the checks before it dies.
+	if err := probs.err(); err != nil {
+		return err
+	}
+
+	log.Info("loaded policies", "names", reg.Names())
+	go watchPolicies(ctx, policyDir, reg, log)
+
+	if envBool("ENSURE_BUCKETS", false) {
+		for _, b := range []string{inputBucket, outputBucket, reportsBucket} {
+			if err := st.EnsureBucket(ctx, b); err != nil {
+				return fmt.Errorf("creating bucket %q (ENSURE_BUCKETS=true): %w", b, err)
+			}
+		}
 	}
 
 	// Reclaim scratch stranded by a previous process before taking any work.
@@ -336,8 +480,8 @@ func realMain(log *slog.Logger) error {
 			DefaultPolicy: os.Getenv("DEFAULT_POLICY"),
 			AllowEdit:     envBool("ALLOW_POLICY_EDIT", true),
 			InputBucket:   inputBucket,
-			OutputBucket:  mustEnv("OUTPUT_BUCKET"),
-			ReportsBucket: mustEnv("REPORTS_BUCKET"),
+			OutputBucket:  outputBucket,
+			ReportsBucket: reportsBucket,
 			UploadExpiry:  envDuration("UPLOAD_EXPIRY", 15*time.Minute),
 			HistoryMax:    envInt("HISTORY_MAX", 100),
 			Canceller:     wk,
@@ -392,6 +536,72 @@ func realMain(log *slog.Logger) error {
 	return err
 }
 
+// caps is the sizing derived from what the pod declares about itself, before any
+// explicit environment override is applied.
+//
+// It is a separate value with a pure constructor because this arithmetic used to be
+// twenty lines inline in realMain, where nothing could reach it: cmd/scrubberd had
+// no test at all, so the chain from "the manifest says 14Gi" to "the engine accepts
+// a 4 GiB bundle" was the least-tested and most load-bearing calculation in the
+// service. Every field below is asserted in main_test.go.
+type caps struct {
+	// scratchBytes is the ephemeral-storage ceiling the caps were sized from, and
+	// scratchSource says whether the pod declared it or it was assumed.
+	scratchBytes  int64
+	scratchSource string
+	// expandBytes is the expanded CONTENT one object may hold.
+	expandBytes int64
+	// objectBytes is the compressed upload ceiling, held at a fixed share of
+	// expandBytes so it stays the limit a user hits first.
+	objectBytes int64
+	// leafBytes is the largest single file the matcher may materialise. Alone among
+	// these it follows MEMORY, because it is the one payload the spill policy cannot
+	// bound.
+	leafBytes int64
+	// memScale is the pod's memory relative to the pod every default was measured on.
+	memScale float64
+}
+
+// deriveCaps sizes the service from the pod's declared ceilings.
+//
+// Two ceilings, two different resources, and keeping them apart is the whole point:
+//
+//	scratch (limits.ephemeral-storage / the /work sizeLimit) bounds how large a
+//	bundle may EXPAND, because archive members spill to TMPDIR and every expanded
+//	byte lands there.
+//
+//	memory (limits.memory) bounds how large a single FILE may be scrubbed, because
+//	the matcher needs one contiguous string and that copy never touches disk.
+//
+// Sizing either from the other reads plausibly and fails in production: an
+// expansion budget from limits.memory evicts the pod for ephemeral-storage, and a
+// leaf cap from the volume size OOM-kills it. Both were previously compiled in —
+// the expansion cap as a flat 1536Mi that moved only if SCRATCH_BYTES was set, so a
+// pod handed 8Gi of /work still refused anything past 1536Mi, and refusing means
+// emitting the object UNSCRUBBED. Now the declaration in deployment.yaml is the
+// ceiling: raise it and the caps follow on the next rollout.
+//
+// Scratch has no measured fallback on purpose. An emptyDir's sizeLimit is enforced
+// by the kubelet, not the filesystem, so statfs inside the container reports the
+// node's whole disk — a number that looks authoritative and is wrong in the
+// direction that gets the pod evicted. Undeclared falls back to the sizeLimit the
+// shipped manifest carries, so a deployment that never engages with any of this
+// behaves as it always has.
+func deriveCaps(res podres.Limits) caps {
+	c := caps{
+		scratchBytes:  res.ScratchBytes,
+		scratchSource: res.ScratchSource,
+		memScale:      podScale(res.MemoryBytes),
+	}
+	if c.scratchBytes <= 0 {
+		c.scratchBytes, c.scratchSource = defaultScratchBytes, "default (undeclared)"
+	}
+	c.expandBytes = int64(float64(c.scratchBytes) / scratchFactor)
+	c.objectBytes = int64(float64(c.expandBytes) * shippedObjectShare)
+	c.leafBytes = int64(float64(maxLeafBaseline) * c.memScale)
+	return c
+}
+
 // podScale converts a detected pod memory ceiling into the multiplier applied to
 // the defaults measured at baselineMemBytes.
 //
@@ -435,10 +645,35 @@ const (
 	// enough to do exactly that, trading memory pressure for inode pressure.
 	minSpillThreshold = 512 << 10
 	// shippedObjectShare is MAX_OBJECT_BYTES as a fraction of MAX_EXPAND_BYTES in
-	// the measured configuration (640Mi of 1536Mi). Held constant when the caps
-	// are derived from SCRATCH_BYTES so the compressed-object ceiling stays the
-	// limit a user hits first, which is the one with a clear error message.
+	// the measured configuration (640Mi of 1536Mi). Held constant as the caps are
+	// derived from the declared scratch ceiling so the compressed-object ceiling
+	// stays the limit a user hits first, which is the one with a clear error
+	// message. It is also the C term in scratchFactor below — change one and the
+	// other stops covering the peak.
 	shippedObjectShare = 640.0 / 1536.0
+	// defaultScratchBytes is the scratch ceiling assumed when the deployment declares
+	// none. It is the /work sizeLimit the manifest carried BEFORE this became
+	// derivable — the shipped manifest now declares 14Gi — so a deployment that never
+	// engages with any of this keeps the volume footprint it already had, rather than
+	// inheriting a budget derived from the node's disk or from a larger manifest it
+	// did not apply.
+	defaultScratchBytes = 4 << 30
+	// maxLeafBaseline is the largest single text file the matcher may materialise on
+	// the 2 GiB baseline pod, scaled from there like the spill knobs.
+	//
+	// Not picked, solved: it is the largest leaf that keeps est_peak_rss under the
+	// same 60% gate the memory matrix fails on, at the baseline pod and the derived
+	// spill policy. Above ~99Mi the estimate crosses the gate and the service would
+	// warn about its own defaults on every start. It scales with the pod like
+	// everything else here, so a 4 GiB pod takes 192Mi and an 8 GiB pod 384Mi.
+	maxLeafBaseline = 96 << 20
+	// maxExpandCeiling is an overflow guard, not a policy limit: the read paths
+	// evaluate budget+1 to distinguish "at the limit" from "over it", and a budget
+	// near math.MaxInt64 wraps that to negative — after which io.CopyN copies
+	// nothing, every payload reads as empty, and objects are emitted unscrubbed
+	// while looking clean. A pebibyte is far above any real pod's scratch and far
+	// below where the arithmetic breaks.
+	maxExpandCeiling = 1 << 50
 	// peakRSSGatePercent is the share of pod memory the estimate may reach before
 	// startup warns. Matches the gate scripts/memory-matrix.sh fails on, so the
 	// service and the benchmark agree on what "too close" means.
@@ -447,9 +682,23 @@ const (
 	// server — what the process costs before it touches an object.
 	runtimeBaselineBytes = 128 << 20
 	// scratchFactor is how much scratch disk one object can occupy relative to the
-	// expansion budget: a .tar.gz stages the decompressed container, the member
-	// bodies and the repacked result.
-	scratchFactor = 2.5
+	// expansion budget, and therefore the divisor that turns the declared scratch
+	// ceiling into that budget.
+	//
+	// For a .tar.gz whose content expands to N, three copies are live at once —
+	// the decompressed tar, the member bodies read out of it, and the repacked
+	// result — on top of the compressed object staged for the download. Peak is
+	// C + 3N, and C is at most shippedObjectShare of N, so 3.42 covers it; 3.5 is
+	// that rounded up.
+	//
+	// It was 2.5 while the budget double-counted a .tar.gz (charging both the
+	// decompressed container and its members), because 2.5 x 2N already exceeded
+	// C + 3N. Now that pipeline.descend lends the container's charge back for the
+	// duration of the walk into it, the budget counts N once and the factor has to
+	// carry the whole multiple itself. The two changed together and must stay
+	// together: leaving this at 2.5 alongside the lend would license 2.5N of disk for
+	// a shape that needs 3.42N.
+	scratchFactor = 3.5
 	// peakRSSFactor converts the spill policy into an estimate of actual resident
 	// memory.
 	//
@@ -538,15 +787,102 @@ func parsePrefixMap(s string) (map[string]string, error) {
 	return m, nil
 }
 
-// --- env helpers ---
+// startupProblems collects configuration faults so that one restart reports all of
+// them.
+//
+// The service used to fail one fault at a time, and two of the ways it did so were
+// actively unhelpful. Required variables went through a mustEnv that PANICKED, so a
+// deployment missing three of them printed a stack trace naming one, and the operator
+// learned about the next only after fixing that one and restarting. Everything else --
+// an unreadable MAX_EXPAND_BYTES, a SCRATCH_BYTES the parser could not use, a sizing
+// combination that will evict the pod -- was a log.Warn that the process then ran
+// happily past, so the pod came up healthy and wrong. Both failure modes are silent in
+// the way that matters: nothing in `oc get pods` distinguishes them from a good start.
+//
+// Faults are therefore accumulated and reported together, with the value seen, what was
+// expected, and what to do about it. A misconfigured pod does not start.
+type startupProblems struct {
+	list []string
+	// sizingOverridden records that the operator has explicitly accepted a sizing
+	// estimate the service considers unsafe.
+	sizingOverridden bool
+}
 
-func mustEnv(k string) string {
-	v := os.Getenv(k)
+// addf records a fault. Convention for the message: one summary line, then indented
+// "Label: value" lines, ending with a "Fix:" that names the knob to turn.
+func (p *startupProblems) addf(format string, a ...any) {
+	p.list = append(p.list, fmt.Sprintf(format, a...))
+}
+
+// sizing records a fault that rests on an ESTIMATE rather than on a value that is
+// definitely wrong -- peak RSS, and the scratch a bundle might need.
+//
+// These get an escape hatch that parse failures do not, because the estimates
+// deliberately err high and an operator who has measured their own workload may know
+// better than the model. ALLOW_UNSAFE_SIZING=true downgrades them to warnings; it is
+// named to be uncomfortable to type, and the warning it leaves behind still says
+// exactly what was overridden.
+func (p *startupProblems) sizing(format string, a ...any) {
+	if envBool("ALLOW_UNSAFE_SIZING", false) {
+		p.sizingOverridden = true
+		return
+	}
+	p.addf(format+NL+"      Override: set ALLOW_UNSAFE_SIZING=true to start anyway. "+
+		"Both sizing checks are estimates that err high, so this is a supported choice "+
+		"if you have measured the real peak with scripts/memory-matrix.sh -- but the pod "+
+		"dies under load rather than at rollout if the estimate was right.", a...)
+}
+
+// req reads a required variable, recording a fault rather than aborting so the rest of
+// the checks still run.
+func (p *startupProblems) req(k, what string) string {
+	v := strings.TrimSpace(os.Getenv(k))
 	if v == "" {
-		panic("required env var not set: " + k)
+		p.addf("%s is required and is not set."+NL+
+			"      What it is: %s"+NL+
+			"      Fix:        set it in the scrubber-config ConfigMap.", k, what)
 	}
 	return v
 }
+
+// reqSecret is req for a value that must never be echoed. The fault says the variable
+// is missing and does not quote it, since a partially-set credential is exactly the
+// case where a log line would leak one.
+func (p *startupProblems) reqSecret(k, what string) string {
+	v := os.Getenv(k)
+	if strings.TrimSpace(v) == "" {
+		p.addf("%s is required and is not set."+NL+
+			"      What it is: %s"+NL+
+			"      Fix:        create the scrubber-secret Secret and reference it from "+
+			"envFrom in the Deployment. Its value is never logged.", k, what)
+	}
+	return v
+}
+
+// err renders every fault as one error, or nil when there are none.
+func (p *startupProblems) err() error {
+	if len(p.list) == 0 {
+		return nil
+	}
+	noun := "problems"
+	if len(p.list) == 1 {
+		noun = "problem"
+	}
+	var b strings.Builder
+	fmt.Fprintf(&b, "refusing to start: %d configuration %s found", len(p.list), noun)
+	for i, s := range p.list {
+		fmt.Fprintf(&b, NL+NL+"  [%d/%d] %s", i+1, len(p.list), s)
+	}
+	b.WriteString(NL + NL + "Nothing was started and no object was touched. " +
+		"Fix all of the above and roll out again.")
+	return errors.New(b.String())
+}
+
+// NL is a newline. Named rather than inlined so the fault messages above read as
+// structured text rather than as escape soup.
+const NL = "\n"
+
+// --- env helpers ---
 
 func envDefault(k, def string) string {
 	if v := os.Getenv(k); v != "" {
@@ -572,13 +908,62 @@ func envInt(k string, def int) int {
 	return def
 }
 
-func envInt64(k string, def int64) int64 {
-	if v := os.Getenv(k); v != "" {
-		if n, err := strconv.ParseInt(v, 10, 64); err == nil {
-			return n
-		}
+// envInt64 reads a byte-valued setting, accepting Kubernetes quantity suffixes and
+// SAYING SO when it cannot read one.
+//
+// Both halves matter. It used to be a bare strconv.ParseInt that returned the default
+// on any error, so "MAX_EXPAND_BYTES: 4Gi" — the form every neighbouring line in the
+// manifest is written in — was discarded in silence and the pod ran with a cap the
+// operator never chose and had no way to discover short of reading the startup log
+// and doing the arithmetic. A configuration that is ignored quietly is worse than one
+// that is rejected loudly.
+//
+// Zero and negatives pass through unparsed because they are meaningful here rather
+// than erroneous: MAX_LEAF_BYTES=0 disables the leaf cap and RESIDUAL_BUDGET=-1
+// disables the residual scan.
+func envInt64(probs *startupProblems, k string, def int64) int64 {
+	v := strings.TrimSpace(os.Getenv(k))
+	if v == "" {
+		return def
 	}
-	return def
+	// Any way of writing zero disables, not just the bare digit. Matching "0" alone
+	// meant MAX_LEAF_BYTES=0Gi — the quantity form this function exists to accept —
+	// fell through to the warning and restored the derived cap, i.e. the documented
+	// way to switch the leaf cap off silently switched it back on.
+	if isZeroQuantity(v) {
+		return 0
+	}
+	neg := strings.HasPrefix(v, "-")
+	n, ok := podres.ParseBytes(strings.TrimPrefix(v, "-"))
+	if !ok {
+		probs.addf("%s is set to a value that cannot be read as a byte count."+NL+
+			"      Value: %q"+NL+
+			"      Fix:   write a plain byte count or a Kubernetes quantity -- "+
+			"4Gi, 512Mi, 2G, 1073741824. Use 0 to disable a cap that supports it. "+
+			"This is fatal rather than defaulted: a cap the operator set and the "+
+			"service ignored is how a pod runs for weeks at a size nobody chose.",
+			k, v)
+		return def
+	}
+	if neg {
+		return -n
+	}
+	return n
+}
+
+// isZeroQuantity reports whether v means zero in any of the forms envInt64 accepts:
+// "0", "-0", "00", "0Gi", "0 Mi". Anything with a non-zero digit is not zero, and
+// anything that is not a number at all is left for ParseBytes to reject and warn about.
+func isZeroQuantity(v string) bool {
+	digits := strings.TrimLeft(strings.TrimPrefix(strings.TrimSpace(v), "-"), "0")
+	digits = strings.TrimSpace(digits)
+	// What remains is either empty (all zeros) or a bare unit suffix on a zero.
+	switch digits {
+	case "", "Ki", "Mi", "Gi", "Ti", "Pi", "k", "K", "M", "G", "T", "P":
+		// Guard against "Gi" alone, which has no digits at all and is not zero.
+		return strings.ContainsAny(v, "0")
+	}
+	return false
 }
 
 func envDuration(k string, def time.Duration) time.Duration {

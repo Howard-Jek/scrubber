@@ -9,20 +9,42 @@
 # http://localhost:9002 (minioadmin / minioadmin).
 set -euo pipefail
 
-IMAGE="${IMAGE:-scrubberd:0.7.0}"
+IMAGE="${IMAGE:-scrubberd:0.8.0}"
 NET=scrubnet
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 
-# Mirror the pod: same memory and CPU ceiling, same caps as deploy/openshift-manifests.yaml.
-# Without --memory the container inherits the whole host and a local run cannot tell you
-# anything about whether a bundle fits the 2Gi pod -- which is the thing worth checking.
-MEM="${MEM:-2g}"
+# Mirror the pod: same memory and CPU ceiling, same DECLARATIONS as
+# deploy/openshift-manifests.yaml. Without --memory the container inherits the whole
+# host and a local run cannot tell you anything about whether a bundle fits the pod --
+# which is the thing worth checking.
+#
+# Note what is NOT set here. MAX_EXPAND_BYTES, MAX_OBJECT_BYTES, MAX_LEAF_BYTES, the
+# SPILL_* pair and GOMEMLIMIT are all DERIVED by the service from MEM and
+# SCRATCH_BYTES, exactly as they are in the pod. This script used to hardcode them,
+# which made the one command people run to "check it like production" the one command
+# that bypassed production's sizing -- and it drifted: it still said 1536Mi long after
+# the manifest's SCRATCH_BYTES derived 1638Mi. Declare the inputs, let the service
+# derive the outputs, and a local run can actually disagree with you.
+#
+# Any of them can still be exported to override, exactly as in the ConfigMap.
+MEM="${MEM:-4g}"
 CPUS="${CPUS:-1}"
-MAX_OBJECT_BYTES="${MAX_OBJECT_BYTES:-671088640}"     # 640Mi
-MAX_EXPAND_BYTES="${MAX_EXPAND_BYTES:-1610612736}"    # 1536Mi
-SPILL_THRESHOLD="${SPILL_THRESHOLD:-4194304}"         # 4Mi
-SPILL_RESIDENT_MAX="${SPILL_RESIDENT_MAX:-67108864}"  # 64Mi
-GOMEMLIMIT="${GOMEMLIMIT:-1200MiB}"
+# Matches the manifest's /work sizeLimit and limits.ephemeral-storage (14Gi), which
+# derives a 4Gi expansion cap. Docker has no emptyDir sizeLimit to enforce, so this is
+# a declaration only: a local run can overrun the volume where the pod would be
+# evicted for ephemeral-storage.
+SCRATCH_BYTES="${SCRATCH_BYTES:-14Gi}"                # == the manifest, verbatim
+
+# POD_MEMORY_LIMIT is what the manifest projects with the Downward API. Docker's
+# cgroup would also be readable, but passing it explicitly keeps the local run on the
+# same code path as the pod.
+mem_bytes() {
+  case "$1" in
+    *g|*G) echo $(( ${1%[gG]} * 1024 * 1024 * 1024 )) ;;
+    *m|*M) echo $(( ${1%[mM]} * 1024 * 1024 )) ;;
+    *)     echo "$1" ;;
+  esac
+}
 
 docker network create "$NET" >/dev/null 2>&1 || true
 docker rm -f scrubber-minio scrubberd >/dev/null 2>&1 || true
@@ -61,9 +83,8 @@ docker run -d --name scrubberd --network "$NET" -p 8080:8080 \
   -e INPUT_BUCKET=scrub-input -e OUTPUT_BUCKET=scrub-output -e REPORTS_BUCKET=scrub-reports \
   -e DEFAULT_POLICY=default -e ENSURE_BUCKETS=true -e POLL_INTERVAL=2s \
   -e WORKERS=1 \
-  -e MAX_OBJECT_BYTES="$MAX_OBJECT_BYTES" -e MAX_EXPAND_BYTES="$MAX_EXPAND_BYTES" \
-  -e SPILL_THRESHOLD="$SPILL_THRESHOLD" -e SPILL_RESIDENT_MAX="$SPILL_RESIDENT_MAX" \
-  -e GOMEMLIMIT="$GOMEMLIMIT" \
+  -e SCRATCH_BYTES="$SCRATCH_BYTES" \
+  -e POD_MEMORY_LIMIT="$(mem_bytes "$MEM")" \
   "$IMAGE" >/dev/null
 
 echo

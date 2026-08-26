@@ -31,9 +31,12 @@ N="${N:-25}"
 SIZE_MB="${SIZE_MB:-8}"
 NET=scrubbench
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
-# Mirror the pod so the numbers mean something for the deployment.
+# Mirror the pod so the numbers mean something for the deployment. Memory tracks
+# deploy/openshift-manifests.yaml (limits.memory: 4Gi); note it governs the SPILL_*
+# knobs and MAX_LEAF_BYTES, NOT how large a bundle may expand -- that follows the
+# scratch declaration, which this queue benchmark does not exercise.
 CPUS="${CPUS:-1}"
-MEMORY="${MEMORY:-2g}"
+MEMORY="${MEMORY:-4g}"
 
 cleanup() {
   docker rm -f scrubbench-minio scrubbench-scrubberd >/dev/null 2>&1 || true

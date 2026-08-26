@@ -39,7 +39,8 @@ func run(args []string) int {
 		salt        = fs.String("salt", "scrubber", "salt used when --redact-report is set")
 		dryRun      = fs.Bool("dry-run", false, "analyze and report without writing any output")
 		maxDepth    = fs.Int("max-depth", 16, "maximum container nesting depth")
-		maxBytes    = fs.Int64("max-expand-bytes", 2<<30, "cumulative decompressed bytes held in memory per input")
+		maxBytes    = fs.Int64("max-expand-bytes", 2<<30, "expanded content accepted per input, enforced while reading (bounds TMPDIR, not memory)")
+		maxLeaf     = fs.Int64("max-leaf-bytes", 0, "largest single file to scrub; 0 = no limit. The matcher needs the payload contiguous in memory, so a large file costs several times its size in heap")
 		maxRatio    = fs.Int("max-ratio", 0, "DEPRECATED, ignored: expansion-ratio limits reject ordinary logs (see --max-expand-bytes)")
 		scrubNames  = fs.Bool("scrub-names", true, "also scrub archive member names/paths, not just contents")
 		verbose     = fs.Bool("verbose", false, "print the per-rule breakdown to stderr")
@@ -105,7 +106,12 @@ func run(args []string) int {
 			MaxDepth:      *maxDepth,
 			MaxTotalBytes: *maxBytes,
 			MaxMembers:    100000,
-			VerifyOutput:  *verifyOut,
+			// Off unless asked for. The service derives this from the pod's memory
+			// because a pod that OOMs takes the queue with it; a workstation has the
+			// memory for one large log and no kubelet to answer to, so imposing a
+			// ceiling here would only refuse work the machine can do.
+			MaxLeafBytes: *maxLeaf,
+			VerifyOutput: *verifyOut,
 		},
 	}
 

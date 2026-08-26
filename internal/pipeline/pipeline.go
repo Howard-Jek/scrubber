@@ -30,20 +30,53 @@ import (
 // There is deliberately no expansion-ratio limit. Ratio cannot separate a bomb
 // from an ordinary log: real-world log files compress at 200:1 to 1000:1, so any
 // ratio threshold low enough to catch a bomb also rejects the tool's primary
-// input — and rejection means the file is emitted UNSCRUBBED. Memory is bounded
+// input — and rejection means the file is emitted UNSCRUBBED. Expansion is bounded
 // instead by MaxTotalBytes, enforced while reading, which is a true bound.
+//
+// The three size limits here answer to three different resources, and mixing them up
+// is how a pod dies rather than how a bundle is refused:
+//
+//	MaxTotalBytes bounds SCRATCH  — expanded payloads spill to TMPDIR.
+//	MaxLeafBytes  bounds HEAP     — one file must be contiguous for the matcher.
+//	MaxMembers    bounds HEAP too — per-member bookkeeping does not spill.
+//
+// In the service each is derived from the pod resource that actually governs it, so
+// MaxTotalBytes follows the ephemeral-storage declaration and MaxLeafBytes follows
+// limits.memory. Swapping them reads plausibly and fails in production.
 type Limits struct {
 	MaxDepth int // maximum container nesting depth
-	// MaxTotalBytes is the cumulative expansion budget for one top-level object:
-	// the total decompressed bytes the engine will read across every nested stream
-	// and archive member.
+	// MaxTotalBytes is the expansion budget for one top-level object: the total
+	// decompressed CONTENT the engine will accept across every nested stream and
+	// archive member.
 	//
-	// Note this bounds bytes *read*, and since members now spill it bounds mostly
-	// DISK rather than resident memory. Size the pod's scratch volume against it,
-	// not just the memory limit — an ephemeral-storage eviction kills a pod as dead
-	// as an OOM.
+	// Content, not bytes materialised. An intermediate container is charged when it is
+	// decompressed, and that charge is lent back for the duration of the walk into it
+	// (see descend), so a .tar.gz costs its content once rather than twice and this
+	// number means to an operator what its name says. Before the lend existed, a 4 GiB
+	// setting admitted only ~2 GiB of tar.gz content.
+	//
+	// Because members spill, it bounds mostly DISK rather than resident memory — and
+	// the disk actually touched is a MULTIPLE of it: the decompressed container, the
+	// member bodies and the repacked result are live at once, so one object can occupy
+	// roughly 3x this plus the compressed object.
+	//
+	// In the service this is DERIVED from the scratch volume rather than chosen: the
+	// declaration is the input and this is that ceiling divided by the multiple above
+	// (see cmd/scrubberd deriveCaps). Do not read the relationship the other way and
+	// size a volume from this number — an ephemeral-storage eviction kills a pod as
+	// dead as an OOM, and it happens without a report.
 	MaxTotalBytes int64
 	MaxMembers    int // maximum entries in a single archive
+	// MaxLeafBytes is the largest single text file the matcher will materialise.
+	// Zero disables the check, which is the behaviour that shipped and what the CLI
+	// wants — a workstation scrubbing one large log has the memory for it and no
+	// kubelet to answer to.
+	//
+	// It exists because this is the only payload the spill policy cannot bound (see
+	// handleLeaf), so it is the one limit that must be sized from the pod's MEMORY
+	// rather than from its scratch volume. Above it the file is passed through and
+	// flagged ReasonLeafCap instead of being scrubbed.
+	MaxLeafBytes int64
 	// Spill decides which payloads stay on the heap. The zero value uses
 	// spill.DefaultPolicy.
 	Spill spill.Policy
@@ -103,6 +136,10 @@ type Engine struct {
 	// budget is the remaining cumulative expansion allowance, reset on each
 	// depth-0 Process call.
 	budget int64
+	// charged is the gross total ever drawn by take, never reduced by a lend. Only
+	// descend reads it, and only as a difference across a subtree: "did walking into
+	// this container charge the budget for what was inside it?"
+	charged int64
 	// staged holds every blob this walk created, so that a panic cannot orphan a
 	// temp file. Each normal path closes its own blobs the moment they are dead;
 	// this is the backstop for the abnormal one, and Blob.Close is idempotent so
@@ -218,7 +255,52 @@ func (e *Engine) Release() {
 }
 
 // take draws n bytes from the expansion budget.
-func (e *Engine) take(n int64) { e.budget -= n }
+//
+// charged accumulates the same amount and is never given back, which is what lets
+// descend below tell "the walk charged this container's contents" apart from "the
+// walk charged nothing, so the container's own bytes are all there is".
+func (e *Engine) take(n int64) {
+	e.budget -= n
+	e.charged += n
+}
+
+// descend walks into a payload that has ALREADY been charged to the budget, lending
+// that charge back for the duration so the payload's own contents can be read
+// against it, then settling up.
+//
+// This is what makes MAX_EXPAND_BYTES mean "expanded content" rather than "bytes
+// materialised on the way to it". A .tar.gz used to draw on the budget twice — once
+// for the decompressed tar, once for the member bodies read out of that tar — so a
+// 4 GiB setting admitted only ~2 GiB of real content and the configured number meant
+// nothing an operator could reason about.
+//
+// The lend has to happen BEFORE the descent, not as a refund after it. The budget is
+// not only an accounting total: the remaining balance is passed down as the read
+// ceiling (ReadTar, ReadZip and DecompressBlob all take e.budget), so a container
+// that stays charged while its own members are being read has already shrunk the
+// ceiling those members must fit under. Refunding afterwards fixes the books and
+// changes nothing about what was admitted — measured at 2.03x content before this
+// was moved earlier.
+//
+// Settling is where the safety lives. If the contents charged less than the container
+// itself cost, the difference goes back on the budget: the container's bulk is real
+// bytes on real disk and something must answer for it. That is what stops the obvious
+// abuse — an archive of large, near-empty inner containers, which under a naive
+// "only charge leaves" rule would refund almost its entire size and let sixteen
+// levels of nesting through for free.
+//
+// Net effect per shape: a .tar.gz costs its decompressed tar once (~content plus tar
+// padding); a plain .tar or .zip is untouched, since the container is the input and
+// was never charged; and a container full of padding still costs its padding.
+func (e *Engine) descend(path string, b *spill.Blob, depth int, charged int64) (*spill.Blob, bool) {
+	e.budget += charged
+	mark := e.charged
+	out, changed := e.ProcessBlob(path, b, depth)
+	if contents := e.charged - mark; contents < charged {
+		e.budget -= charged - contents
+	}
+	return out, changed
+}
 
 // scrubMemberName scrubs an archive entry's name (when enabled), records any hits,
 // and reports whether the name changed. origPath is the report label.
@@ -288,6 +370,7 @@ func (e *Engine) ProcessBlob(path string, in *spill.Blob, depth int) (*spill.Blo
 		if e.budget <= 0 {
 			e.budget = DefaultLimits().MaxTotalBytes
 		}
+		e.charged = 0
 		e.residualLeft = e.Limits.ResidualBudget
 		if e.residualLeft == 0 {
 			e.residualLeft = DefaultResidualBudget
@@ -387,6 +470,23 @@ func (e *Engine) handleLeaf(path string, in *spill.Blob) (*spill.Blob, bool) {
 	// This is why the spill threshold matters — a leaf briefly costs a few times its
 	// own size, and that cost is bounded by the largest single member, not by the
 	// archive.
+	//
+	// It is also the one payload the spill policy does NOT bound. Bytes() reads the
+	// whole file back off scratch without going through the resident reservation, and
+	// Decode, Scrub and Encode each hold their own copy, so one text file costs three
+	// to four times its size in heap however small SPILL_RESIDENT_MAX is set. That was
+	// survivable only because the expansion budget was small enough to bound it by
+	// accident; once the budget follows the pod's declared scratch it no longer does,
+	// and the failure it produces is an OOM mid-object — the pod dies, restarts, picks
+	// the same object up and dies again. Refusing the file is strictly better: the rest
+	// of the archive is still scrubbed and the hole is named in the report.
+	if e.Limits.MaxLeafBytes > 0 && in.Size() > e.Limits.MaxLeafBytes {
+		e.skip(path, report.StatusGuardTripped, report.ReasonLeafCap,
+			fmt.Sprintf("file is %d bytes, above the %d-byte single-file scrub limit; "+
+				"the matcher needs it contiguous in memory and this pod cannot hold it",
+				in.Size(), e.Limits.MaxLeafBytes), in)
+		return in, false
+	}
 	data, err := in.Bytes()
 	if err != nil {
 		e.skip(path, report.StatusPassthrough, report.ReasonMalformed,
@@ -481,7 +581,10 @@ func (e *Engine) handleCompressed(f detect.Format, path string, in *spill.Blob, 
 	defer inner.Close()
 	e.take(inner.Size())
 
-	processed, changed := e.ProcessBlob(path, inner, depth+1)
+	// Charged above, then lent back for the descent to the extent the walk charges
+	// what is inside it: for a .tar.gz the members below pay for the same bytes, and
+	// only one of the two should count against the operator's expansion budget.
+	processed, changed := e.descend(path, inner, depth+1, inner.Size())
 	if !changed {
 		// Nothing changed inside; keep the original bytes for exact fidelity.
 		return in, false
@@ -559,7 +662,9 @@ func (e *Engine) handleTar(path string, in *spill.Blob, depth int) (*spill.Blob,
 		if !members[i].IsRegular() {
 			continue
 		}
-		out, memberChanged := e.ProcessBlob(memberPath, members[i].Body, depth+1)
+		// Size read before the descent: a changed member is replaced by its scrubbed
+		// blob, and the lend must be measured against what was charged going in.
+		out, memberChanged := e.descend(memberPath, members[i].Body, depth+1, members[i].Body.Size())
 		if memberChanged {
 			// Release the original now rather than at the deferred sweep: with many
 			// large members the difference is the whole archive's worth of scratch.
@@ -614,7 +719,9 @@ func (e *Engine) handleZip(path string, in *spill.Blob, depth int) (*spill.Blob,
 		if members[i].IsDir() {
 			continue
 		}
-		out, memberChanged := e.ProcessBlob(memberPath, members[i].Body, depth+1)
+		// See handleTar: charged in the loop above, lent back for whatever the descent
+		// charges against this member's own contents.
+		out, memberChanged := e.descend(memberPath, members[i].Body, depth+1, members[i].Body.Size())
 		if memberChanged {
 			members[i].Body.Close()
 			members[i].Body = out

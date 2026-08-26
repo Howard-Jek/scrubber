@@ -24,6 +24,7 @@ import (
 	"compress/zlib"
 	"errors"
 	"io"
+	"math"
 
 	"github.com/howard/scrubber/internal/detect"
 	"github.com/howard/scrubber/internal/spill"
@@ -39,7 +40,7 @@ func readCapped(r io.Reader, max int64) ([]byte, error) {
 		return nil, ErrTooLarge
 	}
 	var buf bytes.Buffer
-	n, err := io.CopyN(&buf, r, max+1)
+	n, err := io.CopyN(&buf, r, plusOne(max))
 	if err != nil && err != io.EOF {
 		return nil, err
 	}
@@ -47,6 +48,22 @@ func readCapped(r io.Reader, max int64) ([]byte, error) {
 		return nil, ErrTooLarge
 	}
 	return buf.Bytes(), nil
+}
+
+// plusOne is max+1 without the wrap.
+//
+// The read guards ask for one byte more than the budget so that "filled the budget
+// exactly" can be told from "went past it". At the top of the int64 range that
+// addition overflows to negative, io.CopyN treats a negative count as "copy
+// nothing", and the guard then reports a fully-populated stream as empty — the
+// payload is dropped and the object goes out looking clean. The budget is clamped
+// well below this in cmd/scrubberd, but the guard belongs where the arithmetic is:
+// the CLI takes --max-expand-bytes straight from a flag.
+func plusOne(n int64) int64 {
+	if n == math.MaxInt64 {
+		return n
+	}
+	return n + 1
 }
 
 // spillCapped is readCapped's blob-backed twin: identical budget semantics, but the

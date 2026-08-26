@@ -10,6 +10,306 @@ For what to verify on your own cluster after taking a new image, see
 
 ---
 
+## Image 0.8.0 — the expansion cap follows the volume, and a bundle costs its content once
+
+0.6.0 sized the memory knobs from the pod and left the one cap operators actually
+want to change — how large a bundle may expand — compiled in at 1536Mi with an
+environment variable bolted on. Raising it turned out to be unsafe for two reasons
+that had nothing to do with the number: a `.tar.gz` drew on the budget twice, so
+half of it was never usable, and nothing at all bounded what a single large file
+costs in memory. All three move together here, because raising the budget without
+the other two converts a clean guard trip into an OOM crash-loop.
+
+### The expansion cap is derived from the declared volume, not compiled in
+
+**What changed.** `maxExpandDefault` — a flat 1536Mi unless `SCRATCH_BYTES` said
+otherwise — is gone. The caps are derived at startup from what the deployment
+declares:
+
+```
+MAX_EXPAND_BYTES = SCRATCH_BYTES / 3.5
+MAX_OBJECT_BYTES = 41.7% of MAX_EXPAND_BYTES
+MAX_LEAF_BYTES   = 96Mi x (limits.memory / 2Gi)
+```
+
+Raise the declaration in `deployment.yaml` and the cap follows on the next rollout.
+An undeclared scratch ceiling no longer falls back to a constant *cap*; it falls
+back to a constant *scratch* of 4Gi and derives from that, so there is exactly one
+derivation path and a manifest that declares nothing still produces caps that hang
+together.
+
+**Two ceilings, two resources, and they are not interchangeable.**
+
+- How large a bundle may **expand** is bounded by ephemeral storage (`/work`).
+- How large one **file** may be scrubbed is bounded by `limits.memory`.
+
+`limits.memory` does not affect how large a bundle can expand. An expansion cap
+sized from `limits.memory` gets the pod evicted for ephemeral-storage; a per-file
+cap sized from the volume OOM-kills it. This is the sentence to keep: memory buys
+files, the volume buys bundles.
+
+**What the shipped manifest declares.** These are the inputs; every cap below is
+arithmetic on them.
+
+```
+SCRATCH_BYTES:                       "14Gi"          # quantities are accepted now
+/work emptyDir sizeLimit:            14Gi
+resources.limits.ephemeral-storage:  14Gi            # requests too
+resources.limits.memory:             4Gi             # was 2Gi; requests 512Mi
+```
+
+`limits.cpu` stays at `1` with `requests.cpu` 500m, and the image is
+`scrubberd:0.8.0`. 14Gi is not a typo: a `.tar.gz` expanding to 4 GiB holds the
+decompressed tar, the member bodies and the repacked result on `/work` at once.
+
+**What that derives**, exactly — these are asserted against the manifest file itself
+by `TestShippedManifestDerivesItsDocumentedCaps`, not typed here by hand:
+
+| Derived | Value |
+| --- | --- |
+| `MAX_EXPAND_BYTES` | **4294967296** — 4.00 GiB exactly |
+| `MAX_OBJECT_BYTES` | 1789569706 — 1707 MiB |
+| `MAX_LEAF_BYTES` | 201326592 — 192 MiB |
+| `SPILL_THRESHOLD` | 8388608 — 8 MiB |
+| `SPILL_RESIDENT_MAX` | 134217728 — 128 MiB |
+| `GOMEMLIMIT` | 2516582400 — 2400 MiB |
+
+Estimated peak RSS is ~2083 MiB against the 60% gate of 2458 MiB, and peak scratch
+works out at 14.00 Gi against the 14 Gi declared. Both are inside their gates, so a
+pod on this manifest starts with no sizing warning — which is the point of printing
+them.
+
+**Rule of thumb for sizing your own: `/work` is 3.5x the content you need expanded.**
+
+| `/work` (= `SCRATCH_BYTES` = both `ephemeral-storage` values) | Content it admits |
+| --- | --- |
+| 4Gi | 1.14 GiB |
+| 10Gi | 2.86 GiB |
+| 14Gi | **4.00 GiB** (shipped) |
+| 20Gi | 5.71 GiB |
+
+**The pod reads its own resources block.** The Deployment projects it with the
+Downward API: `POD_MEMORY_LIMIT` from `resourceFieldRef: limits.memory` and
+`POD_EPHEMERAL_LIMIT` from `limits.ephemeral-storage`, both with `divisor: "1"`
+(bytes) and `containerName: scrubberd`, which is required. Precedence is explicit in
+both directions:
+
+```
+memory:   POD_MEMORY_LIMIT -> cgroup v2 memory.max -> cgroup v1 -> not detected
+scratch:  SCRATCH_BYTES    -> POD_EPHEMERAL_LIMIT  -> not declared (4Gi default)
+```
+
+**A trap worth knowing before you copy that env block.** If a container declares no
+`limits.ephemeral-storage`, Kubernetes does not fail the reference — it resolves it
+to the **node's** allocatable storage, a number far larger than the pod's share,
+which would derive an expansion cap that gets the pod evicted mid-object. The
+shipped manifest declares the limit explicitly, and `SCRATCH_BYTES` overrides the
+projected value anyway. Do not wire one without the other.
+
+Scratch still has no measured fallback, for the reason 0.6.0 gave and which has not
+changed: an emptyDir's `sizeLimit` is enforced by the kubelet, not the filesystem,
+so `statfs` inside the container reports the node's whole disk.
+
+**This is a breaking deployment change.** A 0.7.0 manifest applied to 0.8.0 keeps
+working — nothing crashes, nothing is refused at startup — but it declares
+`SCRATCH_BYTES=4Gi` and no Downward API, so it sizes from 4Gi and derives an
+expansion cap of **1.14 GiB**. That number is lower than the 1638Mi the same
+manifest got from 0.7.0, while the `.tar.gz` content it actually admits is higher,
+so a straight before/after comparison of the cap tells you nothing useful. To get
+the new caps, four things change together:
+
+1. `SCRATCH_BYTES` in the ConfigMap,
+2. the `/work` emptyDir `sizeLimit`,
+3. `resources.limits.ephemeral-storage` (and `requests`),
+4. the `POD_MEMORY_LIMIT` / `POD_EPHEMERAL_LIMIT` env block on the container.
+
+The first four are the same volume and must carry the same number — the `sizeLimit` is
+what the kubelet enforces, `limits.ephemeral-storage` is what it evicts against,
+`requests.ephemeral-storage` is what the scheduler reserves on the node, and
+`SCRATCH_BYTES` is what the process is told.
+`TestManifestDeclaresScratchConsistently` fails if they drift.
+
+**Read `scratch_source` first when the caps are not what you expected.** The startup
+"resource limits" line gained `max_leaf_bytes`, `scratch_declared_bytes` and
+`scratch_source`. A `scratch_source` of `default (undeclared)` means the manifest
+never told the pod how much `/work` it has, which is the usual reason a cap comes
+out a third of what someone expected. A new warning fires when `MAX_EXPAND_BYTES` is
+pinned well *below* what the declared scratch would allow — bundles refused on a
+volume with room for them — and the existing scratch warning now names
+`scratch_source` and `max_expand_bytes`, so the line says which input to go and
+change.
+
+### A `.tar.gz` drew on the expansion budget twice
+
+**The bug.** Expanding a `.tar.gz` charged the budget for the decompressed tar, then
+charged it again for the member bodies read out of that tar. The same bytes were
+counted twice, so a 4 GiB setting admitted only about 2 GiB of content and the guard
+tripped on bundles that fit the volume with room to spare. And an expansion trip
+does not turn an upload away: the bundle is emitted **unscrubbed** and flagged, so
+the cost of the double-draw was content leaving the pipeline uninspected, not a
+rejection anyone had to argue with. (Only `MAX_OBJECT_BYTES` refuses an object
+outright.)
+
+**Fixed** in `internal/pipeline/pipeline.go`, which gained `descend()`: it lends the
+container's own charge back to the budget before walking into it, and settles up
+afterwards. **The lend has to happen before the walk, not as a refund after it** —
+what remains of the budget is passed down as the *read ceiling* (`ReadTar`,
+`ReadZip` and `DecompressBlob` all take `e.budget`), so a credit paid at the end
+arrives after the reads it was meant to license have already been capped.
+
+**Measured** in `internal/pipeline/budget_test.go` — the smallest budget that admits
+a 57,000-byte body in a 58,880-byte tar:
+
+| Shape | Before | After |
+| --- | --- | --- |
+| `.tar.gz` | 115,880 — **2.03x** content | 58,880 — **1.03x** content |
+| `.tar`, `.zip` | 57,000 — 1.00x | 57,000 — unchanged |
+
+The residual 3% is the tar's own size: block padding, not a second copy of anything.
+Plain containers never had a double-draw and are byte-for-byte unaffected.
+
+**The refund cannot be used to beat the guard.** Settling re-charges the difference
+when a container's contents cost *less* than the container did, so an archive of
+large, near-empty inner containers still trips the guard instead of expanding
+forever on credit it never spent. Pinned by `TestRefundCannotBeUsedToBeatTheGuard`.
+
+### One large text file could still take the pod down: `MAX_LEAF_BYTES`
+
+**Why this had to arrive in the same release as the derived cap.** The matcher needs
+its payload contiguous as a string. `spill.Blob.Bytes()` does an `os.ReadFile` on a
+spilled leaf — reading the whole thing back in, *outside* the resident reservation
+`SPILL_RESIDENT_MAX` enforces — and then `textenc.Decode`, `Matcher.Scrub` and
+`textenc.Encode` each hold their own copy. One text file therefore costs 3-4x its
+size in heap no matter how low the `SPILL_*` pair is set. Spilling decides *where* a
+member lives; it never bounded how large the one being scrubbed may be.
+
+That was survivable only by accident: the old expansion budget was small enough to
+bound the largest possible member for us. Once the budget follows the volume it no
+longer does, and the failure is the worst shape available — an OOM in the middle of
+an object, so the pod dies, restarts, takes the same object off the queue and dies
+again.
+
+**What the cap does.** A file above `MAX_LEAF_BYTES` is passed through unchanged and
+recorded as `guard-tripped` with the reason code `leaf-cap`. **The rest of the
+archive is still scrubbed** — unlike an expansion-budget trip inside a container,
+which discards every member of that container. `0` disables the check, and the CLI
+defaults it to `0` and gained `--max-leaf-bytes`: a workstation has the memory for
+one large log and no kubelet to answer to.
+
+**The startup estimate had been wrong in the same direction.** `est_peak_rss_bytes`
+computed its leaf term as `leafCopies * SPILL_THRESHOLD`, which quietly assumed the
+spill threshold bounds the largest payload the matcher holds. It does not, so the
+estimate was short by the difference between 4Mi and the biggest file in the bundle,
+and that gap is exactly what OOM-kills a pod whose own startup log called it
+comfortable. The term is now `leafCopies * MAX_LEAF_BYTES`.
+
+### `scratchFactor` went 2.5 → 3.5, and it had to move with the refund
+
+The divisor that turns declared scratch into the expansion budget was 2.5 and is now
+3.5. **That is not a separate tuning change; it is the other half of the double-draw
+fix.**
+
+For a `.tar.gz` whose content expands to N, three copies are live on `/work` at
+once: the decompressed tar, the member bodies read out of it, and the repacked
+result, on top of the compressed object C staged for the download. Peak disk is C +
+3N, and C is at most `shippedObjectShare` of N, so 3.42 covers it; 3.5 is that
+rounded up.
+
+2.5 was only ever safe *because* the budget double-counted: 2.5 x 2N already
+exceeded C + 3N. Now that `descend` counts N once, the factor has to carry the whole
+multiple itself. Leaving it at 2.5 alongside the refund would license 2.5N of disk
+for a shape that needs 3.42N, and the pod would be evicted for ephemeral-storage
+mid-object — which produces no report at all, unlike a cap that refuses cleanly and
+says so. `TestScratchFactorCoversPeakDisk` asserts the round trip, and the startup
+check makes the same statement about the shipped manifest: 14.00 Gi of peak scratch
+against 14 Gi declared.
+
+### At the top of the int64 range, a full stream was reported as empty
+
+**The bug**, and it is this document's recurring shape in its purest form. The read
+guards evaluate `budget+1` to tell "exactly at the limit" from "over it". With the
+budget near `MaxInt64` that addition wraps negative; `io.CopyN` copies nothing for a
+negative count; and the guard therefore reports a **full stream as empty**. The
+payload is dropped, the object ships unscrubbed, and the report certifies it
+`complete`.
+
+**Reproduced end to end** at `MaxTotalBytes=MaxInt64` with `SPILL_THRESHOLD=0`:
+1,500 secrets in, **0 matches**, verdict `complete`, output byte-identical to input.
+Nothing in the run indicated a fault, because from the guard's point of view there
+wasn't one.
+
+**Fixed in three places**: `archive.plusOne()`, the saturating room calculation in
+`spill.FromReader`, and a `maxExpandCeiling` of `1<<50` in `cmd/scrubberd` that
+clamps an absurd expansion cap and warns rather than accepting it. The clamp earns
+its place now in a way it would not have before: the caps are computed from
+operator-supplied numbers, so a fat-fingered `SCRATCH_BYTES` reaches this arithmetic
+directly.
+
+### The scripts now exercise the derivation instead of bypassing it
+
+`scripts/run-local.sh` hardcoded `MAX_EXPAND_BYTES`, `MAX_OBJECT_BYTES`, the
+`SPILL_*` pair and `GOMEMLIMIT`, which made the one command people run to "check it
+like production" the one command that bypassed production's sizing — and it had
+drifted: it still said 1536Mi long after the manifest's `SCRATCH_BYTES` derived
+1638Mi. It now declares inputs only — `MEM=4g`, `SCRATCH_BYTES=14Gi`, and
+`POD_MEMORY_LIMIT` passed explicitly so the local run takes the same code path as
+the pod — and lets the service derive the outputs. Any of them can still be exported
+to override, exactly as in the ConfigMap.
+
+`scripts/memory-matrix.sh` had the same problem somewhere it mattered more: the gate
+that is supposed to validate the shipped sizing was passing every cap in explicitly,
+so it validated numbers a human had typed rather than the numbers the service
+computes. `LIMIT_MIB` is now 4096 with a new `SCRATCH_MIB=14336`, and `EXPAND_MIB`,
+`OBJECT_MIB`, `LEAF_MIB`, `GOMEMLIMIT_MIB` and both `SPILL_*_MIB` default to
+**empty** and are passed only when explicitly set. `SCRATCH_MIB=4096 LIMIT_MIB=2048`
+reproduces the old 2 GiB pod.
+
+### New tests, and a manifest that can no longer drift from the code
+
+`cmd/scrubberd` had no tests at all. It now has `TestDeriveCaps*` over the
+derivation itself — that it follows declared scratch, that it is linear in it, that
+scratch is not memory, that the object cap stays under the expansion cap, that it
+does not overflow — plus three that parse `deploy/openshift-manifests.yaml` and
+assert what the shipped file actually produces:
+`TestShippedManifestDerivesItsDocumentedCaps` (4 GiB, exactly),
+`TestManifestDeclaresScratchConsistently` and `TestManifestWiresTheDownwardAPI`.
+Every cap this record has ever published was, until now, a claim about a file
+nothing checked.
+
+`internal/pipeline/budget_test.go` covers the double-draw, the refund's safety cap
+and the leaf cap. `internal/podres/podres_test.go` covers the Downward API
+precedence chains above and the unusable declared values that have to be ignored
+rather than believed.
+
+### What 0.7.0 was actually running, which was not what the docs said
+
+Worth knowing before anyone compares before-and-after numbers. The docs — this
+record included — described the shipped caps as **1536Mi / 640Mi**. They were not.
+Those were the compiled-in defaults, and they applied only when `SCRATCH_BYTES` was
+undeclared; the shipped manifest declared it at 4Gi, from which the 0.6.0 derivation
+produced **1,717,986,918 (1638Mi)** and **715,827,882 (682.7Mi)**. Every published
+measurement labelled "at the shipped caps" was taken at a configuration the shipped
+manifest did not produce.
+
+Nothing below is being rewritten — the entries record what was measured and believed
+at the time. But two of them state a cap as a *current* fact, and both are
+superseded here:
+
+- **0.6.0, "Caps now size themselves against the pod".** Its closing paragraph —
+  declare `SCRATCH_BYTES` equal to the `/work` `sizeLimit`, and `MAX_EXPAND_BYTES`
+  and `MAX_OBJECT_BYTES` derive from it — still holds in shape, but the divisor is
+  now 3.5, `MAX_LEAF_BYTES` derives alongside them from `limits.memory`, an
+  undeclared ceiling falls back to 4Gi of scratch rather than a flat cap, and
+  `SCRATCH_BYTES` is no longer the only way to declare it: `POD_EPHEMERAL_LIMIT` is
+  read when it is absent. That section's `est_peak_rss` column also predates the
+  leaf term — at 4 GiB the estimate is now ~2083 MiB rather than 703 MiB, because it
+  stopped assuming the spill threshold bounds the largest payload the matcher holds.
+- **0.3.0, the shipped-settings table.** `MAX_OBJECT_BYTES 640Mi`, `MAX_EXPAND_BYTES
+  1536Mi` and `/work sizeLimit: 4Gi` were that release's shipped numbers. None of
+  the three is a setting any more: two are derived, and the third is 14Gi.
+
+---
+
 ## Image 0.7.0 — an escape hatch from the queue, and a failure that used to be invisible
 
 ### A failing discovery loop had no metric
@@ -500,10 +800,15 @@ Shipped settings (`deploy/openshift-manifests.yaml`), all changed together:
 | `MAX_OBJECT_BYTES` | 64Mi | **640Mi** |
 | `MAX_EXPAND_BYTES` | 160Mi | **1536Mi** (now bounds mostly *disk*) |
 | `SPILL_THRESHOLD` | — | **4Mi** |
-| `SPILL_RESIDENT_MAX` | — | **64Mi** (this is what bounds memory now) |
+| `SPILL_RESIDENT_MAX` | — | **64Mi** (this is what bounds memory now — see note below) |
 | `GOMEMLIMIT` | 900MiB | **1200MiB** |
 | `/work` emptyDir | no limit | **`sizeLimit: 4Gi`** |
 | `WORKERS` | 4 | **1** (clamped) |
+
+> **Superseded in 0.8.0.** `SPILL_RESIDENT_MAX` bounds every payload the spill policy
+> sees, but not the leaf the matcher is working on: `spill.Blob.Bytes` reads that one
+> back off disk outside the resident reservation. It takes `MAX_LEAF_BYTES` alongside
+> it to bound RSS.
 
 Measured after the change, against real MinIO and the real service:
 
@@ -537,6 +842,8 @@ Recorded rather than fixed, so nothing here is a surprise later:
 - **A single archive *member* larger than the memory budget is still bounded only by
   `MAX_EXPAND_BYTES`.** The leaf scrubber needs its payload contiguous in memory, so
   spilling does not help for one enormous member inside an otherwise ordinary bundle.
+  (Bounded since 0.8.0 by `MAX_LEAF_BYTES`: the member is passed through and flagged
+  `leaf-cap` instead of OOM-killing the pod. Still not *scrubbed*.)
 - **`/work` must have a `sizeLimit`.** It is load-bearing now that members spill there; an
   unbounded emptyDir can eat node ephemeral storage and get the pod evicted.
 - **The image is single-arch (`linux/amd64`).** Building on Apple silicon for an x86

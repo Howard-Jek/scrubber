@@ -3,7 +3,8 @@
 # service, and report peak RSS against the pod's memory limit.
 #
 #   ./scripts/memory-matrix.sh
-#   EXPAND_MIB=192 GOMEMLIMIT_MIB=1000 ./scripts/memory-matrix.sh
+#   SCRATCH_MIB=4096 LIMIT_MIB=2048 ./scripts/memory-matrix.sh   # the old 2Gi pod
+#   EXPAND_MIB=192 GOMEMLIMIT_MIB=1000 ./scripts/memory-matrix.sh # pin caps by hand
 #   SHAPES=big ./scripts/memory-matrix.sh          # just the 500MiB bundle
 #
 # Why this exists separately from `go test -run TestMemoryMatrix`: that test measures
@@ -27,14 +28,28 @@ set -uo pipefail
 
 S="$(cd "$(dirname "$0")/.." && pwd)"
 WORK="${WORK:-/tmp/scrubber-memory-matrix}"
-LIMIT_MIB="${LIMIT_MIB:-2048}"      # the pod's memory limit this is judged against
+LIMIT_MIB="${LIMIT_MIB:-4096}"      # the pod's memory limit this is judged against
 TARGET_PCT="${TARGET_PCT:-60}"      # peak RSS should land under this share of it
-EXPAND_MIB="${EXPAND_MIB:-1536}"
-GOMEMLIMIT_MIB="${GOMEMLIMIT_MIB:-1200}"
-OBJECT_MIB="${OBJECT_MIB:-640}"
-SPILL_THRESHOLD_MIB="${SPILL_THRESHOLD_MIB:-4}"
-SPILL_RESIDENT_MIB="${SPILL_RESIDENT_MIB:-64}"
+# The pod's declared scratch volume. Every cap the service applies is DERIVED from
+# this and LIMIT_MIB, so the run exercises the same arithmetic production does.
+#
+# This block used to pin EXPAND_MIB, OBJECT_MIB, GOMEMLIMIT_MIB and both SPILL_*
+# values explicitly and never set SCRATCH_BYTES at all, which meant the gate could
+# not validate the derivation it exists to guard -- it would have passed cleanly with
+# the derivation deleted outright. Leave them empty to test what actually ships; set
+# one to probe a specific configuration.
+SCRATCH_MIB="${SCRATCH_MIB:-14336}"  # 14Gi, matching the manifest -> 4Gi expansion
+EXPAND_MIB="${EXPAND_MIB:-}"         # empty = derived as SCRATCH_MIB / 3.5
+GOMEMLIMIT_MIB="${GOMEMLIMIT_MIB:-}" # empty = derived from LIMIT_MIB
+OBJECT_MIB="${OBJECT_MIB:-}"         # empty = derived as 41.7% of the expansion cap
+LEAF_MIB="${LEAF_MIB:-}"             # empty = derived as 96Mi x LIMIT_MIB/2048
+SPILL_THRESHOLD_MIB="${SPILL_THRESHOLD_MIB:-}"
+SPILL_RESIDENT_MIB="${SPILL_RESIDENT_MIB:-}"
 SHAPES="${SHAPES:-tiny big}"
+# What the service WILL derive, recomputed here so the fixtures can be sized to fill
+# the cap. Kept in step with cmd/scrubberd/main.go scratchFactor by
+# TestScratchFactorCoversPeakDisk, which fails if that constant moves without this.
+EFFECTIVE_EXPAND_MIB="${EXPAND_MIB:-$(( SCRATCH_MIB * 10 / 35 ))}"
 BIG_MIB="${BIG_MIB:-500}"    # content size of the "big" incompressible shape
 
 command -v jq >/dev/null || { echo "jq is required" >&2; exit 1; }
@@ -54,7 +69,7 @@ cp "$S"/deploy/policies/*.json "$WORK/policies/"
 go build -o "$WORK/scrubberd" "$S/cmd/scrubberd" || exit 1
 
 # --- fixtures --------------------------------------------------------------------
-python3 - "$WORK" "$EXPAND_MIB" "$SHAPES" "$BIG_MIB" <<'PY'
+python3 - "$WORK" "$EFFECTIVE_EXPAND_MIB" "$SHAPES" "$BIG_MIB" <<'PY'
 import io, os, sys, tarfile
 work, expand_mib, shapes, big_mib = sys.argv[1], int(sys.argv[2]), sys.argv[3].split(), int(sys.argv[4])
 cap = expand_mib * 1024 * 1024
@@ -68,14 +83,18 @@ def report(path, members, content, draw, note):
 
 if "tiny" in shapes:
     # Size the fixture against the budget the engine actually charges, not against
-    # content. A .tar.gz draws twice -- once for the whole decompressed tar, once for
-    # the member bodies copied out of it -- and for many *small* members the tar's own
-    # overhead is not a rounding error: every member costs a 512B header plus padding
-    # up to the next 512B block. Ignoring that overshoots the cap, the guard trips, and
-    # the object is emitted UNSCRUBBED, which looks like a memory pass but is a scrub
-    # failure. MAX_MEMBERS is the other ceiling; stay clear of it for the same reason.
-    PER = 4096                            # block-aligned, so no padding waste
-    PER_MEMBER_DRAW = (512 + PER) + PER   # tar header+body, then the body copied again
+    # content. For many *small* members the tar's own overhead is not a rounding
+    # error: every member costs a 512B header plus padding up to the next 512B block.
+    # Ignoring that overshoots the cap, the guard trips, and the object is emitted
+    # UNSCRUBBED -- which looks like a memory pass but is a scrub failure.
+    # MAX_MEMBERS is the other ceiling; stay clear of it for the same reason.
+    #
+    # A .tar.gz used to draw TWICE, once for the decompressed tar and again for the
+    # member bodies copied out of it, so this was (512 + PER) + PER. The engine now
+    # lends the container's charge back before walking into it, so the draw is the
+    # decompressed tar alone.
+    PER = 4096                      # block-aligned, so no padding waste
+    PER_MEMBER_DRAW = 512 + PER     # tar header + body, charged once
     members = min(int(cap * 0.95 / PER_MEMBER_DRAW), 90000)
     body = (line * (PER // len(line) + 1))[:PER]
     out = f"{work}/tiny.tar.gz"
@@ -104,7 +123,9 @@ if "big" in shapes:
             info = tarfile.TarInfo(name="bundle/blob-%03d.bin" % i)
             info.size = len(body)
             tf.addfile(info, io.BytesIO(body))
-    report(out, MEMBERS, MEMBERS * PER, MEMBERS * (512 + PER) + MEMBERS * PER,
+    # One draw, not two: descend() lends the decompressed tar back before walking
+    # into it, so the members do not pay for the same bytes a second time.
+    report(out, MEMBERS, MEMBERS * PER, MEMBERS * (512 + PER),
            "incompressible, the shape the spill exists for")
 PY
 
@@ -121,11 +142,14 @@ MINIO_ENDPOINT=127.0.0.1:19000 MINIO_ACCESS_KEY=minioadmin MINIO_SECRET_KEY=mini
 MINIO_USE_TLS=false INPUT_BUCKET=scrub-input OUTPUT_BUCKET=scrub-output \
 REPORTS_BUCKET=scrub-reports ENSURE_BUCKETS=true DEFAULT_POLICY=default \
 POLICIES_DIR="$WORK/policies" PORT=8080 LOG_LEVEL=info WORKERS=1 \
-MAX_OBJECT_BYTES=$((OBJECT_MIB * 1024 * 1024)) \
-MAX_EXPAND_BYTES=$((EXPAND_MIB * 1024 * 1024)) \
-SPILL_THRESHOLD=$((SPILL_THRESHOLD_MIB * 1024 * 1024)) \
-SPILL_RESIDENT_MAX=$((SPILL_RESIDENT_MIB * 1024 * 1024)) \
-GOMEMLIMIT="${GOMEMLIMIT_MIB}MiB" \
+SCRATCH_BYTES=$((SCRATCH_MIB * 1024 * 1024)) \
+POD_MEMORY_LIMIT=$((LIMIT_MIB * 1024 * 1024)) \
+${OBJECT_MIB:+MAX_OBJECT_BYTES=$((OBJECT_MIB * 1024 * 1024))} \
+${EXPAND_MIB:+MAX_EXPAND_BYTES=$((EXPAND_MIB * 1024 * 1024))} \
+${LEAF_MIB:+MAX_LEAF_BYTES=$((LEAF_MIB * 1024 * 1024))} \
+${SPILL_THRESHOLD_MIB:+SPILL_THRESHOLD=$((SPILL_THRESHOLD_MIB * 1024 * 1024))} \
+${SPILL_RESIDENT_MIB:+SPILL_RESIDENT_MAX=$((SPILL_RESIDENT_MIB * 1024 * 1024))} \
+${GOMEMLIMIT_MIB:+GOMEMLIMIT="${GOMEMLIMIT_MIB}MiB"} \
   "$WORK/scrubberd" >"$WORK/scrubberd.log" 2>&1 &
 for _ in $(seq 1 60); do curl -fsS http://127.0.0.1:8080/readyz >/dev/null 2>&1 && break; sleep 1; done
 SP=$(pgrep -f "$WORK/scrubberd" | head -1)

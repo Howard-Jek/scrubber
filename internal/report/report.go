@@ -197,6 +197,16 @@ const (
 	ReasonScratch       Reason = "scratch-unavailable"  // could not spill to disk
 	ReasonRepackFailed  Reason = "repack-failed"        // scrubbed, then could not be rebuilt
 	ReasonResidualScrub Reason = "residual-after-scrub" // scrubbed, but the policy still matches
+	// ReasonLeafCap marks one text file too large to scrub on this pod's memory,
+	// which is a different failure from the archive around it being too large.
+	//
+	// The matcher needs its payload contiguous as a string, so a single leaf costs
+	// several times its own size in heap — and unlike every other payload it is
+	// materialised outside the spill accounting, so no SPILL_* setting bounds it.
+	// Without this code such a file is not refused, it is an OOM: the pod dies
+	// mid-object, the kubelet restarts it, the object is picked up again and it dies
+	// again. Naming it turns a crash loop into one flagged file in a report.
+	ReasonLeafCap Reason = "leaf-cap" // single file too large to scrub in memory
 	// ReasonUnclassified is the tripwire. It is never written deliberately: it marks
 	// a hole recorded through Record instead of Skip, i.e. one whose author did not
 	// say why. The conformance corpus asserts zero of these, so the shortcut that
@@ -209,7 +219,7 @@ const (
 var AllReasons = []Reason{
 	ReasonBinary, ReasonEncoding, ReasonUnsupported, ReasonMalformed,
 	ReasonExpandBudget, ReasonMemberCap, ReasonDepthCap, ReasonScratch,
-	ReasonRepackFailed, ReasonResidualScrub, ReasonUnclassified,
+	ReasonRepackFailed, ReasonResidualScrub, ReasonLeafCap, ReasonUnclassified,
 }
 
 // AuditLevel controls how much per-match detail the report retains.
