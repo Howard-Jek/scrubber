@@ -261,6 +261,24 @@ data:
   # Number of past runs the UI may request from /api/history.
   HISTORY_MAX: "100"
   # debug logs a line per file inside every bundle as it is scrubbed.
+  # A misconfigured pod does not start. Every fault found at startup -- a missing
+  # required variable, an unreadable byte setting, a policy that will not compile, a
+  # sizing combination that will evict or OOM the pod -- is collected and reported
+  # together as one error naming the value seen and the fix, then the process exits 1.
+  #
+  # It used to panic on the first missing variable and log.Warn past everything else,
+  # so a pod could come up healthy and wrong. If a rollout fails, `oc logs` has the
+  # whole list; you do not need to fix them one restart at a time.
+  #
+  # The two SIZING checks (estimated peak RSS against limits.memory, and scratch needed
+  # against the declared volume) rest on estimates that deliberately err high, so they
+  # have an escape hatch that parse failures do not:
+  # ALLOW_UNSAFE_SIZING: "false"   # "true" downgrades the two sizing faults to
+                                  # warnings and starts anyway. Only reasonable if you
+                                  # have measured the real peak with
+                                  # ./scripts/memory-matrix.sh -- if the estimate was
+                                  # right, the pod now dies under load instead of at
+                                  # rollout, which is the failure with no report.
   LOG_LEVEL: "info"
   PORT: "8080"
   # Let the Go GC know the container ceiling so it collects harder as it nears it

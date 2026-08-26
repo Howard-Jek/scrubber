@@ -9,10 +9,7 @@
 package main
 
 import (
-	"bytes"
 	"fmt"
-	"io"
-	"log/slog"
 	"math"
 	"os"
 	"strconv"
@@ -394,69 +391,153 @@ func countOccurrences(hay, needle string) int {
 // through, and the piece that had no test at all.
 //
 // Two behaviours matter more than the parsing. A value that cannot be read must be
-// WARNED about rather than silently replaced by a default — that silence is how a pod
-// runs for weeks with a cap nobody chose. And every way of writing zero must disable,
-// because the quantity forms this function exists to accept are exactly what an
-// operator will reach for after reading the docs.
+// recorded as a startup FAULT rather than silently replaced by a default — that
+// silence is how a pod runs for weeks with a cap nobody chose. And every way of
+// writing zero must disable, because the quantity forms this function exists to accept
+// are exactly what an operator reaches for after reading the docs.
 func TestEnvInt64(t *testing.T) {
-	discard := slog.New(slog.NewTextHandler(io.Discard, nil))
 	const def = int64(999)
 
 	tests := []struct {
-		name string
-		set  string // "" means leave unset
-		want int64
+		name      string
+		set       string // "" means leave unset
+		want      int64
+		wantFault bool
 	}{
-		{"unset uses the default", "", def},
-		{"plain bytes", "4294967296", 4294967296},
-		{"binary quantity", "4Gi", 4294967296},
-		{"binary quantity, small", "192Mi", 201326592},
-		{"decimal quantity", "2G", 2000000000},
-		{"zero disables", "0", 0},
-		{"zero disables in quantity form", "0Gi", 0},
-		{"zero disables written long", "00", 0},
-		{"negative disables the residual scan", "-1", -1},
-		{"negative quantity", "-64Mi", -67108864},
-		// Unreadable: fall back, but loudly. The value is not silently honoured as
-		// something else, and it is not allowed to become zero — zero means "disabled"
-		// to several of these settings, which is the opposite of "I could not read it".
-		{"garbage falls back", "lots", def},
-		{"unit typo falls back", "14GB", def},
-		{"bare suffix falls back", "Gi", def},
-		{"fractional falls back", "1.5Gi", def},
+		{"unset uses the default", "", def, false},
+		{"plain bytes", "4294967296", 4294967296, false},
+		{"binary quantity", "4Gi", 4294967296, false},
+		{"binary quantity, small", "192Mi", 201326592, false},
+		{"decimal quantity", "2G", 2000000000, false},
+		{"zero disables", "0", 0, false},
+		{"zero disables in quantity form", "0Gi", 0, false},
+		{"zero disables written long", "00", 0, false},
+		{"negative disables the residual scan", "-1", -1, false},
+		{"negative quantity", "-64Mi", -67108864, false},
+		// Unreadable: the return value still falls back, but the process must not be
+		// allowed to start on it. Never silently zero — zero means "disabled" to
+		// several of these settings, which is the opposite of "I could not read it".
+		{"garbage is a fault", "lots", def, true},
+		{"unit typo is a fault", "14GB", def, true},
+		{"bare suffix is a fault", "Gi", def, true},
+		{"fractional is a fault", "1.5Gi", def, true},
 	}
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
 			const key = "SCRUBBER_TEST_BYTES"
 			t.Setenv(key, tc.set)
-			if got := envInt64(discard, key, def); got != tc.want {
+			probs := &startupProblems{}
+			got := envInt64(probs, key, def)
+			if got != tc.want {
 				t.Errorf("envInt64(%q) = %d, want %d", tc.set, got, tc.want)
+			}
+			if fault := probs.err() != nil; fault != tc.wantFault {
+				t.Errorf("envInt64(%q) recorded fault=%v, want %v", tc.set, fault, tc.wantFault)
 			}
 		})
 	}
 }
 
-// TestEnvInt64WarnsRatherThanDefaultsSilently pins the half of the contract that the
-// return value cannot express.
-func TestEnvInt64WarnsRatherThanDefaultsSilently(t *testing.T) {
-	var buf bytes.Buffer
-	log := slog.New(slog.NewTextHandler(&buf, &slog.HandlerOptions{Level: slog.LevelWarn}))
+// TestEnvInt64FaultNamesTheVariable pins the half of the contract the return value
+// cannot express: the operator has to be able to tell WHICH setting was rejected and
+// what it was set to, without grepping the source.
+func TestEnvInt64FaultNamesTheVariable(t *testing.T) {
 	const key = "SCRUBBER_TEST_BYTES"
+	probs := &startupProblems{}
 
 	t.Setenv(key, "14 gigabytes")
-	if got := envInt64(log, key, 123); got != 123 {
+	if got := envInt64(probs, key, 123); got != 123 {
 		t.Errorf("got %d, want the default 123", got)
 	}
-	if out := buf.String(); !strings.Contains(out, key) {
-		t.Errorf("an unreadable value was swallowed without naming the variable; log was %q", out)
+	err := probs.err()
+	if err == nil {
+		t.Fatal("an unreadable value was swallowed; the pod would start with a cap nobody chose")
+	}
+	for _, want := range []string{key, "14 gigabytes", "Fix:"} {
+		if !strings.Contains(err.Error(), want) {
+			t.Errorf("the fault does not mention %q; it said: %v", want, err)
+		}
 	}
 
-	buf.Reset()
+	// And a good value must not manufacture one.
+	clean := &startupProblems{}
 	t.Setenv(key, "4Gi")
-	if got := envInt64(log, key, 123); got != 4294967296 {
+	if got := envInt64(clean, key, 123); got != 4294967296 {
 		t.Errorf("got %d, want 4294967296", got)
 	}
-	if out := buf.String(); out != "" {
-		t.Errorf("a perfectly good value produced a warning: %q", out)
+	if err := clean.err(); err != nil {
+		t.Errorf("a perfectly good value produced a fault: %v", err)
+	}
+}
+
+// TestStartupProblemsReportsEverythingAtOnce is the whole point of the accumulator.
+// The service used to panic on the first missing variable, so an operator fixed one,
+// redeployed, and discovered the next — a restart per fault.
+func TestStartupProblemsReportsEverythingAtOnce(t *testing.T) {
+	probs := &startupProblems{}
+	t.Setenv("SCRUBBER_TEST_A", "")
+	t.Setenv("SCRUBBER_TEST_B", "")
+	probs.req("SCRUBBER_TEST_A", "the first thing")
+	probs.req("SCRUBBER_TEST_B", "the second thing")
+	t.Setenv("SCRUBBER_TEST_C", "nonsense")
+	envInt64(probs, "SCRUBBER_TEST_C", 1)
+
+	err := probs.err()
+	if err == nil {
+		t.Fatal("three faults produced no error")
+	}
+	msg := err.Error()
+	for _, want := range []string{"SCRUBBER_TEST_A", "SCRUBBER_TEST_B", "SCRUBBER_TEST_C", "3 configuration problems"} {
+		if !strings.Contains(msg, want) {
+			t.Errorf("the report omits %q; it said: %s", want, msg)
+		}
+	}
+	if probs2 := (&startupProblems{}); probs2.err() != nil {
+		t.Error("a clean configuration produced an error")
+	}
+}
+
+// TestStartupProblemsNeverEchoesASecret: the fault for a missing credential must not
+// quote its value. A partially-set credential is exactly the case where a helpful
+// error message leaks one into the pod log.
+func TestStartupProblemsNeverEchoesASecret(t *testing.T) {
+	probs := &startupProblems{}
+	t.Setenv("SCRUBBER_TEST_SECRET", "   ") // whitespace: set, but unusable
+	probs.reqSecret("SCRUBBER_TEST_SECRET", "the credential")
+
+	err := probs.err()
+	if err == nil {
+		t.Fatal("a whitespace-only credential was accepted")
+	}
+	if strings.Contains(err.Error(), "   ") && strings.Contains(err.Error(), "Value") {
+		t.Errorf("the fault quotes the secret's value: %v", err)
+	}
+	if !strings.Contains(err.Error(), "never logged") {
+		t.Errorf("the fault should say the value is not logged; it said: %v", err)
+	}
+}
+
+// TestSizingFaultCanBeOverridden: the two sizing checks rest on estimates that err
+// high, so an operator who has measured their own workload gets a documented way past
+// them. Parse failures do not get one — those are unambiguous.
+func TestSizingFaultCanBeOverridden(t *testing.T) {
+	t.Setenv("ALLOW_UNSAFE_SIZING", "")
+	strict := &startupProblems{}
+	strict.sizing("estimated peak RSS is too high")
+	if strict.err() == nil {
+		t.Error("a sizing fault did not stop startup by default")
+	}
+	if strict.sizingOverridden {
+		t.Error("sizingOverridden set without the override being requested")
+	}
+
+	t.Setenv("ALLOW_UNSAFE_SIZING", "true")
+	lax := &startupProblems{}
+	lax.sizing("estimated peak RSS is too high")
+	if lax.err() != nil {
+		t.Errorf("ALLOW_UNSAFE_SIZING did not downgrade the fault: %v", lax.err())
+	}
+	if !lax.sizingOverridden {
+		t.Error("the override was not recorded, so nothing can warn about it later")
 	}
 }
