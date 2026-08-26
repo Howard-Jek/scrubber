@@ -45,17 +45,45 @@ data:
   # resident memory was a multiple of the bundle size and a few-hundred-MiB upload
   # could not fit this pod at any cap. It now can.
   #
-  # The consequence is that MAX_EXPAND_BYTES bounds mostly DISK, not memory. Size the
-  # /work emptyDir against it — an ephemeral-storage eviction kills a pod exactly as
-  # dead as an OOM, and an unbounded emptyDir draws on node storage shared with every
-  # other pod on the node.
+  # -------------------------------------------------------------------------------
+  # TWO CEILINGS, TWO RESOURCES. Read this before changing any number below.
   #
-  # Resident memory is now governed by the two SPILL_* settings below, NOT by
-  # MAX_EXPAND_BYTES. Verify any change with ./scripts/memory-matrix.sh, which runs
-  # the worst-shaped bundle end to end and fails if peak RSS exceeds 60% of the limit
-  # OR if the object comes back with a passthrough — a cap set too low stops bounding
-  # anything and starts silently emitting unscrubbed files, which looks like a pass
-  # if you only watch memory.
+  #   How large a bundle may EXPAND      -> bounded by ephemeral storage (/work)
+  #   How large one FILE may be SCRUBBED -> bounded by memory (limits.memory)
+  #
+  # They are not interchangeable, and swapping them fails in production rather than
+  # at rollout. Every expanded byte lands on /work, so an expansion cap sized from
+  # limits.memory gets the pod EVICTED for ephemeral-storage. One file must be
+  # contiguous in memory for the matcher and that copy never touches disk, so a
+  # per-file cap sized from the volume OOM-KILLS the pod.
+  #
+  # NOTHING here is compiled in any more. Both caps are DERIVED at startup from what
+  # this file declares — the resources block and the /work sizeLimit at the bottom,
+  # projected into the pod by the Downward API env vars in the Deployment. Raise the
+  # declaration and the caps follow on the next rollout, with no code change.
+  #
+  # And note what "too large" does -- three different things, worth keeping apart:
+  #
+  #   MAX_OBJECT_BYTES   the only one that REJECTS. The upload is turned away and
+  #                      counted in scrubber_objects_total{status="too_large"}.
+  #   MAX_EXPAND_BYTES   the whole container is emitted UNSCRUBBED, flagged
+  #                      guard-tripped / expansion-budget. EVERY member of it is
+  #                      uninspected, not just the one that overran.
+  #   MAX_LEAF_BYTES     only THAT FILE is emitted unscrubbed, flagged
+  #                      guard-tripped / leaf-cap. The rest of the archive is
+  #                      scrubbed normally.
+  #
+  # In the last two the object still lands in the output bucket, with verdict
+  # "incomplete". Alert on scrubber_files_not_inspected_total by reason, not just on
+  # the error counters -- nothing errored.
+  # -------------------------------------------------------------------------------
+  #
+  # Verify any change with ./scripts/memory-matrix.sh, which runs the worst-shaped
+  # bundles end to end and fails on five conditions: the object not reaching status
+  # "scrubbed", any passthrough, ZERO MATCHES, peak RSS above TARGET_PCT of LIMIT_MIB,
+  # or a leaked temp file. The matches gate is the one a memory check cannot replace:
+  # a cap set too low stops bounding anything and starts silently emitting unscrubbed
+  # files, which looks like a pass if you only watch memory.
   WORKERS: "1"                    # queue concurrency. Kept for config compatibility
                                   # and CLAMPED to 1 -- a higher value is ignored
                                   # (with a warning) because concurrent scrubs on a
@@ -119,41 +147,92 @@ data:
                                   # mid-object and discards a completed scrub, which
                                   # then has to be redone after the restart. Keep it
                                   # inside terminationGracePeriodSeconds below.
-  # SCRATCH_BYTES declares how much scratch one object may use, and MUST match the
-  # /work emptyDir sizeLimit at the bottom of this file. It cannot be detected:
-  # an emptyDir's sizeLimit is enforced by the kubelet, not the filesystem, so
-  # statfs inside the container reports the whole node's disk and would license a
-  # budget that gets the pod evicted.
+  # SCRATCH_BYTES declares how much scratch one object may use. It is the ceiling the
+  # expansion cap is derived from, so it is what you change to scrub bigger bundles --
+  # but it is one of FOUR statements about the same volume, and they must move
+  # together or the pod plans for storage it has not been given:
   #
-  # MAX_EXPAND_BYTES and MAX_OBJECT_BYTES are derived from it (expansion =
-  # SCRATCH_BYTES / 2.5, object = 41.7% of that, the ratios the shipped numbers
-  # were measured at). Set either one explicitly below to override the derivation.
-  SCRATCH_BYTES: "4294967296"     # 4Gi — keep equal to the /work sizeLimit
-  # MAX_OBJECT_BYTES: "671088640"   # 640Mi compressed input. Larger objects are
-                                  # skipped without being downloaded whole and
-                                  # counted in scrubber_objects_total{status=
-                                  # "too_large"}. Watch that counter: it is how you
-                                  # find out real uploads are being turned away.
-                                  # Raised from 64Mi, which rejected ordinary
-                                  # bundles outright before the spill made them
-                                  # processable.
-  # MAX_EXPAND_BYTES: "1610612736"  # 1536Mi cumulative decompressed bytes per object,
-                                  # enforced *while* reading so it is a real budget
+  #   SCRATCH_BYTES (here)                 what the process sizes its budget from
+  #   /work emptyDir sizeLimit             what the kubelet enforces
+  #   resources.limits.ephemeral-storage   what the kubelet evicts against
+  #   resources.requests.ephemeral-storage what the scheduler reserves on the node
+  #
+  # Raising the first three and forgetting requests schedules the pod onto a node
+  # with the OLD headroom, so it evicts under load rather than failing at rollout.
+  #
+  # Kubernetes quantities are accepted here (14Gi, 512Mi, 2G) as well as plain byte
+  # counts, so this can be written identically to the three declarations below. A
+  # value that cannot be read is WARNED about at startup and then ignored -- check
+  # scratch_source in the "resource limits" log line if the cap is not what you set.
+  #
+  # It cannot be detected. An emptyDir's sizeLimit is enforced by the kubelet, not
+  # the filesystem, so statfs inside the container reports the whole node's disk and
+  # would license a budget that gets the pod evicted. The Downward API can supply it
+  # instead (POD_EPHEMERAL_LIMIT, wired in the Deployment) — but ONLY if
+  # limits.ephemeral-storage is declared, because Kubernetes silently resolves that
+  # reference to the NODE's allocatable storage when the container declares none.
+  # Setting SCRATCH_BYTES explicitly here is the belt to that braces; it wins.
+  #
+  #   MAX_EXPAND_BYTES = SCRATCH_BYTES / 3.5   -> 14Gi gives exactly 4 GiB
+  #   MAX_OBJECT_BYTES = 41.7% of that         -> 1707Mi compressed upload
+  #
+  # Where 3.5 comes from: a .tar.gz holding N bytes of content puts the decompressed
+  # tar, the member bodies read out of it, and the repacked result on /work at the
+  # same time (3N), plus the staged compressed object. It was 2.5 while the budget
+  # double-counted a .tar.gz; the budget now counts content once, so the factor
+  # carries the whole multiple. See cmd/scrubberd/main.go scratchFactor.
+  SCRATCH_BYTES: "14Gi"           # == the /work sizeLimit AND both
+                                  # ephemeral-storage values below. Derives a 4 GiB
+                                  # expansion cap. For a different target multiply the
+                                  # expanded size you need by 3.5 -- e.g. 6 GiB of
+                                  # content needs 21Gi, here and in all three others.
+  # MAX_OBJECT_BYTES: "1789569706"  # 1707Mi compressed input, derived. Larger objects
+                                  # are turned away and counted in
+                                  # scrubber_objects_total{status="too_large"}. Watch
+                                  # that counter: it is how you find out real uploads
+                                  # are being turned away. (The object is streamed to
+                                  # scratch up to the cap PLUS ONE BYTE before being
+                                  # refused -- the extra byte is how "exactly at the
+                                  # limit" is told from "over it". Not free; just not
+                                  # kept.)
+  # MAX_EXPAND_BYTES: "4294967296"  # 4Gi of expanded CONTENT per object, derived.
+                                  # Enforced *while* reading, so it is a real budget
                                   # rather than a ratio heuristic. Members spill, so
-                                  # this is now a DISK bound: keep the /work
-                                  # sizeLimit comfortably above it.
-                                  # NOTE: a .tar.gz draws on this budget twice --
-                                  # once for the decompressed tar, once for the
-                                  # member bodies read out of it. Effective capacity
-                                  # for a tar.gz is therefore ~768Mi of content.
-  # The two SPILL_* settings and GOMEMLIMIT are now DERIVED from the pod's own
-  # memory limit, read from the cgroup at startup. The values below are what a
-  # 2Gi pod derives; a 4Gi pod gets double and an 8Gi pod quadruple, with no edit
-  # here. They are left commented rather than deleted because setting either one
-  # explicitly is still the override — and note that doing so freezes it: a
-  # hard-coded SPILL_RESIDENT_MAX is exactly what stopped the service using a
-  # larger pod, and raising it far enough to matter turns spilling off and brings
-  # back the OOM the spill exists to prevent. Prefer changing limits.memory.
+                                  # this is a DISK bound.
+                                  # It now means what it says: a .tar.gz used to draw
+                                  # on it TWICE (once for the decompressed tar, once
+                                  # for the member bodies), so effective capacity was
+                                  # half the setting. The container's charge is now
+                                  # LENT BACK before the walk descends into it and
+                                  # settled afterwards -- lent BEFORE, because the
+                                  # remaining budget is also the read ceiling its own
+                                  # members must fit under. 4Gi here is now 4Gi of
+                                  # real content; measured 2.03x -> 1.03x.
+                                  # Set it BELOW the derived value to be more
+                                  # conservative; setting it above is what the
+                                  # startup scratch warning is for.
+  # MAX_LEAF_BYTES: "201326592"     # 192Mi, derived as 96Mi x (limits.memory / 2Gi).
+                                  # The largest SINGLE FILE the matcher will scrub.
+                                  # This one follows MEMORY, not the volume: the
+                                  # matcher needs the payload contiguous as a string,
+                                  # and Bytes/Decode/Scrub/Encode each hold a copy
+                                  # outside the spill accounting, so one file costs
+                                  # 3-4x its size in heap however low SPILL_* is set.
+                                  # A larger file is passed through and flagged
+                                  # leaf-cap rather than OOM-killing the pod — which
+                                  # would otherwise crash-loop, since the restart
+                                  # picks the same object up again. 0 disables it.
+  # SPILL_THRESHOLD, SPILL_RESIDENT_MAX, MAX_LEAF_BYTES and GOMEMLIMIT are DERIVED
+  # from the pod's own memory limit — read from POD_MEMORY_LIMIT (Downward API,
+  # wired in the Deployment) and falling back to the cgroup. The values quoted below
+  # are the 2Gi values for the two SPILL_* knobs; this pod is 4Gi and derives double
+  # those (8Mi / 128Mi). MAX_LEAF_BYTES and GOMEMLIMIT are already quoted at their
+  # 4Gi values above and below. Nothing needs editing either way.
+  # They are left commented rather than deleted because setting one explicitly
+  # is still the override — and note that doing so freezes it: a hard-coded
+  # SPILL_RESIDENT_MAX is exactly what stopped the service using a larger pod, and
+  # raising it far enough to matter turns spilling off and brings back the OOM the
+  # spill exists to prevent. Prefer changing limits.memory.
   # SPILL_THRESHOLD: "4194304"      # 4Mi. Payloads larger than this go to /work on
                                   # their own. Below it they stay on the heap, which
                                   # keeps a 20000-member archive from creating 20000
@@ -163,8 +242,12 @@ data:
                                   # payload is individually under the threshold while
                                   # together they would hold the whole archive. Once
                                   # this is exceeded everything spills regardless of
-                                  # size. THIS, not MAX_EXPAND_BYTES, is what bounds
-                                  # resident memory now.
+                                  # size. THIS and MAX_LEAF_BYTES, not
+                                  # MAX_EXPAND_BYTES, are what bound resident memory
+                                  # now. (SPILL_RESIDENT_MAX alone does not: the leaf
+                                  # the matcher is working on is read back off disk
+                                  # outside this accounting, which is why the leaf cap
+                                  # exists.)
   SCRUB_FILENAMES: "true"         # also scrub archive member names/paths + output key
   # Reports live in an internal bucket for operators to verify the scrub, so they
   # show the actual original values by default. Set "true" to store salted hashes
@@ -186,13 +269,18 @@ data:
   # This is a soft target the GC grows the heap *toward*, so it sets the steady-state
   # RSS as much as it caps it. It only holds while the LIVE set fits underneath: before
   # members spilled, at MAX_EXPAND_BYTES=512Mi the live set exceeded 1600MiB, the GC
-  # could not keep up, and RSS overran to 1889Mi -- 92% of this pod.
+  # could not keep up, and RSS overran to 1889Mi -- 92% of the 2Gi pod it was
+  # measured on (46% of this one, which is 4Gi).
   #
   # Now that the live set is bounded by the SPILL_* settings rather than by the bundle,
-  # the measured peak is 445Mi (22% of the limit) with this target, across both worst
-  # shapes: 90000 tiny members and a 500Mi incompressible bundle. This is the value
-  # ./scripts/memory-matrix.sh measured at; change it and re-run that script.
-  # GOMEMLIMIT: "1200MiB"          # derived as 58.6% of the detected pod memory
+  # the measured peak was 445Mi (22% of a 2Gi limit) at the 1200MiB target that pod
+  # derived -- not the 2400MiB below, which is this pod's -- across both
+  # worst shapes: 90000 tiny members and a 500Mi incompressible bundle. Those two
+  # shapes have no large single member, so they never exercised the leaf path — which
+  # is why MAX_LEAF_BYTES had to be introduced from the arithmetic rather than read
+  # off that measurement. Re-run ./scripts/memory-matrix.sh after changing either.
+  # GOMEMLIMIT: "2400MiB"          # derived as 58.6% of the detected pod memory
+                                  # (1200MiB at the 2Gi baseline, doubled for 4Gi)
   # Web UI: browser uploads straight to MinIO via presigned URLs, so the browser
   # must be able to reach MinIO. Set these to MinIO's externally reachable host.
   # (MinIO also needs CORS allowing the scrubber Route origin.)
@@ -234,12 +322,41 @@ spec:
         - name: artifactory-pull   # only if pulling from a private Artifactory repo
       containers:
         - name: scrubberd
-          image: <ARTIFACTORY_DOCKER_HOST>/docker-local/scrubberd:0.7.0
+          image: <ARTIFACTORY_DOCKER_HOST>/docker-local/scrubberd:0.8.0
           ports:
             - containerPort: 8080
           envFrom:
             - configMapRef: { name: scrubber-config }
             - secretRef: { name: scrubber-secret }
+          # The resources block below, handed to the process as numbers rather than
+          # left to be guessed. This is what makes the caps track this file: change a
+          # limit here and the derived caps change on the next rollout.
+          #
+          # divisor "1" means bytes. Without it the values arrive in the API's default
+          # units and the derivation is off by orders of magnitude.
+          #
+          # containerName is required for resourceFieldRef and must match the
+          # container name above.
+          #
+          # WARNING on limits.ephemeral-storage: if a container declares no
+          # ephemeral-storage limit, Kubernetes resolves this reference to the NODE's
+          # allocatable storage rather than failing — a number far larger than this
+          # pod may use, which would derive an expansion cap that gets it evicted.
+          # It is declared below, and SCRATCH_BYTES in the ConfigMap overrides this
+          # anyway. Do not remove one without removing the other.
+          env:
+            - name: POD_MEMORY_LIMIT
+              valueFrom:
+                resourceFieldRef:
+                  containerName: scrubberd
+                  resource: limits.memory
+                  divisor: "1"
+            - name: POD_EPHEMERAL_LIMIT
+              valueFrom:
+                resourceFieldRef:
+                  containerName: scrubberd
+                  resource: limits.ephemeral-storage
+                  divisor: "1"
           volumeMounts:
             - name: policies
               mountPath: /etc/scrubber/policies
@@ -269,15 +386,41 @@ spec:
             timeoutSeconds: 5
             failureThreshold: 6
           resources:
-            # Sized from the MAX_OBJECT_BYTES + MAX_EXPAND_BYTES budget in the
-            # ConfigMap above (one object at a time) -- change them together, never
-            # one alone.
+            # THIS BLOCK IS THE INPUT TO THE SIZING, not a consequence of it. The
+            # caps in the ConfigMap are derived from these numbers via the Downward
+            # API above, so this is where you change how much the service can chew.
+            #
+            #   memory            -> how large one FILE can be scrubbed
+            #                        (MAX_LEAF_BYTES = 96Mi x memory/2Gi = 192Mi here)
+            #                        and the SPILL_* / GOMEMLIMIT knobs.
+            #   ephemeral-storage -> how large a bundle can EXPAND
+            #                        (MAX_EXPAND_BYTES = 14Gi / 3.5 = 4Gi here).
+            #
+            # ephemeral-storage MUST equal the /work sizeLimit at the bottom and
+            # SCRATCH_BYTES in the ConfigMap. All three are the same volume; the
+            # sizeLimit is what the kubelet enforces, the limit is what the scheduler
+            # reserves, and SCRATCH_BYTES is what the process is told.
+            #
+            # 14Gi is not a typo. A .tar.gz expanding to 4 GiB holds the decompressed
+            # tar, the member bodies and the repacked result on /work at once. If the
+            # node cannot spare it, lower ephemeral-storage and the expansion cap
+            # drops with it. That is the safe direction: a smaller cap means oversized
+            # bundles come back flagged and UNSCRUBBED, which you can see and act on,
+            # while an undersized volume evicts the pod mid-object with no report at
+            # all and re-queues the same object to do it again.
+            #
             # The CPU request matters more than it used to: with a single consumer,
             # the queue's drain rate IS the CPU share this pod gets when the node is
             # contended. 100m was conservative when work was spread over several
             # goroutines; now it directly throttles every upload in the queue.
-            requests: { cpu: 500m, memory: 512Mi }
-            limits:   { cpu: "1",  memory: 2Gi }
+            requests:
+              cpu: 500m
+              memory: 512Mi
+              ephemeral-storage: 14Gi
+            limits:
+              cpu: "1"
+              memory: 4Gi
+              ephemeral-storage: 14Gi
           securityContext:
             runAsNonRoot: true
             allowPrivilegeEscalation: false
@@ -290,14 +433,20 @@ spec:
         - name: policies
           configMap: { name: scrubber-policies }
         - name: work
-          # sizeLimit is load-bearing now that archive members spill here. Without
-          # it an emptyDir draws on node ephemeral storage shared with every other
-          # pod, and exceeding it evicts this pod — the same outcome as an OOM, from
-          # a different resource. Keep it comfortably above MAX_EXPAND_BYTES: a
-          # .tar.gz stages the decompressed container, the member bodies and the
-          # repacked result, so budget roughly 2.5x the expansion cap.
+          # sizeLimit is load-bearing twice over. Without it an emptyDir draws on node
+          # ephemeral storage shared with every other pod, and exceeding it evicts
+          # this pod — the same outcome as an OOM, from a different resource. And it
+          # is now the number the expansion cap is DERIVED from, so it decides how
+          # large a bundle the service will accept.
+          #
+          # Keep all FOUR in step — this sizeLimit, both ephemeral-storage values
+          # above, and SCRATCH_BYTES in the ConfigMap. requests is the one people
+          # forget, and it fails late: the scheduler reserves it, so the pod lands on
+          # a node with the old headroom and evicts under load rather than at rollout. A .tar.gz stages the decompressed
+          # container, the member bodies and the repacked result at once, so the
+          # volume must be ~3.5x the expansion cap: 14Gi here for 4Gi of content.
           emptyDir:
-            sizeLimit: 4Gi
+            sizeLimit: 14Gi
         # - name: ca
         #   configMap: { name: scrubber-ca }
 ---

@@ -31,9 +31,9 @@ type Metrics struct {
 	// indefinitely, accepting uploads that are never scrubbed.
 	DiscoveryFailures prometheus.Counter
 
-	BytesIn      prometheus.Counter
-	BytesOut     prometheus.Counter
-	Duration     prometheus.Histogram
+	BytesIn  prometheus.Counter
+	BytesOut prometheus.Counter
+	Duration prometheus.Histogram
 
 	// QueueWait is how long an object sat in the queue before its scrub started.
 	QueueWait prometheus.Histogram
@@ -72,8 +72,8 @@ func New(reg prometheus.Registerer) *Metrics {
 			Help: "Failed listings of the input bucket. Rising steadily means no work is " +
 				"being discovered at all, while every per-object metric stays flat.",
 		}),
-		BytesIn:     prometheus.NewCounter(prometheus.CounterOpts{Name: "scrubber_bytes_in_total", Help: "Total input bytes read."}),
-		BytesOut:    prometheus.NewCounter(prometheus.CounterOpts{Name: "scrubber_bytes_out_total", Help: "Total output bytes written."}),
+		BytesIn:  prometheus.NewCounter(prometheus.CounterOpts{Name: "scrubber_bytes_in_total", Help: "Total input bytes read."}),
+		BytesOut: prometheus.NewCounter(prometheus.CounterOpts{Name: "scrubber_bytes_out_total", Help: "Total output bytes written."}),
 		Duration: prometheus.NewHistogram(prometheus.HistogramOpts{
 			Name: "scrubber_process_seconds", Help: "Per-object processing time.",
 			Buckets: prometheus.ExponentialBuckets(0.01, 3, 8),
@@ -250,8 +250,11 @@ var ObjectStatuses = []string{
 	"error",     // failed processing at the top level
 	"stalled",   // an object-storage transfer went quiet and was abandoned
 	"cancelled", // withdrawn from the queue by request
-	"too_large", // above MAX_OBJECT_BYTES; skipped without being downloaded
-	"panic",     // a bug in the pipeline; the object is skipped, the service continues
+	// above MAX_OBJECT_BYTES. Not kept, but not free either: GetLimitedTo streams
+	// the object to scratch up to the cap plus one byte before refusing it — the
+	// extra byte is how "exactly at the limit" is told from "over it".
+	"too_large",
+	"panic", // a bug in the pipeline; the object is skipped, the service continues
 }
 
 // Done reports whether the job reached a terminal state.

@@ -70,12 +70,17 @@ scrubber --terms terms.json --in bundle.zip --out clean.zip --fail-on-unscrubbed
 
 ### As a service
 
-One command brings up MinIO plus the service, under the same memory and CPU ceiling
-as the production pod:
+One command brings up MinIO plus the service, under the same memory and CPU ceiling as
+the production pod, and declaring the same scratch space:
 
 ```sh
 ./scripts/run-local.sh
 ```
+
+It no longer hardcodes the caps. It sets the *inputs* the pod sets — `MEM`,
+`SCRATCH_BYTES`, `POD_MEMORY_LIMIT` — and lets the service derive `MAX_EXPAND_BYTES`
+and the rest the way it does in the cluster, so a local run exercises production's
+sizing instead of bypassing it.
 
 Then open <http://localhost:8080>. Drop a bundle in, get a scrubbed bundle and a
 report back. To stop:
@@ -85,6 +90,28 @@ docker rm -f scrubberd scrubber-minio && docker network rm scrubnet
 ```
 
 For OpenShift, see [docs/MANUAL.md](docs/MANUAL.md#deploying-on-openshift).
+
+### How big a bundle fits
+
+Two ceilings, against two different resources. How large a bundle may **expand** is
+bounded by the scratch volume: `MAX_EXPAND_BYTES` is derived at startup from the
+ephemeral storage the pod declares, at roughly `/work ÷ 3.5`, so the shipped manifest's
+14Gi volume yields a 4.00 GiB expansion cap. How large a **single file** may be scrubbed
+is bounded by memory: the matcher needs one payload contiguous in heap, so
+`MAX_LEAF_BYTES` scales with `limits.memory` — 192 MiB at the shipped 4Gi — and a file
+over it is passed through unchanged and flagged `leaf-cap` while the rest of the archive
+is still scrubbed. Raising `limits.memory` does not let a larger bundle through, and
+sizing the expansion cap from memory rather than from the volume gets the pod evicted
+for ephemeral-storage.
+
+Neither of those two turns an upload away: over the expansion budget the bundle is
+emitted unscrubbed and flagged, over the leaf cap one file is. `MAX_OBJECT_BYTES` is the
+only cap that refuses an object outright, and even that is not a free rejection: the
+object is streamed to scratch up to the cap plus one byte before it is turned away, then
+discarded. The arithmetic, the derived values and what each startup warning means are in
+[docs/MANUAL.md](docs/MANUAL.md#sizing-the-pod). The CLI
+leaves the leaf cap off by default (`--max-leaf-bytes 0`): a workstation has the memory
+for one large log and no kubelet to answer to.
 
 ---
 
@@ -171,7 +198,7 @@ understanding before you trust an output bundle.
 | `binary-skipped` | **no** | Classified as binary by content, passed through untouched. |
 | `passthrough-error` | **no** | Unreadable, corrupt or encrypted; emitted byte-for-byte. |
 | `unsupported-format` | **no** | A container we can read but not rewrite (7z, rar, bzip2). |
-| `guard-tripped` | **no** | A size, depth or member-count guard refused to expand it. |
+| `guard-tripped` | **no** | A size, depth or member-count guard refused to expand it, or the file was over `MAX_LEAF_BYTES`. |
 | `residual-match` | **no** | Scrubbed, but the policy still matches the result. |
 | `cancelled` | **no** | Withdrawn from the queue by request. No output, report or digest is produced. |
 
@@ -186,7 +213,8 @@ alert on. Every uninspected file carries exactly one.
 | `encoding-unsupported` | Text that cannot be round-tripped (malformed UTF-16 or UTF-32). |
 | `unsupported-format` | A container we can read but not rewrite (7z, rar, bzip2). |
 | `malformed` | Corrupt, truncated or encrypted. |
-| `expansion-budget` | Would exceed `MAX_EXPAND_BYTES`. |
+| `expansion-budget` | Would exceed `MAX_EXPAND_BYTES`. Every member of that container is emitted unscrubbed. **Fix:** raise the `/work` volume (and both `ephemeral-storage` values and `SCRATCH_BYTES`) — 3.5x the expanded size you need. Not memory. |
+| `leaf-cap` | One **file** larger than `MAX_LEAF_BYTES` — too large to hold contiguously in heap. Only that file is passed through; the rest of the archive is still scrubbed. **Fix:** raise `limits.memory` — the cap scales at 96 MiB per 2 GiB of pod, so 4Gi admits 192 MiB files and 8Gi admits 384 MiB — or scrub that one file with the CLI, which has no leaf cap. Not the volume. |
 | `member-cap` | Archive exceeds `MAX_MEMBERS`. |
 | `depth-cap` | Nesting exceeds `MAX_DEPTH`. |
 | `scratch-unavailable` | Could not spill to disk. |

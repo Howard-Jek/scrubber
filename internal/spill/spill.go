@@ -23,6 +23,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"math"
 	"os"
 	"sync"
 )
@@ -189,7 +190,14 @@ func FromReader(r io.Reader, max int64, p Policy) (*Blob, error) {
 		return nil, fmt.Errorf("%w: %v", ErrSpill, werr)
 	}
 	// max-n+1 so exceeding the budget is detected rather than silently truncated.
-	copied, cerr := io.CopyN(f, r, max-n+1)
+	// Saturating, because the +1 wraps to negative at the top of the int64 range and
+	// io.CopyN reads nothing for a negative count — which would report a full stream
+	// as empty and emit the object as though it held no data.
+	room := max - n
+	if room < math.MaxInt64 {
+		room++
+	}
+	copied, cerr := io.CopyN(f, r, room)
 	if closeErr := f.Close(); cerr == nil && closeErr != nil {
 		cerr = closeErr
 	}
