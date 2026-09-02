@@ -592,19 +592,30 @@ func (r *Report) OnMembers(fn func(int)) {
 	r.onMembers = fn
 }
 
-// NoteMembers records that n more archive members have been discovered, and reports
-// the running total.
+// NoteMembers adjusts the running count of archive members expected to file a
+// report entry, and reports the new total.
 //
 // Called once per container as it is opened, BEFORE any of its members is scrubbed,
 // which is what makes a denominator available from the first file rather than only
 // once the archive is finished.
+//
+// n is a DELTA and may be zero or negative. A container that is itself a member has
+// already been counted by its parent and replaces itself with its own contents, so
+// one holding a single file adds nothing and an empty one subtracts. Rejecting those
+// as "not a discovery" is what left the total permanently above the number of entries
+// that could ever arrive. The caller computes the delta; see pipeline.noteMembers.
 func (r *Report) NoteMembers(n int) {
-	if n <= 0 {
+	if n == 0 {
 		return
 	}
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	r.membersSeen += n
+	if r.membersSeen < 0 {
+		// Cannot happen from a consistent walk, and a negative denominator would
+		// render as a nonsense percentage rather than fail visibly.
+		r.membersSeen = 0
+	}
 	if r.onMembers != nil {
 		r.onMembers(r.membersSeen)
 	}

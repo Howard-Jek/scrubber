@@ -300,6 +300,11 @@ var ObjectStatuses = []string{
 	"error",     // failed processing at the top level
 	"stalled",   // an object-storage transfer went quiet and was abandoned
 	"cancelled", // withdrawn from the queue by request
+	// the walk outran SCRUB_TIMEOUT and was abandoned. Distinct from "error"
+	// because the response is different: an error usually means the object is bad,
+	// this means the budget or the CPU is too small for the bundles being sent.
+	// Alert on it separately -- a rising rate here is a capacity signal.
+	"timeout",
 	// above MAX_OBJECT_BYTES. Not kept, but not free either: GetLimitedTo streams
 	// the object to scratch up to the cap plus one byte before refusing it — the
 	// extra byte is how "exactly at the limit" is told from "over it".

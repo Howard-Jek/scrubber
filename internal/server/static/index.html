@@ -48,7 +48,23 @@
   .cnt{visibility:hidden; font-size:11px; font-weight:500; color:var(--color-text-success); background:var(--color-background-success); padding:1px 7px; border-radius:999px; min-width:14px; text-align:center;}
   .rule{display:flex; align-items:center; gap:6px; padding:5px 7px; border-radius:var(--border-radius-md); transition:background .4s;}
   .sr{position:absolute; width:1px; height:1px; overflow:hidden; clip:rect(0 0 0 0);}
-  pre{margin:0; white-space:pre-wrap;}
+  /* Long unbreakable strings are this page's NORMAL input, not an edge case: object
+     keys carry a uuid prefix, member paths carry the whole bundle path, and a
+     failure now explains itself in a paragraph. A flex item does not shrink below
+     its own content unless told to, so one long name pushed the Withdraw button out
+     of its card and under the policy panel beside it — measured at 39px hidden on a
+     desktop window and 180px on a phone, with the page scrolling sideways.
+       .ell  one line, clipped with an ellipsis — for identity, where the shape is
+             what you read and the middle can go
+       .brk  wraps anywhere, including mid-token — for prose and paths you need whole
+       .row  a flex row whose children may shrink AND wrap rather than push a sibling
+             out of the box
+     min-width:0 is the load-bearing part of all three: without it the browser
+     refuses to shrink a flex item below its content and the overflow reappears. */
+  .row{display:flex; align-items:center; gap:10px; flex-wrap:wrap; min-width:0;}
+  .ell{min-width:0; overflow:hidden; text-overflow:ellipsis; white-space:nowrap;}
+  .brk{min-width:0; overflow-wrap:anywhere;}
+  pre{margin:0; white-space:pre-wrap; overflow-wrap:anywhere;}
   /* Icons are an inline sprite rather than a webfont from a CDN: this page has
      to render in an air-gapped cluster with no egress. Sized in em so the
      existing font-size/color styling keeps working. */
@@ -92,15 +108,17 @@
 <div class="wrap">
 <div class="frame">
 
-  <div style="display:flex; align-items:center; gap:10px; margin-bottom:1.25rem;">
+  <div style="display:flex; align-items:center; gap:10px; margin-bottom:1.25rem; flex-wrap:wrap;">
     <div style="width:36px; height:36px; border-radius:var(--border-radius-md); background:var(--color-background-primary); border:0.5px solid var(--color-border-tertiary); display:flex; align-items:center; justify-content:center;">
       <svg class="icn" style="font-size:20px; color:var(--color-text-primary);" aria-hidden="true"><use href="#i-eraser"/></svg>
     </div>
-    <div>
+    <div style="min-width:0;">
       <div style="font-size:16px; font-weight:500; color:var(--color-text-primary);">Scrubber</div>
       <div style="font-size:13px; color:var(--color-text-secondary);">Sanitize logs before you share them</div>
     </div>
-    <div style="margin-left:auto; display:flex; align-items:center; gap:8px;">
+    <!-- Wraps as a group. Left to itself the theme button was the item that fell off
+         the right edge on a phone, taking the page's horizontal scrollbar with it. -->
+    <div style="margin-left:auto; display:flex; align-items:center; gap:8px; flex-wrap:wrap;">
       <div style="display:flex; align-items:center; gap:6px; font-size:12px; color:var(--color-text-secondary); background:var(--color-background-primary); border:0.5px solid var(--color-border-tertiary); padding:5px 10px; border-radius:var(--border-radius-md);">
         <svg class="icn" style="font-size:15px;" aria-hidden="true"><use href="#i-shield-check"/></svg> policy: <span id="policyName">default</span>
       </div>
@@ -119,7 +137,7 @@
 
   <div style="display:flex; gap:16px; flex-wrap:wrap; align-items:flex-start;">
 
-    <div style="flex:2 1 320px; min-width:280px;">
+    <div style="flex:2 1 320px; min-width:min(280px,100%);">
       <div id="drop" role="button" tabindex="0" aria-label="Drop files here or click to browse"
         style="background:var(--color-background-primary); border:1.5px dashed var(--color-border-secondary); border-radius:var(--border-radius-lg); padding:2.25rem 1rem; text-align:center; cursor:pointer; transition:border-color .15s, background .15s;">
         <svg class="icn" style="font-size:34px; color:var(--color-text-secondary);" aria-hidden="true"><use href="#i-cloud-upload"/></svg>
@@ -127,8 +145,8 @@
         <div style="font-size:13px; color:var(--color-text-tertiary); margin-top:4px;">Archives, logs, any file — unpacked, scrubbed, repacked</div>
       </div>
       <input type="file" id="picker" multiple class="sr" />
-      <div style="display:flex; align-items:center; justify-content:space-between; margin-top:12px;">
-        <div style="font-size:12px; color:var(--color-text-tertiary); display:flex; align-items:center; gap:6px;">
+      <div style="display:flex; align-items:center; justify-content:space-between; margin-top:12px; flex-wrap:wrap; gap:8px;">
+        <div style="font-size:12px; color:var(--color-text-tertiary); display:flex; align-items:center; gap:6px; min-width:0;">
           <svg class="icn" style="font-size:14px;" aria-hidden="true"><use href="#i-lock"/></svg> Bytes go straight to storage
         </div>
         <button id="demo">Load a sample bundle</button>
@@ -136,7 +154,7 @@
       <div id="list" style="margin-top:1.25rem; display:flex; flex-direction:column; gap:12px;"></div>
     </div>
 
-    <aside style="flex:1 1 230px; min-width:220px; background:var(--color-background-primary); border:0.5px solid var(--color-border-tertiary); border-radius:var(--border-radius-lg); padding:14px;">
+    <aside style="flex:1 1 230px; min-width:min(220px,100%); background:var(--color-background-primary); border:0.5px solid var(--color-border-tertiary); border-radius:var(--border-radius-lg); padding:14px;">
       <div style="display:flex; align-items:center; gap:7px; margin-bottom:2px;">
         <svg class="icn" style="font-size:17px; color:var(--color-text-secondary);" aria-hidden="true"><use href="#i-list-search"/></svg>
         <span style="font-size:14px; font-weight:500; color:var(--color-text-primary);">Active policy</span>
@@ -152,12 +170,14 @@
 
       <!-- Bounded height: the rule list must not grow the page as the policy grows. -->
       <div id="policy" style="max-height:44vh; min-height:120px; overflow-y:auto; overscroll-behavior:contain; margin:0 -4px; padding:0 4px;"></div>
-      <div id="ruleMore" style="display:none; font-size:11px; color:var(--color-text-tertiary); padding-top:6px;"></div>
+      <div id="ruleMore" class="brk" style="display:none; font-size:11px; color:var(--color-text-tertiary); padding-top:6px;"></div>
 
       <button id="editbtn" style="width:100%; font-size:12px; margin-top:12px;"><svg class="icn" style="font-size:14px; vertical-align:-2px; margin-right:5px;" aria-hidden="true"><use href="#i-edit"/></svg>Edit terms.json</button>
       <div id="editor" style="display:none; margin-top:8px;">
         <textarea id="jsontext" spellcheck="false" aria-label="terms.json editor" style="width:100%; height:190px; box-sizing:border-box; font-family:var(--font-mono); font-size:11px; line-height:1.5; padding:8px; border-radius:var(--border-radius-md); border:0.5px solid var(--color-border-secondary); background:var(--color-background-tertiary); color:var(--color-text-primary); resize:vertical;"></textarea>
-        <div id="policyerr" style="display:none; margin-top:6px; font-family:var(--font-mono); font-size:11px; color:var(--color-text-danger); white-space:pre-wrap;"></div>
+        <!-- A policy parse error names a file path and a rule id, neither of which
+             has a space in it, so pre-wrap alone paints it out of the panel. -->
+        <div id="policyerr" class="brk" style="display:none; margin-top:6px; font-family:var(--font-mono); font-size:11px; color:var(--color-text-danger); white-space:pre-wrap;"></div>
         <div id="policyok" style="display:none; margin-top:6px; font-size:11px; color:var(--color-text-success);"><svg class="icn" style="font-size:13px; vertical-align:-2px;" aria-hidden="true"><use href="#i-check"/></svg> Applied — active now</div>
         <div style="display:flex; gap:6px; margin-top:8px;">
           <button id="applybtn" style="flex:1; font-size:12px;"><svg class="icn" style="font-size:14px; vertical-align:-2px; margin-right:5px;" aria-hidden="true"><use href="#i-check"/></svg>Apply</button>
@@ -345,17 +365,27 @@
     var card=document.createElement('div');
     card.style.cssText='background:var(--color-background-primary); border:0.5px solid var(--color-border-tertiary); border-radius:var(--border-radius-lg); padding:14px 16px;';
     card.innerHTML=
-      '<div style="display:flex; align-items:center; gap:10px;">'
+      '<div class="row">'
       +'<svg class="icn" style="font-size:20px; color:var(--color-text-secondary);" aria-hidden="true"><use href="#i-'+(isArch?'file-zip':'file-text')+'"/></svg>'
-      +'<span style="font-family:var(--font-mono); font-size:13px; color:var(--color-text-primary); overflow:hidden; text-overflow:ellipsis; white-space:nowrap;">'+esc(file.name)+'</span>'
-      +'<span class="st" style="margin-left:auto; font-size:12px; color:var(--color-text-secondary); white-space:nowrap;">Uploading…</span>'
+      // A floor of 10ch rather than min-width:0. A name shrunk to nothing identifies
+      // nothing, and the floor is also what makes the status group WRAP to its own
+      // line on a narrow card instead of the two of them squeezing each other out.
+      +'<span class="ell" style="flex:1 1 auto; min-width:10ch; font-family:var(--font-mono); font-size:13px; color:var(--color-text-primary);">'+esc(file.name)+'</span>'
       // Withdraw sits next to the status because that is where the eye already is
       // when an upload looks stuck. Hidden until the object exists server-side:
       // there is nothing to withdraw during the browser-to-MinIO PUT.
+      //
+      // They travel as one group so the button can never be separated from the state
+      // it acts on, and so that a long status ellipsizes rather than shouldering the
+      // button off the card -- which is exactly what it used to do, leaving half a
+      // Withdraw button behind the policy panel at the moment someone needed it.
+      +'<span style="margin-left:auto; display:flex; align-items:center; gap:8px; min-width:min(180px,100%); flex:0 1 auto;">'
+      +'<span class="st ell" style="font-size:12px; color:var(--color-text-secondary);">Uploading…</span>'
       +'<button class="cx" type="button" title="Withdraw this package from the queue" '
-      +'style="display:none; margin-left:8px; padding:2px 9px; font-size:12px; cursor:pointer; '
+      +'style="display:none; flex:none; padding:2px 9px; font-size:12px; cursor:pointer; '
       +'background:transparent; color:var(--color-text-tertiary); '
-      +'border:0.5px solid var(--color-border-tertiary); border-radius:var(--border-radius-md);">Withdraw</button></div>'
+      +'border:0.5px solid var(--color-border-tertiary); border-radius:var(--border-radius-md);">Withdraw</button>'
+      +'</span></div>'
       +'<div style="margin-top:10px; height:6px; background:var(--color-background-tertiary); border-radius:999px; overflow:hidden;"><div class="bar" style="height:100%; width:0%; background:var(--accent); border-radius:999px; transition:width .25s;"></div></div>'
       +'<div class="meta" style="display:flex; justify-content:space-between; margin-top:7px; font-size:12px; color:var(--color-text-tertiary);"><span class="pct">0%</span><span class="el">0s</span></div>'
       // The file being scrubbed right now. The server has always reported it; the
@@ -363,12 +393,23 @@
       // you WHICH file a long run is sitting on was invisible unless you happened
       // to hover. Truncated from the left, because the distinguishing part of a
       // path inside a bundle is the end of it.
-      +'<div class="cur" style="margin-top:5px; font-size:11px; font-family:var(--font-mono); color:var(--color-text-tertiary); white-space:nowrap; overflow:hidden; text-overflow:ellipsis;"></div>'
+      +'<div class="cur ell" style="margin-top:5px; font-size:11px; font-family:var(--font-mono); color:var(--color-text-tertiary);"></div>'
+      // The stall hint gets its own line rather than a tail on the status.
+      // Appended to the status it was the first thing the ellipsis ate on a narrow
+      // card -- and "no new file in 12m" is the one reading that separates slow from
+      // stuck, which is the whole reason someone is looking at this card.
+      +'<div class="warn brk" style="display:none; margin-top:4px; font-size:11px; color:var(--color-text-warning);"></div>'
+      // Failures explain themselves at length now -- a timeout names the phase, the
+      // file count, the last file finished, what happened to the input and what to
+      // change. That does not fit on the status line, and forcing it there is what
+      // would push the row off the card again. It gets a block that wraps.
+      +'<div class="err brk" style="display:none; margin-top:7px; font-size:12px; line-height:1.5; color:var(--color-text-danger); background:var(--color-background-danger); border:0.5px solid var(--color-border-danger); border-radius:var(--border-radius-md); padding:8px 10px;"></div>'
       +'<div class="done"></div>';
     list.appendChild(card);
     var bar=card.querySelector('.bar'), st=card.querySelector('.st'), pct=card.querySelector('.pct'),
         elp=card.querySelector('.el'), meta=card.querySelector('.meta'), done=card.querySelector('.done'),
-        cur=card.querySelector('.cur'), cx=card.querySelector('.cx');
+        cur=card.querySelector('.cur'), cx=card.querySelector('.cx'),
+        errEl=card.querySelector('.err'), warnEl=card.querySelector('.warn');
     var cancelled=false;
     // Tracks whether files_done is actually advancing. The server reports the
     // current count, never whether it moved, so only the client can tell "slow"
@@ -381,7 +422,24 @@
     var STALL_HINT=90;
     var tick=setInterval(function(){ elp.textContent=fmtDur((Date.now()-start)/1000); },500);
     function setp(p){ p=Math.round(p); bar.style.width=p+'%'; pct.textContent=p+'%'; }
-    function fail(m){ clearInterval(tick); if(cur) cur.textContent=''; if(cx) cx.style.display='none'; st.innerHTML='<span style="color:var(--color-text-danger)">'+esc(m)+'</span>'; bar.style.background='var(--color-text-danger)'; }
+    // A short label on the status line, the reason in a block below it.
+    //
+    // The status shares a nowrap flex row with the Withdraw button, so a long message
+    // there does not wrap -- it pushes the row off the card. That was survivable while
+    // every failure was "upload failed (500)". It is not now: a timeout says which
+    // phase it stopped in, how many files of how many were done, the last file it
+    // finished, what happened to the input and what to change, and every word of that
+    // is worth reading.
+    function fail(m){
+      clearInterval(tick);
+      if(cur) cur.textContent='';
+      if(warnEl) warnEl.style.display='none';
+      if(cx) cx.style.display='none';
+      st.innerHTML='<span style="color:var(--color-text-danger)">Failed</span>';
+      st.title=m;
+      if(errEl){ errEl.textContent=m; errEl.style.display='block'; }
+      bar.style.background='var(--color-text-danger)';
+    }
 
     fetch('/api/uploads',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({name:file.name})})
       .then(function(r){ if(!r.ok) throw 0; return r.json(); })
@@ -444,6 +502,7 @@
         netErrs=0;
         if(cancelled) return;
         if(s.status==='cancelled'){ clearInterval(tick); cx.style.display='none';
+          if(cur) cur.textContent=''; if(warnEl) warnEl.style.display='none';
           bar.style.background='var(--color-text-tertiary)'; st.textContent='Withdrawn'; return; }
         if(s.status==='scrubbed'){ setp(100); finish(s,key); return; }
         if(s.status==='error'){ fail(s.error||'processing error'); return; }
@@ -522,15 +581,16 @@
           var stallSecs=(typeof s.progress_seconds==='number')
             ? s.progress_seconds
             : (Date.now()-lastDoneAt)/1000;
+          st.textContent=label;
+          st.title=label+(s.current_file?'\nCurrent file: '+s.current_file:'');
           if(stallSecs>STALL_HINT){
-            st.innerHTML=esc(label)+' <span style="color:var(--color-text-warning);">— no new file in '
-              +esc(fmtDur(stallSecs))+'</span>';
-            st.title=(s.current_file?'Still on: '+s.current_file+'\n':'')
-              +'The scrub itself has no timeout: a single very large file can hold '
-              +'the queue for a long time. Withdraw it if it must not.';
+            warnEl.textContent='No new file in '+fmtDur(stallSecs);
+            warnEl.style.display='block';
+            warnEl.title='A single very large file can hold the queue for a while. The scrub is '
+              +'bounded by SCRUB_TIMEOUT, after which the object fails and says exactly '
+              +'where it stopped -- withdraw it if you do not want to wait for that.';
           } else {
-            st.textContent=label;
-            st.title=s.current_file?'Current file: '+s.current_file:'';
+            warnEl.style.display='none';
           }
           // The whole point of the line: WHICH member is being worked on. It used
           // to live only in a title attribute, so the detail that tells you where a
@@ -562,6 +622,7 @@
     function finish(s,key){
       clearInterval(tick); meta.style.display='none';
       if(cur) cur.textContent='';
+      if(warnEl) warnEl.style.display='none';
       // Nothing left to withdraw: the output is written.
       if(cx) cx.style.display='none';
       var secs=fmtDur((Date.now()-start)/1000);
@@ -592,7 +653,7 @@
       // actionable rather than a vague caveat.
       function fileRows(list,total){
         var rows=(list||[]).map(function(p){
-          return '<div style="font-family:var(--font-mono); font-size:11px; color:var(--color-text-primary); padding:4px 0; border-bottom:0.5px solid var(--color-border-tertiary);">'
+          return '<div class="brk" style="font-family:var(--font-mono); font-size:11px; color:var(--color-text-primary); padding:4px 0; border-bottom:0.5px solid var(--color-border-tertiary);">'
             +esc(p.path)+'<div style="color:var(--color-text-tertiary); margin-top:2px;">'+esc(p.status)+(p.reason?' — '+esc(p.reason):'')+'</div></div>';
         }).join('');
         var more=total-(list||[]).length;
@@ -618,18 +679,18 @@
           : {bg:'var(--color-background-warning)', bd:'var(--color-border-warning)', fg:'var(--color-text-warning)',
              head:'Emitted without being inspected — review before sharing'};
         warn='<div style="margin-top:12px; padding:10px 12px; border-radius:var(--border-radius-md); background:'+tone.bg+'; border:0.5px solid '+tone.bd+';">'
-          +'<div style="font-size:12px; font-weight:500; color:'+tone.fg+'; display:flex; align-items:center; gap:6px;">'
+          +'<div style="font-size:12px; font-weight:500; color:'+tone.fg+'; display:flex; align-items:center; gap:6px; min-width:0;">'
           +'<svg class="icn" style="font-size:14px;" aria-hidden="true"><use href="#i-alert-triangle"/></svg>'+tone.head+'</div>'
           +groups;
         if(risky && (s.residual_samples||[]).length){
-          warn+='<div style="margin-top:10px; font-size:11px; font-family:var(--font-mono); color:'+tone.fg+';">'
+          warn+='<div class="brk" style="margin-top:10px; font-size:11px; font-family:var(--font-mono); color:'+tone.fg+';">'
             +(s.residual_samples||[]).map(esc).join('<br>')+'</div>';
         }
         warn+='</div>';
       }
       done.innerHTML=
         warn
-        +'<div style="display:flex; gap:8px; margin-top:12px;">'
+        +'<div style="display:flex; gap:8px; margin-top:12px; flex-wrap:wrap;">'
         +'<button class="dl"><svg class="icn" style="font-size:15px; vertical-align:-2px; margin-right:5px;" aria-hidden="true"><use href="#i-download"/></svg>Download scrubbed</button>'
         +'<button class="rp"><svg class="icn" style="font-size:15px; vertical-align:-2px; margin-right:5px;" aria-hidden="true"><use href="#i-file-search"/></svg>View report</button></div>'
         +'<div class="panel" style="display:none; margin-top:12px; padding-top:12px; border-top:0.5px solid var(--color-border-tertiary);">'

@@ -75,6 +75,23 @@ type Config struct {
 	// destroy real work. The judgement of what is too long belongs to whoever
 	// knows the bundles, which is not this process.
 	StallWarnAfter time.Duration
+	// ScrubTimeout is the total budget for one object, after which the walk is
+	// abandoned and the object fails. Zero disables it, which is the CLI's
+	// behaviour and was the service's until it was found that nothing at all
+	// bounded a scrub: StallWarnAfter only ever wrote a log line, and the transfer
+	// timeouts bound object-storage calls, not the walk between them. An object
+	// could and did occupy the single consumer for hours with every upload behind
+	// it waiting.
+	//
+	// Enforced between archive members, which is the only place the walk can stop
+	// without leaving a container half-rewritten, so a scrub overruns by at most one
+	// member. It is not enforced during the final write: by then the work is done
+	// and discarding it would cost more than the overrun.
+	//
+	// Size it from how long a legitimate bundle takes on THIS pod, not from
+	// patience. Too low and every large bundle fails; the object is not retried, so
+	// that failure is permanent until someone re-uploads.
+	ScrubTimeout time.Duration
 	// Audit is how much per-match detail the stored report retains. See
 	// ParseAuditLevel: this is a memory setting as much as a disclosure one.
 	Audit         report.AuditLevel
@@ -813,6 +830,18 @@ func (w *Worker) processObject(ctx context.Context, o store.Object) {
 	// SIGTERM indistinguishable from a cancel and silently discard finished scrubs
 	// on every rollout.
 	var aborted atomic.Bool
+	// timedOut latches when the object's own deadline expires. It stops the walk
+	// through the same predicate as a cancel, and is kept separate because the two
+	// mean opposite things to whoever is waiting: one is a withdrawal that was asked
+	// for, the other is a failure that has to be reported as one.
+	var timedOut atomic.Bool
+	// expiredAt is where the object had got to at the instant the deadline passed.
+	// Captured on the timer's goroutine from the lock-protected job log, never from
+	// the walk's own locals -- the walk owns those and is still running. It is also
+	// not the same as the position at the moment the failure is recorded: the walk
+	// continues to the next member boundary, and what an operator needs is where the
+	// budget actually ran out.
+	var expiredAt atomic.Pointer[position]
 	ctx, abort := context.WithCancel(ctx)
 	defer abort()
 	if !w.beginInflight(o.Key, abort, &aborted) {
@@ -829,6 +858,41 @@ func (w *Worker) processObject(ctx context.Context, o store.Object) {
 	job.ProgressSince = job.PhaseSince
 	w.jobs.Upsert(job)
 	w.log.Info("processing object", "key", o.Key, "size", o.Size)
+
+	// Live position, kept current by the report callbacks below and read by every
+	// terminal path so a failure says where it happened rather than only what failed.
+	// Everything here is touched on this goroutine alone: the callbacks run
+	// synchronously inside the walk. The timer goroutine reads the job log instead.
+	var (
+		filesDone    int
+		membersTotal int
+		currentFile  string // already redacted; see displayPath
+	)
+	at := func() position {
+		p := position{phase: job.Phase, filesDone: filesDone,
+			filesTotal: membersTotal, currentFile: currentFile}
+		if !job.ProgressSince.IsZero() {
+			p.noProgress = time.Since(job.ProgressSince)
+		}
+		return p
+	}
+
+	// The object's deadline. Nothing else bounds the walk, so without this a single
+	// bundle holds the one consumer for as long as it takes -- measured at over
+	// three hours on a CPU-throttled pod, with every upload behind it queued.
+	if w.cfg.ScrubTimeout > 0 {
+		deadline := time.AfterFunc(w.cfg.ScrubTimeout, func() {
+			// Snapshot BEFORE the flag, so anyone who sees the flag sees the
+			// position that goes with it.
+			if j, ok := w.jobs.Get(o.Key); ok {
+				expiredAt.Store(&position{phase: j.Phase, filesDone: j.FilesDone,
+					filesTotal: j.FilesTotal, currentFile: j.CurrentFile,
+					noProgress: time.Duration(j.ProgressSeconds() * float64(time.Second))})
+			}
+			timedOut.Store(true)
+		})
+		defer deadline.Stop()
+	}
 
 	// cancelledExit records the withdrawal and disposes of the input. Called from
 	// every point the walk can unwind after a cancel.
@@ -894,7 +958,7 @@ func (w *Worker) processObject(ctx context.Context, o store.Object) {
 			// likely to succeed on the next attempt.
 			job.Status = "retrying"
 			job.RetryInSeconds = int(d.Round(time.Second).Seconds())
-			job.Error = err.Error()
+			job.Error = failureDetail(err, at(), time.Since(start))
 			record(job)
 			w.log.Error("object storage transfer stalled and was abandoned; the object "+
 				"stays in the input bucket and is retried after a backoff",
@@ -902,10 +966,55 @@ func (w *Worker) processObject(ctx context.Context, o store.Object) {
 			return
 		}
 		w.metrics.Objects.WithLabelValues("error").Inc()
+		p := at()
 		job.Status = "error"
-		job.Error = err.Error()
+		job.Phase = ""
+		job.FilesDone, job.FilesTotal, job.CurrentFile = filesDone, membersTotal, currentFile
+		job.Error = failureDetail(err, p, time.Since(start))
 		record(job)
-		w.log.Error("process object", "key", o.Key, "err", err)
+		w.log.Error("process object", "key", o.Key, "err", err,
+			"phase", p.phase, "files_done", p.filesDone, "files_total", p.filesTotal,
+			"current_file", p.currentFile, "elapsed", roundDur(time.Since(start)))
+	}
+
+	// timedOutExit fails an object that outran its budget.
+	//
+	// Terminal, and the input is disposed of exactly as an oversized one is. Leaving
+	// it in the bucket would be worse than useless: the next poll picks the same
+	// object up, spends the same budget on it, and fails it again forever, with the
+	// whole queue behind it -- and a bundle that needs longer than the budget will
+	// need longer on every attempt. Re-uploading is the retry, and it is a decision
+	// for whoever can also change the budget.
+	timedOutExit := func(p position) {
+		w.metrics.Errors.Inc()
+		w.metrics.Objects.WithLabelValues("timeout").Inc()
+		disposition := "The input was left in the bucket."
+		if err := w.finish(ctx, o.Key); err != nil {
+			// Could not move it aside, so it WILL come back. Say so rather than
+			// promising a disposal that did not happen.
+			w.log.Warn("could not move a timed-out input aside; it stays in the input "+
+				"bucket and will be picked up again", "key", o.Key, "err", err)
+			disposition = "The input could NOT be moved aside (" + err.Error() +
+				"), so it stays in the input bucket and will be attempted again."
+		} else {
+			w.clearDeferral(o.Key)
+			switch w.cfg.Action {
+			case ActionDelete:
+				disposition = "The input was deleted, as this deployment is configured to do."
+			default:
+				disposition = "The input was moved to " + w.cfg.ProcessedPrefix + o.Key +
+					" and will NOT be retried automatically; re-upload it to try again."
+			}
+		}
+		job.Status = "error"
+		job.Phase = ""
+		job.FilesDone, job.FilesTotal, job.CurrentFile = filesDone, membersTotal, currentFile
+		job.Error = timeoutDetail(w.cfg.ScrubTimeout, time.Since(start), p, disposition)
+		record(job)
+		w.log.Error("object exceeded its scrub budget and was abandoned",
+			"key", o.Key, "budget", w.cfg.ScrubTimeout, "elapsed", roundDur(time.Since(start)),
+			"phase_at_deadline", p.phase, "files_done", p.filesDone, "files_total", p.filesTotal,
+			"current_file", p.currentFile, "no_progress", roundDur(p.noProgress))
 	}
 
 	// Stage the upload on scratch storage rather than the heap. For an
@@ -988,8 +1097,6 @@ func (w *Worker) processObject(ctx context.Context, o store.Object) {
 	job.PhaseSince = time.Now()
 	job.ProgressSince = job.PhaseSince
 	w.jobs.Upsert(job)
-	filesDone := 0
-	membersTotal := 0
 	// How many members the walk has found so far, so the card can say "file 7 of 10"
 	// rather than a count with no denominator. It rises when a nested archive opens,
 	// which is honest: what is inside a member is not known until the walk reaches it.
@@ -1022,9 +1129,10 @@ func (w *Worker) processObject(ctx context.Context, o store.Object) {
 			w.log.Info("file not scrubbed", "key", o.Key, "path", f.Path,
 				"status", f.Status, "detail", f.Detail)
 		}
+		currentFile = displayPath(res.Matcher, f.Path)
 		j := job
 		j.FilesDone = filesDone
-		j.CurrentFile = displayPath(res.Matcher, f.Path)
+		j.CurrentFile = currentFile
 		// Finishing a file IS progress, and stamping it here is what stops the stall
 		// warning firing on a healthy multi-file scrub.
 		j.ProgressSince = time.Now()
@@ -1037,7 +1145,11 @@ func (w *Worker) processObject(ctx context.Context, o store.Object) {
 		// The only thing that can stop the walk. It polls this between members; an
 		// aborted walk returns every container unchanged rather than a partial
 		// rebuild, so `changed` collapses to false and there is nothing to deliver.
-		Abort: aborted.Load,
+		//
+		// Two reasons resolve to one predicate because the walk's behaviour is
+		// identical either way -- stop, rebuild nothing, hand back the input. Which
+		// of them fired is read below, where it decides what the object BECAME.
+		Abort: func() bool { return aborted.Load() || timedOut.Load() },
 	}
 	// Release every blob the walk staged. This runs before the panic recovery
 	// above (defers unwind last-registered-first), so a bug anywhere in the
@@ -1045,10 +1157,23 @@ func (w *Worker) processObject(ctx context.Context, o store.Object) {
 	defer eng.Release()
 	out, changed := eng.ProcessBlob(o.Key, input, 0)
 	if eng.Aborted() {
-		// Withdrawn mid-walk. Everything staged is released by the defers above; no
+		// Stopped mid-walk. Everything staged is released by the defers above; no
 		// output, report or digest is written, and the verdict below is deliberately
-		// never computed — a cancelled object has no coverage answer to give.
-		cancelledExit()
+		// never computed — an object that did not finish has no coverage answer to
+		// give.
+		//
+		// A withdrawal wins over an expiry that lands in the same moment: someone
+		// asked for this one, and cancelling also disposes of the input the way that
+		// person expects.
+		if aborted.Load() {
+			cancelledExit()
+			return
+		}
+		p := at()
+		if snap := expiredAt.Load(); snap != nil {
+			p = *snap
+		}
+		timedOutExit(p)
 		return
 	}
 	if changed {

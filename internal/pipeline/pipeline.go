@@ -161,6 +161,42 @@ type Engine struct {
 	// "not aborted" at one level and "aborted" at the next, which is precisely how
 	// a container ends up half-rewritten.
 	aborted bool
+
+	// asMember records that the payload about to be walked was itself already
+	// counted as a member of the archive that contains it. See noteMembers.
+	asMember bool
+}
+
+// noteMembers tells the report how many entries an opened container adds to the
+// count a progress display divides by, which is NOT the same as how many entries
+// the container has.
+//
+// Two corrections, and without them the denominator is permanently larger than the
+// numerator, so a bar drawn as files_done/files_total can never reach the end. Every
+// entry counted here must eventually produce exactly one report entry, because that
+// is what the numerator counts.
+//
+//	n is the members that will actually be WALKED. A directory entry or a tar
+//	symlink is a member of the archive and is never scrubbed, so it files no
+//	report entry and must not be in the total.
+//
+//	Minus one when this container is itself a member. A nested .zip is counted
+//	once by its parent, then opened here and replaced by its own members — it
+//	files no entry of its own, only its children do. Leaving both in place is
+//	what pinned a bundle of five nested zips at 92% forever: 50 leaves against a
+//	total of 55, which never closes however long the scrub runs.
+//
+// The delta may be zero (a nested container holding one file) or negative (an empty
+// one); both are correct and NoteMembers applies them.
+func (e *Engine) noteMembers(n int) {
+	if e.asMember {
+		// Consumed here: a .tar.gz member reaches handleTar through
+		// handleCompressed, which passes the flag along untouched, and only the
+		// container that actually opens is the one that replaces the member.
+		e.asMember = false
+		n--
+	}
+	e.Report.NoteMembers(n)
 }
 
 // Aborted reports whether the walk has been told to stop, latching the first true
@@ -376,6 +412,9 @@ func (e *Engine) ProcessBlob(path string, in *spill.Blob, depth int) (*spill.Blo
 			e.residualLeft = DefaultResidualBudget
 		}
 		e.residualHits, e.residualLabels = 0, nil
+		// The top-level object is nobody's member: it was never counted, so its own
+		// members are added in full.
+		e.asMember = false
 	}
 	// Nothing below this point runs once the walk is aborted, and every level
 	// returns its input unchanged. Deliberately no e.skip() call: skip records a
@@ -646,8 +685,16 @@ func (e *Engine) handleTar(path string, in *spill.Blob, depth int) (*spill.Blob,
 	}
 	defer archive.CloseTar(members)
 	// Announced before the member loop, so a watcher has a denominator from the very
-	// first file rather than only once the archive has finished.
-	e.Report.NoteMembers(len(members))
+	// first file rather than only once the archive has finished. Only the regular
+	// entries: a directory or a symlink files no report entry, so counting it here
+	// would put the denominator permanently out of reach of the numerator.
+	walked := 0
+	for i := range members {
+		if members[i].IsRegular() {
+			walked++
+		}
+	}
+	e.noteMembers(walked)
 
 	for i := range members {
 		e.stage(members[i].Body)
@@ -667,7 +714,13 @@ func (e *Engine) handleTar(path string, in *spill.Blob, depth int) (*spill.Blob,
 		}
 		// Size read before the descent: a changed member is replaced by its scrubbed
 		// blob, and the lend must be measured against what was charged going in.
+		// The member is already in the total noteMembers announced. Say so, so that a
+		// member which turns out to be a container replaces itself in the count
+		// instead of adding its children on top of it. Cleared straight after: a
+		// member that is an ordinary file consumes nothing.
+		e.asMember = true
 		out, memberChanged := e.descend(memberPath, members[i].Body, depth+1, members[i].Body.Size())
+		e.asMember = false
 		if memberChanged {
 			// Release the original now rather than at the deferred sweep: with many
 			// large members the difference is the whole archive's worth of scratch.
@@ -706,7 +759,13 @@ func (e *Engine) handleZip(path string, in *spill.Blob, depth int) (*spill.Blob,
 	}
 	defer archive.CloseZip(members)
 	// See handleTar.
-	e.Report.NoteMembers(len(members))
+	walked := 0
+	for i := range members {
+		if !members[i].IsDir() {
+			walked++
+		}
+	}
+	e.noteMembers(walked)
 
 	for i := range members {
 		e.stage(members[i].Body)
@@ -726,7 +785,13 @@ func (e *Engine) handleZip(path string, in *spill.Blob, depth int) (*spill.Blob,
 		}
 		// See handleTar: charged in the loop above, lent back for whatever the descent
 		// charges against this member's own contents.
+		// The member is already in the total noteMembers announced. Say so, so that a
+		// member which turns out to be a container replaces itself in the count
+		// instead of adding its children on top of it. Cleared straight after: a
+		// member that is an ordinary file consumes nothing.
+		e.asMember = true
 		out, memberChanged := e.descend(memberPath, members[i].Body, depth+1, members[i].Body.Size())
+		e.asMember = false
 		if memberChanged {
 			members[i].Body.Close()
 			members[i].Body = out

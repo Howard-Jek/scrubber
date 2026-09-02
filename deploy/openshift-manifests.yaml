@@ -97,6 +97,24 @@ data:
   # kill: a large bundle legitimately spends minutes in one phase. Pair it with an
   # alert on scrubber_inflight_phase_seconds, which is the same signal as a metric.
   STALL_WARN_AFTER: "5m"
+  # The ONLY bound on the scrub itself. Past this, the object is abandoned and
+  # FAILS -- no output, no report, and the input is moved aside rather than
+  # retried, because a bundle that needs longer than the budget needs longer on
+  # every attempt and would otherwise fail forever with the queue behind it.
+  #
+  # Distinct from STALL_WARN_AFTER above, which only ever writes a log line, and
+  # from the transfer timeouts below, which bound object-storage calls and not the
+  # work between them. With no timeout at all, one deeply nested bundle held the
+  # single consumer for over three hours.
+  #
+  # Size it from measurement, not patience. The matcher runs at roughly 8 MB/s of
+  # expanded content on one unthrottled core and about 3.5 MB/s on a throttled
+  # one, so the 4 GiB MAX_EXPAND_BYTES ceiling is a worst case near twenty minutes
+  # of real work; an hour leaves room for a slow node. Raise it together with
+  # MAX_EXPAND_BYTES, and the startup log warns when the two disagree.
+  #
+  # "0" removes the bound entirely, which is what shipped before this existed.
+  SCRUB_TIMEOUT: "1h"
   # Abandon an object-storage transfer that has moved NO bytes for this long, and
   # bound the metadata calls (10x this for listings, which paginate). This is not
   # a deadline on the transfer: a large object over a congested link legitimately
@@ -340,11 +358,11 @@ spec:
         - name: artifactory-pull   # only if pulling from a private Artifactory repo
       containers:
         - name: scrubberd
-          # Build this with --build-arg VERSION=0.8.1 so the tag and the version the
+          # Build this with --build-arg VERSION=0.8.2 so the tag and the version the
           # process reports are the same string. It is surfaced at /api/version, in
           # the scrubber_build_info metric, in the first startup log line and in the
           # UI header -- an unstamped build reports "dev" rather than guessing.
-          image: <ARTIFACTORY_DOCKER_HOST>/docker-local/scrubberd:0.8.1
+          image: <ARTIFACTORY_DOCKER_HOST>/docker-local/scrubberd:0.8.2
           ports:
             - containerPort: 8080
           envFrom:
