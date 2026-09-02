@@ -218,7 +218,13 @@ type Job struct {
 	// FilesDone and CurrentFile give live progress while Status is "processing",
 	// so the UI can report what is actually happening instead of animating a bar
 	// on a timer.
-	FilesDone   int    `json:"files_done"`
+	FilesDone int `json:"files_done"`
+	// FilesTotal is how many archive members have been DISCOVERED so far, or 0 when
+	// the object is not an archive or nothing has been opened yet.
+	//
+	// It can rise mid-run when a nested archive is opened, so a client must treat it
+	// as a running denominator rather than a fixed one.
+	FilesTotal  int    `json:"files_total,omitempty"`
 	CurrentFile string `json:"current_file,omitempty"`
 	// Phase is a coarse label for the current stage: "reading", "unpacking",
 	// "scrubbing", "writing". Empty once the job is finished.
@@ -234,6 +240,16 @@ type Job struct {
 	// should take is the signal, and it is the only one available while
 	// FilesDone is pinned at 0.
 	PhaseSince time.Time `json:"-"`
+	// ProgressSince is when this object last did anything OBSERVABLE -- changed
+	// phase, or finished another file.
+	//
+	// PhaseSince alone cannot answer "is it stuck?", and reading it as though it
+	// could produced a false alarm on every healthy long run: the phase is set once
+	// when scrubbing starts and never again, so a 19-minute scrub advancing steadily
+	// through 60 files logged "may be stalled" three times while files_done climbed
+	// 25 -> 40 -> 55. A warning that fires on correct behaviour is worse than no
+	// warning, because it trains the reader to ignore the real one.
+	ProgressSince time.Time `json:"-"`
 	// RetryInSeconds is how long the object is held back before its next attempt,
 	// set alongside Status "retrying". It is what lets the page say "retrying in
 	// 8s" instead of either giving up or claiming progress it cannot see.
@@ -252,6 +268,25 @@ func (j Job) PhaseSeconds() float64 {
 		return 0
 	}
 	return time.Since(j.PhaseSince).Seconds()
+}
+
+// ProgressSeconds reports how long it has been since this object last showed any
+// observable movement. It is the number to judge "stalled" on; PhaseSeconds is the
+// number to judge "how long has this stage taken".
+//
+// They differ precisely when an object is working steadily inside one long phase,
+// which is the normal case for a large bundle and exactly where the two get
+// confused.
+func (j Job) ProgressSeconds() float64 {
+	if j.Phase == "" {
+		return 0
+	}
+	if j.ProgressSince.IsZero() {
+		// A record from a process that predates the stamp: fall back rather than
+		// report a false zero, which would read as "just moved".
+		return j.PhaseSeconds()
+	}
+	return time.Since(j.ProgressSince).Seconds()
 }
 
 // ObjectStatuses is every value scrubber_objects_total{status} can take.

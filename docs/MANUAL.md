@@ -706,8 +706,8 @@ Supplied as environment variables, in practice via a ConfigMap plus a Secret.
 
 ```sh
 # 1. build + push the image (air-gap: override BASE_*_IMAGE / GOPROXY to Artifactory mirrors)
-podman build -f deploy/Containerfile -t <artifactory>/docker-local/scrubberd:0.8.0 .
-podman push <artifactory>/docker-local/scrubberd:0.8.0
+podman build -f deploy/Containerfile -t <artifactory>/docker-local/scrubberd:0.8.1 .
+podman push <artifactory>/docker-local/scrubberd:0.8.1
 #    (air-gapped: transfer dist/scrubberd-0.8.0.tar and `podman load -i` on the target)
 
 # 2. prereqs: MinIO creds Secret + named-policy ConfigMap

@@ -666,6 +666,7 @@ func jobStatusPayload(j metrics.Job) map[string]any {
 		"residual_hits":     j.ResidualHits,
 		"residual_samples":  j.ResidualSamples,
 		"files_done":        j.FilesDone,
+		"files_total":       j.FilesTotal,
 		"current_file":      j.CurrentFile,
 		"phase":             j.Phase,
 		// How long this phase has lasted. During "unpacking" it is the only
@@ -673,6 +674,11 @@ func jobStatusPayload(j metrics.Job) map[string]any {
 		// container is fully expanded — so the client shows this instead of
 		// animating a bar it has no basis for.
 		"phase_seconds": j.PhaseSeconds(),
+		// Seconds since anything observable last happened -- a finished file or a
+		// phase change. This is the one to judge "stalled" on. phase_seconds cannot:
+		// it keeps climbing through a perfectly healthy multi-file scrub, because the
+		// phase does not change while the files inside it are being worked through.
+		"progress_seconds": j.ProgressSeconds(),
 		// Set only with status "retrying": how long until the next attempt. The
 		// client shows it and keeps polling rather than reporting a failure.
 		"retry_in_seconds": j.RetryInSeconds,

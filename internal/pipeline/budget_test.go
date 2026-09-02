@@ -278,3 +278,56 @@ func TestLeafCapSparesTheRestOfTheArchive(t *testing.T) {
 		t.Errorf("no leaf-cap hole recorded; got %+v", rep.Summary.Passthroughs)
 	}
 }
+
+// TestFileCountMatchesMemberCount: a 10-member archive must report ten files, not
+// twelve.
+//
+// A scrubbed FILENAME files its own report entry, which is right for the audit record
+// and wrong for a count someone is watching. With two renamed members the same run
+// said "file 10 of 10" while working and "12 files" in its history — two numbers for
+// one archive, which is how a reader stops believing either.
+func TestFileCountMatchesMemberCount(t *testing.T) {
+	body := repetitiveLog(20)
+	var buf bytes.Buffer
+	tw := tar.NewWriter(&buf)
+	names := []string{
+		"logs/file1.log",
+		"logs/AcmeCorp-prod/file2.log", // name matches the policy: gets renamed
+		"logs/file3.log",
+	}
+	for _, n := range names {
+		if err := tw.WriteHeader(&tar.Header{
+			Name: n, Mode: 0o644, Size: int64(len(body)), Typeflag: tar.TypeReg,
+		}); err != nil {
+			t.Fatalf("header: %v", err)
+		}
+		mustWrite(t, tw, body)
+	}
+	if err := tw.Close(); err != nil {
+		t.Fatalf("close: %v", err)
+	}
+
+	rep := report.New("in", "out", report.AuditFull, false, "test")
+	eng := &Engine{
+		Matcher: testMatcher(t), Report: rep, Limits: DefaultLimits(),
+		ScrubNames: true,
+	}
+	eng.Process("bundle", buf.Bytes(), 0)
+
+	if got := rep.Summary.FilesTotal; got != len(names) {
+		t.Errorf("FilesTotal = %d for a %d-member archive; filename-scrub entries are "+
+			"being counted as files", got, len(names))
+	}
+	// The rename itself must still be recorded and its matches still counted — the
+	// fix is to the tally, not to the audit trail.
+	var sawRename bool
+	for _, f := range rep.Files {
+		if f.Detail == report.DetailFilenameScrubbed {
+			sawRename = true
+		}
+	}
+	if !sawRename {
+		t.Error("the filename-scrub entry vanished from the report; it must still be " +
+			"there, just not counted as a file")
+	}
+}

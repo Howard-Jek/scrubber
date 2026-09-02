@@ -197,6 +197,27 @@
 
   function esc(s){return String(s).replace(/[&<>]/g,function(c){return{'&':'&amp;','<':'&lt;','>':'&gt;'}[c];});}
 
+  // Turn the engine's internal path into something a person reads.
+  //
+  // The engine addresses a member as "<object key>!<path inside>", one "!" per level
+  // of nesting, so a member of a tar inside a tar.gz arrives as
+  // "abc123-bundle.tar.gz!inner.tar!logs/app.log". The leading object key is noise --
+  // the card is already titled with the file the user dropped -- and the "!" reads as
+  // punctuation rather than structure. Dropping the first segment and showing the rest
+  // as "inner.tar › logs/app.log" says the same thing in the shape people expect.
+  //
+  // The path arrives ALREADY REDACTED from the server: a member path can carry the
+  // same data as a member body (which is why SCRUB_FILENAMES exists), and this value
+  // goes over an unauthenticated endpoint, so the worker runs the policy over it
+  // before it leaves. Nothing here should try to redact -- it would be too late and
+  // in the wrong place.
+  function prettyPath(p){
+    if(!p) return '';
+    var parts=String(p).split('!');
+    if(parts.length>1) parts=parts.slice(1);   // drop the object key
+    return parts.join(' › ');
+  }
+
   // Which build is serving this page. Fetched rather than templated in so the chip
   // reflects the process actually answering requests -- during a rollout that is the
   // question being asked, and a value baked into the HTML would answer for whichever
@@ -342,7 +363,7 @@
       // you WHICH file a long run is sitting on was invisible unless you happened
       // to hover. Truncated from the left, because the distinguishing part of a
       // path inside a bundle is the end of it.
-      +'<div class="cur" style="margin-top:5px; font-size:11px; font-family:var(--font-mono); color:var(--color-text-tertiary); white-space:nowrap; overflow:hidden; text-overflow:ellipsis; direction:rtl; text-align:left;"></div>'
+      +'<div class="cur" style="margin-top:5px; font-size:11px; font-family:var(--font-mono); color:var(--color-text-tertiary); white-space:nowrap; overflow:hidden; text-overflow:ellipsis;"></div>'
       +'<div class="done"></div>';
     list.appendChild(card);
     var bar=card.querySelector('.bar'), st=card.querySelector('.st'), pct=card.querySelector('.pct'),
@@ -469,9 +490,23 @@
           // files, so a 5000-file bundle sat at "92%" for hours and read as wedged.
           // The bar is now capped well short of full and the REAL signals -- how
           // many files, how long, which file right now -- carry the information.
-          creep=Math.max(creep,Math.min(88,60+Math.log(1+s.files_done)*8));
+          // With a member count the bar can be REAL: the upload occupied 0-55%, so
+          // the scrub occupies the rest in proportion to files actually done. Without
+          // one (a bare .log, or an archive not yet opened) fall back to the log curve,
+          // which at least never claims to be finished.
+          var total=s.files_total||0;
+          if(total>0){
+            creep=Math.max(creep,60+Math.min(1,s.files_done/total)*35);
+          } else {
+            creep=Math.max(creep,Math.min(88,60+Math.log(1+s.files_done)*8));
+          }
           var secs=Math.round(s.phase_seconds||0);
-          var label=(s.phase==='writing'?'Writing… ':'Scrubbing… ')+s.files_done+' file'+(s.files_done===1?'':'s');
+          // "file 7 of 10" is the phrasing the count was added for. The denominator can
+          // grow when a nested archive opens; that is honest, and better than a fixed
+          // total that would be wrong.
+          var label=(s.phase==='writing'?'Writing… ':'Scrubbing… ')
+            +(total>0 ? ('file '+s.files_done+' of '+total)
+                      : (s.files_done+' file'+(s.files_done===1?'':'s')));
           // Elapsed used to vanish the moment the first file landed, so the one
           // reading that distinguishes "slow" from "stuck" was hidden exactly when
           // it started to matter.
@@ -481,7 +516,12 @@
           // not whether it changed. Naming the file it is sitting on turns "it is
           // stuck" into something you can act on.
           if(s.files_done!==lastDone){ lastDone=s.files_done; lastDoneAt=Date.now(); }
-          var stallSecs=(Date.now()-lastDoneAt)/1000;
+          // progress_seconds is the server's own answer to "when did anything last
+          // happen", and it survives a page reload where the client-side timer does
+          // not. Prefer it, fall back to local tracking for an older service.
+          var stallSecs=(typeof s.progress_seconds==='number')
+            ? s.progress_seconds
+            : (Date.now()-lastDoneAt)/1000;
           if(stallSecs>STALL_HINT){
             st.innerHTML=esc(label)+' <span style="color:var(--color-text-warning);">— no new file in '
               +esc(fmtDur(stallSecs))+'</span>';
@@ -492,7 +532,10 @@
             st.textContent=label;
             st.title=s.current_file?'Current file: '+s.current_file:'';
           }
-          if(s.current_file) cur.textContent=s.current_file;
+          // The whole point of the line: WHICH member is being worked on. It used
+          // to live only in a title attribute, so the detail that tells you where a
+          // long run is sitting was invisible unless you thought to hover.
+          cur.textContent=s.current_file ? '↳ '+prettyPath(s.current_file) : '';
         } else {
           // Unpacking: a container is expanded in full before its first member is
           // scrubbed, so there is no per-file progress to report yet and the bar
@@ -504,7 +547,9 @@
           var secs=Math.round(s.phase_seconds||0);
           st.textContent=(isArch?'Unpacking':'Reading')+(secs?' — '+fmtDur(secs):'…');
           st.title='No per-file progress is available until the container is fully expanded';
-          cur.textContent='';
+          // Named rather than blank, so the gap before the first member is a state the
+          // reader recognises instead of an absence they have to interpret.
+          cur.textContent=isArch?'↳ expanding the container — no members yet':'';
         }
         setp(creep);
         setTimeout(function(){poll(key,creep);},1200);

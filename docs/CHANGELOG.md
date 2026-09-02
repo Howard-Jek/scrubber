@@ -10,6 +10,55 @@ For what to verify on your own cluster after taking a new image, see
 
 ---
 
+## 0.8.1 — a stall warning that fired on healthy runs, and no way to see what was happening
+
+Found by running a real 4 GB bundle end to end rather than by reading code.
+
+**The false stall.** A 19-minute, 60-file scrub logged *"it may be stalled"* three
+times while `files_done` climbed 25 → 40 → 55. `PhaseSince` is stamped once when
+scrubbing begins and never updated, so the check measured time-in-**phase**, not
+time-since-**progress** — meaning every scrub longer than `STALL_WARN_AFTER` fired it.
+A warning that goes off on correct behaviour is worse than no warning: it trains the
+reader to ignore the real one. `ProgressSince` now stamps on each finished file and
+each phase change, `ProgressSeconds` is what the check reads, and `progress_seconds`
+is exposed on the status API. Re-running the identical bundle with a *stricter* 2m
+threshold produced **zero** warnings.
+
+**No visibility into which member was being worked on.** The server had always
+reported `current_file`; the page put it in a `title` attribute, so the one detail
+that says where a long run is sitting was invisible unless you hovered. It is now a
+line on the card, and the count reads **"file 7 of 10"** against a real member total
+(`Report.NoteMembers`, announced as each container opens) with a bar drawn in
+proportion instead of a log curve that pinned near full at 78 files.
+
+**A count that disagreed with itself.** A scrubbed *filename* files its own report
+entry — correct for the audit record, wrong for a tally someone is watching. A
+10-member archive with two renamed members reported "file 10 of 10" live and "12
+files" in its history. The file tally now skips those entries in both directions
+(record and rollback); their matches still count and the rename is still recorded.
+
+**A disclosure the transparency work would have made worse.** Member paths are
+recorded unscrubbed, which is right for a report in an internal bucket. `/api/status`
+is neither internal nor authenticated, and `SCRUB_FILENAMES` exists precisely because
+a path carries the same class of data as a body — verified: a member named
+`logs/AcmeCorp-prod/alice@acme.test-session.log` is renamed in the emitted bundle and
+was still reported verbatim. Displaying that live would have had the tool broadcast
+exactly what it was asked to remove. The same matcher now rewrites paths on the way
+to the API, so what the UI shows is what the recipient of the bundle would see. This
+also covers `passthrough_paths`, `binary_skip_paths` and `not_inspected_set`.
+
+**Durations** are `h/m/s` throughout; a finished run reported `12043.6s` before.
+
+**A version indicator**, since nothing reported which build was running: stamped from
+the `VERSION` build-arg and surfaced at `GET /api/version`, in `scrubber_build_info`,
+in the first startup log line, and as a chip in the UI header.
+
+Measured on the 4 GB tar (60 members × 66.6 MB, 1 CPU, 4 GiB): upload 125 MB/s, scrub
+**3.5 MB/s** and CPU-bound, memory flat at 322–896 MiB, `/work` peaking at 7.6 GB,
+88,133,040 matches, verdict `complete`.
+
+---
+
 ## Image 0.8.0 — the expansion cap follows the volume, and a bundle costs its content once
 
 0.6.0 sized the memory knobs from the pod and left the one cap operators actually
