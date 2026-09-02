@@ -20,7 +20,7 @@ behind it, sizing and memory, the service, metrics, the web UI, and benchmarking
   - [Web front page](#web-front-page)
 - [Updating the default policy and presets](#updating-the-default-policy-and-presets)
 - [Benchmarking](#benchmarking)
-- [Nothing bounds the scrub itself](#nothing-bounds-the-scrub-itself)
+- [What bounds the scrub](#what-bounds-the-scrub)
 - [Troubleshooting by symptom](#troubleshooting-by-symptom)
 - [Notes and limitations](#notes-and-limitations)
 
@@ -678,7 +678,8 @@ Supplied as environment variables, in practice via a ConfigMap plus a Secret.
 | `MAX_OBJECT_BYTES` | *derived* | Ceiling on the uploaded (compressed) object — the only cap that turns an upload away. Derived as 41.7% of `MAX_EXPAND_BYTES`; 1707Mi as shipped. |
 | `SPILL_THRESHOLD` | *derived* | Payloads above this go to `/work` individually. Scaled from the pod's memory (4Mi at 2Gi, 8Mi as shipped), floored at 512Ki. |
 | `SPILL_RESIDENT_MAX` | *derived* | Aggregate in-memory budget. **This is what bounds RSS**, together with `MAX_LEAF_BYTES` — on its own it does not, because the leaf being scrubbed is read back off disk outside this accounting. Scaled from the pod's memory (64Mi at 2Gi, 128Mi as shipped). |
-| `STALL_WARN_AFTER` | `5m` | How long the in-flight object may sit in one phase before the worker logs that it may be stalled. **A log threshold, never a kill** — see [Nothing bounds the scrub itself](#nothing-bounds-the-scrub-itself). Zero disables. |
+| `SCRUB_TIMEOUT` | `1h` | Total budget for one object. Past it the walk is abandoned **between members** and the object **fails**, with no output, no report, and the input moved aside rather than retried. The only setting that bounds compute — see [What bounds the scrub](#what-bounds-the-scrub). `0` disables. |
+| `STALL_WARN_AFTER` | `5m` | How long the in-flight object may sit in one phase before the worker logs that it may be stalled. **A log threshold, never a kill** — see [What bounds the scrub](#what-bounds-the-scrub). Zero disables. |
 | `TRANSFER_STALL_TIMEOUT` | `60s` | Abandon an object-storage transfer that has moved **no bytes** for this long. Not a deadline on the transfer. Also bounds metadata calls (10× for listings). Negative disables, restoring an unbounded wait. |
 | `ALLOW_CANCEL` | `true` | Enable `POST /api/cancel`. A cancel must still present the token this server minted for that key at upload time. |
 | `ALLOW_CANCEL_ANY` | `false` | Drop the token requirement, so any caller can withdraw any key. **Do not enable without real authentication in front of the Route** — `/api/queue` and `/api/history` both publish live input keys, so this turns a two-line loop into a durable evacuation of every user's work. It exists because clearing *somebody else's* stuck object is the operator's real need. |
@@ -706,8 +707,8 @@ Supplied as environment variables, in practice via a ConfigMap plus a Secret.
 
 ```sh
 # 1. build + push the image (air-gap: override BASE_*_IMAGE / GOPROXY to Artifactory mirrors)
-podman build -f deploy/Containerfile -t <artifactory>/docker-local/scrubberd:0.8.1 .
-podman push <artifactory>/docker-local/scrubberd:0.8.1
+podman build -f deploy/Containerfile -t <artifactory>/docker-local/scrubberd:0.8.2 .
+podman push <artifactory>/docker-local/scrubberd:0.8.2
 #    (air-gapped: transfer dist/scrubberd-0.8.0.tar and `podman load -i` on the target)
 
 # 2. prereqs: MinIO creds Secret + named-policy ConfigMap
@@ -1026,28 +1027,63 @@ overrun the volume where the pod would be evicted.
 
 ---
 
-## Nothing bounds the scrub itself
+## What bounds the scrub
 
-Worth stating plainly, because the timeouts have names that sound like they cover
-it and they do not:
+Worth a table, because most of the timeouts have names that sound like they cover the
+scrub and only one of them does:
 
-| Setting | What it bounds | Kills a slow scrub? |
+| Setting | What it bounds | Ends a slow scrub? |
 | --- | --- | --- |
+| `SCRUB_TIMEOUT` | **the walk** — total budget for one object | **yes, and the object fails** |
 | `TRANSFER_STALL_TIMEOUT` | one object-storage transfer that has moved **no bytes** | no |
 | `LIST_TIMEOUT` | one bucket listing | no |
 | `API_STORAGE_BUDGET` | the storage time one HTTP request may spend | no |
 | `STALL_WARN_AFTER` | nothing — it **only logs** | no |
 
-All four bound **I/O**. None bounds **compute**. The walk takes no context, so a
-bundle that is expanding and scrubbing runs to completion however long that takes;
-`Engine.Abort` is the only thing that stops it, and the only thing wired to Abort is
-an operator pressing **Withdraw**. That is deliberate — killing a scrub mid-flight
-destroys work, and how long is too long depends on the bundle, which the process
-does not know.
+The bottom four bound **I/O**. Only `SCRUB_TIMEOUT` bounds **compute**, and until it
+existed nothing did: the walk takes no context, so a bundle that was expanding and
+scrubbing ran to completion however long that took. One deeply nested bundle held the
+single consumer for over three hours with every upload behind it queued.
 
-The consequence to plan for: **one slow object holds the queue.** The consumer is
-single and strictly FCFS, so everything behind it waits. Withdraw is the escape
-hatch, and `scrubber_inflight_phase_seconds` is the series to alert on.
+**Where it is enforced.** `SCRUB_TIMEOUT` reuses `Engine.Abort`, the same seam the
+Withdraw button uses, which the walk polls *between archive members*. That is the only
+place a walk can stop without leaving a container half-rewritten, so a scrub overruns
+its budget by at most one member — on a bundle of 200 MiB members, that member. It is
+deliberately **not** enforced during the final write: by then the scrub is finished and
+throwing the result away would cost more than the overrun.
+
+**What a timed-out object becomes.** It **fails**. No output and no report are written,
+so nothing partial is ever published, and the input is moved aside exactly as an
+oversized one is — it is **not** retried. That reads harsh and is not: a bundle that
+needs longer than the budget will need longer on every attempt, so retrying fails it
+again forever with the whole queue behind it. Re-uploading is the retry, and it is a
+decision for whoever can also change the budget.
+
+The failure text says where the deadline landed — the phase, how many files of how
+many were finished, the last one completed, how long it had gone without finishing one
+— then what happened to the object and what to change. Member paths in it are redacted
+the same way `current_file` is, because `/api/status` is unauthenticated.
+
+**Sizing it.** From measurement, not patience. The matcher runs at roughly **8 MB/s** of
+expanded content on one unthrottled modern core and about **3.5 MB/s** on a container
+limited to a fraction of one, so a full 4 GiB `MAX_EXPAND_BYTES` is a worst case near
+twenty minutes of real work. The `1h` default leaves a wide margin for a slower node.
+Raise it alongside `MAX_EXPAND_BYTES`: the startup log warns when the budget cannot
+plausibly finish the largest bundle the pod is configured to accept, and warns again if
+you set it to `0`, which removes the bound entirely.
+
+**Nesting is not what makes a bundle slow.** Measured on the same 480 MiB of content:
+59.5s flat, 56.1s as a zip inside a zip, 59.8s at three levels — within noise, and
+unchanged when every payload is forced onto disk. Depth costs nothing; throughput is
+the whole cost. If a bundle has to go faster, that is CPU — `limits.cpu: "1"` on a
+single-threaded matcher means one object never exceeds one core, and
+`requests.cpu: 500m` makes it the first thing throttled when the node is busy.
+
+The consequence to plan for either way: **one slow object holds the queue.** The
+consumer is single and strictly FCFS, so everything behind it waits until it finishes,
+is withdrawn, or hits its budget. `scrubber_inflight_phase_seconds` is the series to
+alert on, and `scrubber_objects_total{status="timeout"}` is the one that says the
+budget or the CPU is too small for the bundles arriving.
 
 Note also that a transfer trickling bytes slowly never trips the stall guard — the
 guard fires on *no* movement, not on *slow* movement, because a large object over a
@@ -1107,8 +1143,10 @@ A count that is genuinely stuck means one member is taking that long. Check
 `scrubber_files_not_inspected_total{reason="leaf-cap"}`: before v0.8.0 nothing
 bounded a single file, so one very large log could hold the queue indefinitely while
 the matcher worked through it and the GC thrashed on three or four copies of it.
-`MAX_LEAF_BYTES` is what turns that into a flagged passthrough. And note that no
-timeout will end it — see [Nothing bounds the scrub itself](#nothing-bounds-the-scrub-itself).
+`MAX_LEAF_BYTES` is what turns that into a flagged passthrough. `SCRUB_TIMEOUT` ends
+the object eventually, but only at the *next member boundary* — so a single enormous
+member is exactly the shape that overruns the budget rather than being stopped by it.
+See [What bounds the scrub](#what-bounds-the-scrub).
 
 **The caps are not what the manifest says.** Read `scratch_source` in the startup
 `resource limits` line. `default (undeclared)` means neither `SCRATCH_BYTES` nor

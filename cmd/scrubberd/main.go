@@ -260,9 +260,13 @@ func realMain(log *slog.Logger) error {
 		MaxObjectBytes: envInt64(probs, "MAX_OBJECT_BYTES", maxObjectDefault),
 		FinalizeGrace:  envDuration("FINALIZE_GRACE", 15*time.Second),
 		StallWarnAfter: envDuration("STALL_WARN_AFTER", 5*time.Minute),
-		Audit:          audit,
-		RedactReports:  envBool("REDACT_REPORTS", false),
-		ScrubNames:     envBool("SCRUB_FILENAMES", true),
+		// The one bound on the walk itself. See worker.Config.ScrubTimeout for why
+		// nothing else is one, and the sizing check below for how this default was
+		// picked against MAX_EXPAND_BYTES.
+		ScrubTimeout:  envDuration("SCRUB_TIMEOUT", defaultScrubTimeout),
+		Audit:         audit,
+		RedactReports: envBool("REDACT_REPORTS", false),
+		ScrubNames:    envBool("SCRUB_FILENAMES", true),
 		Limits: pipeline.Limits{
 			MaxDepth: envInt("MAX_DEPTH", 16),
 			// Expanded CONTENT one object may hold, derived above from the declared
@@ -426,6 +430,30 @@ func realMain(log *slog.Logger) error {
 			scratch, scratch>>20, scratchFactor, scratchBytes, scratchBytes>>20,
 			scratchSource, int64(float64(scratchBytes)/scratchFactor))
 	}
+	// A budget too small for the bundles this pod is configured to accept fails every
+	// large object, permanently, and the failure looks like a broken bundle rather
+	// than a setting. A warning, not a fault: the operator may know their inputs are
+	// nowhere near the cap, and this is the one check whose input is a guess about
+	// hardware rather than a declared resource.
+	if wcfg.ScrubTimeout > 0 {
+		if need := time.Duration(wcfg.Limits.MaxTotalBytes/scrubFloorBytesPerSec) * time.Second; need > wcfg.ScrubTimeout {
+			log.Warn("SCRUB_TIMEOUT may be too short for the largest bundle this pod will accept; "+
+				"an object that exceeds it FAILS and is not retried",
+				"scrub_timeout", wcfg.ScrubTimeout.String(),
+				"max_expand_bytes", wcfg.Limits.MaxTotalBytes,
+				"needed_at_floor_rate", need.String(),
+				"floor_bytes_per_sec", scrubFloorBytesPerSec,
+				"fix", "raise SCRUB_TIMEOUT to at least the needed value, lower MAX_EXPAND_BYTES, "+
+					"or give the pod more CPU; SCRUB_TIMEOUT=0 removes the bound")
+		}
+	} else {
+		log.Warn("SCRUB_TIMEOUT is 0: nothing bounds a scrub. One large or deeply nested "+
+			"bundle can hold the single consumer indefinitely with every upload behind it "+
+			"queued. STALL_WARN_AFTER only writes a log line and the transfer timeouts "+
+			"bound object-storage calls, not the walk.",
+			"fix", "set SCRUB_TIMEOUT to the longest a legitimate bundle may take on this pod")
+	}
+
 	// The reverse mistake, and it is the quiet one: an operator raises the volume
 	// and forgets that MAX_EXPAND_BYTES is pinned in the ConfigMap, so the pod keeps
 	// refusing bundles it now has the disk for — and refusing means emitting them
@@ -749,6 +777,30 @@ const (
 	// ones. Calibrated so the estimate sits above both measured shapes
 	// (445MiB peak at MAX_MEMBERS=100000); see scripts/memory-matrix.sh.
 	perMemberBytes = 2 << 10
+	// defaultScrubTimeout is the budget one object gets before it is abandoned.
+	//
+	// Sized from measurement, not patience. The matcher runs at roughly 8 MB/s of
+	// expanded content on one unthrottled modern core, and about 3.5 MB/s on a
+	// container limited to a fraction of one -- so the 4 GiB expansion ceiling is a
+	// worst case of about twenty minutes of real work. An hour leaves a wide margin
+	// for a slower node and still fails an object long before it can hold the queue
+	// for the afternoon.
+	//
+	// Set SCRUB_TIMEOUT to 0 to disable the bound entirely. That is the behaviour
+	// that shipped before it existed, and it is a defensible choice for a deployment
+	// with no queue contention -- but it is what lets one bundle run for hours.
+	defaultScrubTimeout = time.Hour
+	// scrubFloorBytesPerSec is the pessimistic drain rate the timeout is checked
+	// against: half the 3.5 MB/s measured on a throttled container, so the check
+	// complains only about a budget that cannot plausibly finish a full-sized bundle
+	// on any pod.
+	//
+	// It has to be half of a MEASURED rate rather than a round pessimistic number.
+	// At 1 MiB/s the default hour looks too short for the default 4 GiB cap and the
+	// shipped configuration warns about itself on every start — which is the failure
+	// the false stall warning in 0.8.1 already taught: a warning that fires on
+	// correct behaviour trains the reader to ignore the real one.
+	scrubFloorBytesPerSec = 7 << 18 // 1.75 MiB/s
 )
 
 // cachedReady wraps a readiness check so concurrent probes share one in-flight

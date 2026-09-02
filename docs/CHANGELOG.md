@@ -10,6 +10,110 @@ For what to verify on your own cluster after taking a new image, see
 
 ---
 
+## 0.8.2 — a scrub nothing could stop, and a progress bar that could never finish
+
+Both found from one report: an object sitting at three hours, and a bar that had been
+stuck at 92% for most of it. They looked like one bug. They were two, and neither was
+the stall the timeout work in 0.8.1 was aimed at.
+
+**Nothing bounded the scrub.** `STALL_WARN_AFTER` writes a log line and returns to its
+ticker — it never touched the abort flag. `TRANSFER_STALL_TIMEOUT` and `LIST_TIMEOUT`
+bound object-storage calls, not the work between them. The only thing that could stop
+a walk was the manual cancel API. So an object ran until it finished, and with a
+single-threaded matcher on a CPU-limited pod, a full-sized bundle legitimately takes
+hours — measured at **8.4 MB/s** of expanded content on one unthrottled core and
+**3.5 MB/s** throttled, against a 4 GiB expansion ceiling.
+
+`SCRUB_TIMEOUT` (default **1h**) is now the one bound on the walk. It reuses the
+existing abort seam, so it is enforced between archive members — the only place a walk
+can stop without leaving a container half-rewritten — and a scrub overruns by at most
+one member. It is deliberately *not* enforced during the final write: by then the work
+is done and discarding it would cost more than the overrun. `0` restores the old
+unbounded behaviour.
+
+A timed-out object **fails**, and the input is moved aside rather than retried. That
+looks harsh and is not: a bundle that needs longer than the budget needs longer on
+every attempt, so retrying fails it again forever with the whole queue behind it.
+
+**Every failure now says where it happened.** A timeout has no underlying error to
+read, so anything the message does not say, nobody learns. It now reports the phase at
+the instant the deadline passed (captured on the timer's goroutine from the job log,
+not from the walk's own locals — the walk is still running), how many files of how many
+were finished, the last one completed, how long it had gone without finishing one, that
+nothing was published, where the input went, and which knob to turn. Ordinary failures
+carry the same position, so `put output: connection reset` no longer leaves open
+whether the bundle was half-scrubbed. Paths in that text go through the same redaction
+as `current_file`, because failure text is served from the unauthenticated
+`/api/status`.
+
+**The progress bar could not reach the end, and nesting is why.** `files_total` counted
+every archive *member*; `files_done` counts every report *entry*. A member that turns
+out to be a container files no entry of its own — only its children do — so each nested
+archive left the denominator permanently one above anything the numerator could reach.
+Directory and symlink entries did the same to a flat archive. The bar is drawn as
+`60 + (done/total) * 35`, so the shape in the report — 53-odd files across five nested
+zips — lands on exactly **92%** and stays there however long the scrub runs:
+
+| bundle | entries filed | old total | old ceiling |
+|---|---|---|---|
+| flat zip | 53 | 53 | 95% |
+| one nested zip | 53 | 54 | 94% |
+| five nested zips | 50 | 55 | **92%** |
+| eight nested zips | 48 | 56 | 90% |
+
+The count now announces only members that will actually file an entry, and a container
+that is itself a member replaces itself in the total instead of adding to it. So the
+92% was never a stall, and no timeout could have fixed it — which is why it survived
+0.8.1.
+
+**Half the Withdraw button was behind the policy panel.** Reported from use, and the
+cause is one line of CSS the whole page had been getting away with. The card header is
+a flex row, and a flex item does not shrink below its own content unless told to — so a
+long object key, or a long status, pushed the row wider than the card. The card does not
+clip, so the overflow rendered on top of the *Active policy* panel beside it: 39px past
+the card edge, 23px of the button genuinely hidden, and at the exact moment someone
+wanted to withdraw a bundle that looked stuck.
+
+An audit for it (walk the DOM, flag anything rendering past a parent that does not clip)
+found five more, all the same shape:
+
+| where | over | when |
+|---|---|---|
+| Withdraw button | 39px desktop, 180px at 375px wide | long name or long status |
+| status line | 92px | at 375px wide |
+| header chips + theme button | 58px, **and the page scrolled sideways** | any phone |
+| drop zone | 40px | at 320px wide |
+| coverage paths, residual samples | — | any path without hyphens to break at |
+| the timeout message itself | would have been ~600px | every timeout, once 0.8.2 shipped |
+
+Three utilities (`.row`, `.ell`, `.brk`) now carry `min-width:0` where flex items must
+shrink, an ellipsis where the shape of a name is what you read, and `overflow-wrap` where
+you need the whole string. The status and Withdraw travel as one group that wraps to its
+own line rather than squeezing each other out, and the filename keeps a 10ch floor —
+a name shrunk to nothing identifies nothing.
+
+Two consequences worth calling out. A failure no longer goes on the status line: it gets
+a block that wraps, because the timeout added above explains itself in a paragraph and
+that paragraph on a nowrap flex line is what would have pushed the row off the card
+again. And the stall hint moved off the status line too — appended there it was the first
+thing an ellipsis ate on a narrow card, and *"no new file in 12m"* is the one reading
+that separates slow from stuck.
+
+Verified at 320, 360, 375, 390, 480, 600, 768, 900, 1024, 1280 and 1440px, in both
+themes, with every surface open at once — two cards (one mid-scrub with a long name, a
+long status and a stall warning, one finished with its stats panel expanded), the policy
+editor, and ten history rows: **zero elements rendering outside their parent, zero
+horizontal page scroll.**
+
+**Nesting itself is not slow.** Worth stating, because it was the obvious suspect. The
+same 480 MiB of content took 59.5s flat, 56.1s as a zip in a zip, and 59.8s at three
+levels — within noise, and unchanged when every payload is forced onto disk. The cost
+is throughput, not depth. If a bundle must go faster, that is CPU: `limits.cpu: "1"`
+on a single-threaded matcher means one object never exceeds one core, and
+`requests.cpu: 500m` makes it the first thing throttled under pressure.
+
+---
+
 ## 0.8.1 — a stall warning that fired on healthy runs, and no way to see what was happening
 
 Found by running a real 4 GB bundle end to end rather than by reading code.

@@ -10,14 +10,14 @@ why*, see [CHANGELOG.md](CHANGELOG.md). For the full reference, see
 
 ```sh
 git pull
-docker build -f deploy/Containerfile -t scrubberd:0.8.0 .
-docker save -o dist/scrubberd-0.8.0.tar scrubberd:0.8.0
+docker build -f deploy/Containerfile -t scrubberd:0.8.2 .
+docker save -o dist/scrubberd-0.8.2.tar scrubberd:0.8.2
 ```
 
 On the isolated side:
 
 ```sh
-docker load -i scrubberd-0.8.0.tar
+docker load -i scrubberd-0.8.2.tar
 ```
 
 If your air-gapped registry mirrors its own base images, build with them instead — the
@@ -28,7 +28,7 @@ docker build -f deploy/Containerfile \
   --build-arg BASE_BUILD_IMAGE=<artifactory>/docker-public/golang:1.25 \
   --build-arg BASE_RUNTIME_IMAGE=<artifactory>/docker-public/ubi9/ubi-micro:latest \
   --build-arg GOPROXY=https://<artifactory>/artifactory/api/go/go-remote \
-  -t <artifactory>/docker-local/scrubberd:0.8.0 .
+  -t <artifactory>/docker-local/scrubberd:0.8.2 .
 ```
 
 > **Architecture.** The image is single-arch. Add `--platform linux/amd64` if you are
@@ -52,7 +52,7 @@ docker run --rm \
   -e MINIO_ENDPOINT=... -e MINIO_ACCESS_KEY=... -e MINIO_SECRET_KEY=... \
   -e INPUT_BUCKET=scrub-input -e OUTPUT_BUCKET=scrub-output -e REPORTS_BUCKET=scrub-reports \
   -e DEFAULT_POLICY=default \
-  scrubberd:0.8.0
+  scrubberd:0.8.2
 ```
 
 Expect `loaded policies`, then `control server listening`. `/healthz` and `/readyz` should
@@ -208,6 +208,28 @@ means emitting them **unscrubbed** and flagged, which looks like success in the 
 ## 5. The four checks that matter
 
 ### a. A real bundle of yours
+
+New in 0.8.2, and worth checking on a **nested** bundle specifically — a `.zip` holding
+other `.zip`s, or a `.tar.gz` of archives:
+
+- **The progress bar must reach the end.** It used to top out short of it and stay
+  there: every nested container, and every directory entry, inflated `files_total`
+  without ever filing an entry against it, so a bundle of five nested zips pinned the
+  card at **92%** for the whole run and read as wedged. `file N of M` should now finish
+  at `M of M`.
+- **Watch the card on a narrow window too.** The filename, the status and the
+  **Withdraw** button used to fight for one row: a long object key pushed Withdraw out
+  of the card and under the *Active policy* panel, which is where it was when someone
+  wanted to press it. They now wrap. Nothing on the page should render outside its box
+  or make the page scroll sideways, at any width.
+- **A bundle that runs past `SCRUB_TIMEOUT` (default `1h`) must FAIL, not hang.** The
+  card should show an error naming the phase it stopped in, how many files of how many
+  were done, and the last one finished. Check the input moved to `processed/` — it is
+  deliberately **not** retried. If your legitimate bundles need longer, raise
+  `SCRUB_TIMEOUT` rather than leaving it to fail: the startup log warns when the budget
+  cannot plausibly cover `MAX_EXPAND_BYTES`, and `scrubber_objects_total{status="timeout"}`
+  is the series to alert on.
+
 
 The point of the whole thing. Upload one of the ~500 MiB packages that used to be too
 large to scrub, and watch `docker stats scrubberd` while it runs.
