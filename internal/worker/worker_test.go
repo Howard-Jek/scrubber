@@ -5,6 +5,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"github.com/howard/scrubber/internal/scrub"
 	"io"
 	"log/slog"
 	"os"
@@ -878,5 +879,65 @@ func TestWorkerClampsConcurrency(t *testing.T) {
 	w2 := New(ms, testRegistry(t), w.metrics, w.jobs, w.cfg, w.log)
 	if w2.cfg.Workers != 1 {
 		t.Errorf("Workers = %d, want 1", w2.cfg.Workers)
+	}
+}
+
+// TestDisplayPathRedactsMemberNames is a disclosure test, not a formatting one.
+//
+// Member paths are recorded UNSCRUBBED on purpose — the report is an audit record in
+// an internal bucket and an operator verifying a scrub needs the real name. But
+// /api/status is unauthenticated, served on the external Route, and polled every
+// second by the browser, and SCRUB_FILENAMES defaults to true precisely because a
+// path carries the same class of data as a file body. Sending the original down that
+// channel would have the tool broadcast live exactly what it was asked to remove.
+//
+// Verified against the real pipeline before this existed: a member named
+// "logs/AcmeCorp-prod/alice@acme.test-session.log" is scrubbed in the emitted bundle
+// and was still reported verbatim in current_file.
+func TestDisplayPathRedactsMemberNames(t *testing.T) {
+	m, err := scrub.NewMatcher("[REDACTED]", []scrub.Rule{
+		{ID: "literal:AcmeCorp", Replacement: "[COMPANY]", Pattern: `AcmeCorp`},
+		{ID: "email", Replacement: "[EMAIL]", Pattern: `[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}`},
+	})
+	if err != nil {
+		t.Fatalf("matcher: %v", err)
+	}
+
+	const raw = "abc123-bundle.tar!logs/AcmeCorp-prod/alice@acme.test-session.log"
+	got := displayPath(m, raw)
+
+	for _, leak := range []string{"AcmeCorp", "alice@acme.test"} {
+		if strings.Contains(got, leak) {
+			t.Errorf("displayPath leaked %q into an unauthenticated field: %s", leak, got)
+		}
+	}
+	if !strings.Contains(got, "[COMPANY]") || !strings.Contains(got, "[EMAIL]") {
+		t.Errorf("displayPath = %q, want the policy's labels in place of the matches", got)
+	}
+	// The structure has to survive, or the display stops being useful. Note the
+	// email rule greedily takes "-session.log" with it, since that suffix is still
+	// inside the domain pattern -- over-redacting a filename is the safe direction,
+	// so the assertion is on the path's SHAPE rather than on any surviving segment.
+	if !strings.Contains(got, "bundle.tar!") || !strings.Contains(got, "logs/") {
+		t.Errorf("displayPath = %q, want the path shape preserved", got)
+	}
+}
+
+// TestDisplayPathPassesCleanPathsThrough: the common case must be untouched, or every
+// ordinary filename would render as noise.
+func TestDisplayPathPassesCleanPathsThrough(t *testing.T) {
+	m, err := scrub.NewMatcher("[REDACTED]", []scrub.Rule{
+		{ID: "literal:AcmeCorp", Replacement: "[COMPANY]", Pattern: `AcmeCorp`},
+	})
+	if err != nil {
+		t.Fatalf("matcher: %v", err)
+	}
+	const clean = "bundle.tar!logs/service/application.log"
+	if got := displayPath(m, clean); got != clean {
+		t.Errorf("displayPath(%q) = %q, want it unchanged", clean, got)
+	}
+	// A nil matcher must not panic — the CLI path builds jobs without one.
+	if got := displayPath(nil, clean); got != clean {
+		t.Errorf("displayPath with a nil matcher = %q, want %q", got, clean)
 	}
 }

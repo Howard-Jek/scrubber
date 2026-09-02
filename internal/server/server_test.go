@@ -747,3 +747,30 @@ func TestStatusReportsBinarySkips(t *testing.T) {
 		t.Errorf("wrong path surfaced: %v", paths[0])
 	}
 }
+
+// TestAPIVersion covers the endpoint that answers "which build is this?".
+//
+// The question has no other answer from outside a pod, which is exactly why it was
+// worth an endpoint: during a rollout, or when a cluster behaves unlike the source
+// tree, "what is actually running there" is the first thing to establish and the
+// hardest thing to guess.
+func TestAPIVersion(t *testing.T) {
+	code, body := getJSON(t, newTestServerWith(Deps{Version: "0.8.0"}), "/api/version")
+	if code != http.StatusOK {
+		t.Fatalf("status = %d, want 200", code)
+	}
+	if got := body["version"]; got != "0.8.0" {
+		t.Errorf("version = %v, want 0.8.0", got)
+	}
+}
+
+// TestAPIVersionUnstamped: a binary built without -X main.version must say so rather
+// than return an empty string. In the UI chip an empty value is indistinguishable
+// from a missing element, which turns "this build is unstamped" into "the version
+// feature is broken".
+func TestAPIVersionUnstamped(t *testing.T) {
+	_, body := getJSON(t, newTestServerWith(Deps{}), "/api/version")
+	if got := body["version"]; got != "unknown" {
+		t.Errorf("version = %v, want \"unknown\" for an unstamped build", got)
+	}
+}

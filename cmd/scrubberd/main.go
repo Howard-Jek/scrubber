@@ -13,6 +13,7 @@ import (
 	"net/http"
 	"os"
 	"os/signal"
+	"runtime"
 	"runtime/debug"
 	"strconv"
 	"strings"
@@ -32,6 +33,20 @@ import (
 	"github.com/howard/scrubber/internal/worker"
 	"github.com/prometheus/client_golang/prometheus"
 )
+
+// version is the release this binary was built from. It is stamped at build time:
+//
+//	go build -ldflags "-X main.version=0.8.0" ./cmd/scrubberd
+//
+// and deploy/Containerfile passes the VERSION build-arg through to exactly that.
+// The default is deliberately "dev" rather than a number: a binary that was built
+// without the stamp must not claim to be a release, because the whole point of the
+// field is answering "which build is actually running in this cluster?" -- and a
+// wrong answer there is worse than an obviously missing one.
+//
+// It reaches an operator three ways: the startup log, GET /api/version, and the
+// scrubber_build_info metric. The UI shows it in the footer.
+var version = "dev"
 
 func main() {
 	log := slog.New(slog.NewJSONHandler(os.Stdout, &slog.HandlerOptions{Level: logLevel()}))
@@ -141,6 +156,10 @@ func realMain(log *slog.Logger) error {
 	// --- metrics + worker ---
 	promReg := prometheus.NewRegistry()
 	m := metrics.New(promReg)
+	// A build_info gauge is the conventional way to answer "what is deployed?" from
+	// monitoring rather than by shelling into a pod, and it joins to every other
+	// series by instance.
+	metrics.RegisterBuildInfo(promReg, version)
 	jobs := metrics.NewJobLog(envInt("JOBS_HISTORY", 200))
 
 	// A typo here resolving quietly to "full" would retain matched cleartext in every
@@ -169,6 +188,10 @@ func realMain(log *slog.Logger) error {
 	// governs which cap and why the two must not be swapped. An explicit
 	// environment variable still wins over all of it: this changes defaults, not
 	// policy.
+	// First line out of the process, before anything can fail: whatever else goes
+	// wrong below, the log says which build produced it.
+	log.Info("starting scrubberd", "version", version, "go", runtime.Version())
+
 	res := podres.Detect()
 	c := deriveCaps(res)
 	memScale := c.memScale
@@ -371,7 +394,11 @@ func realMain(log *slog.Logger) error {
 		"scratch_declared_bytes", scratchBytes,
 		"scratch_source", scratchSource,
 		"pod_cpus", res.CPUs,
-		"mem_scale", memScale)
+		"mem_scale", memScale,
+		// Repeated on this line as well as the startup line above, because this is
+		// the line an operator screenshots when the caps are not what they expected,
+		// and the first question is always which build produced them.
+		"version", version)
 
 	// Two ways to get this wrong that are worth naming at startup rather than
 	// leaving to be discovered as an eviction or an OOM under load.
@@ -477,6 +504,7 @@ func realMain(log *slog.Logger) error {
 			Archive:       st,
 			Queue:         wk,
 			Nudge:         wk.Nudge,
+			Version:       version,
 			DefaultPolicy: os.Getenv("DEFAULT_POLICY"),
 			AllowEdit:     envBool("ALLOW_POLICY_EDIT", true),
 			InputBucket:   inputBucket,

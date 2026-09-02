@@ -312,7 +312,7 @@ func (e *Engine) scrubMemberName(origPath, name string, inBytes int64) (string, 
 	if len(matches) == 0 {
 		return name, false
 	}
-	e.Report.Record(origPath+" [name]", report.StatusScrubbed, "filename scrubbed", int(inBytes), len(newName), matches)
+	e.Report.Record(origPath+" [name]", report.StatusScrubbed, report.DetailFilenameScrubbed, int(inBytes), len(newName), matches)
 	return newName, true
 }
 
@@ -645,6 +645,9 @@ func (e *Engine) handleTar(path string, in *spill.Blob, depth int) (*spill.Blob,
 		return in, false
 	}
 	defer archive.CloseTar(members)
+	// Announced before the member loop, so a watcher has a denominator from the very
+	// first file rather than only once the archive has finished.
+	e.Report.NoteMembers(len(members))
 
 	for i := range members {
 		e.stage(members[i].Body)
@@ -702,6 +705,8 @@ func (e *Engine) handleZip(path string, in *spill.Blob, depth int) (*spill.Blob,
 		return in, false
 	}
 	defer archive.CloseZip(members)
+	// See handleTar.
+	e.Report.NoteMembers(len(members))
 
 	for i := range members {
 		e.stage(members[i].Body)

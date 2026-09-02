@@ -30,6 +30,7 @@ import (
 	"github.com/howard/scrubber/internal/policy"
 	"github.com/howard/scrubber/internal/queue"
 	"github.com/howard/scrubber/internal/report"
+	"github.com/howard/scrubber/internal/scrub"
 	"github.com/howard/scrubber/internal/spill"
 	"github.com/howard/scrubber/internal/store"
 )
@@ -252,6 +253,45 @@ func (w *Worker) Depth() int { return w.q.Depth() }
 // Snapshot returns the in-flight keys and up to limit pending keys, in queue order.
 func (w *Worker) Snapshot(limit int) (inflight, pending []string) { return w.q.Snapshot(limit) }
 
+// displayPath makes a member path safe to show outside the reports bucket.
+//
+// Paths are RECORDED unscrubbed, and that is correct: the report is the audit record,
+// it lands in an internal bucket, and an operator verifying a scrub needs the real
+// name. REDACT_REPORTS exists for when that bucket is less trusted than the operators.
+//
+// /api/status is a different audience. It is unauthenticated, it is served on the
+// external Route, and the browser polls it every second. SCRUB_FILENAMES defaults to
+// true precisely because a member path carries the same class of data as the file
+// body -- a directory named after a customer, a filename with an email in it. Sending
+// the original down that channel would have the tool broadcast, live, exactly the
+// strings it was asked to remove. Verified: a member named
+// "logs/AcmeCorp-prod/alice@acme.test-session.log" is scrubbed in the output and was
+// still reported verbatim here.
+//
+// So the same matcher that rewrites the name in the bundle rewrites it for display.
+// What the UI shows is what the recipient of the bundle would see.
+func displayPath(m *scrub.Matcher, p string) string {
+	if m == nil {
+		return p
+	}
+	out, _ := m.ScrubName(p)
+	return out
+}
+
+// displayNotes is displayPath over a list of report notes, for the path lists
+// /api/status returns alongside the live one.
+func displayNotes(m *scrub.Matcher, notes []report.Note) []report.Note {
+	if m == nil || len(notes) == 0 {
+		return notes
+	}
+	out := make([]report.Note, len(notes))
+	for i, n := range notes {
+		n.Path = displayPath(m, n.Path)
+		out[i] = n
+	}
+	return out
+}
+
 // InflightPhaseSeconds reports how long the object being scrubbed has been in its
 // current phase, or 0 when nothing is in flight.
 //
@@ -300,9 +340,15 @@ func (w *Worker) watchStalls(ctx context.Context) {
 			if !ok || j.Done() {
 				continue
 			}
-			secs := j.PhaseSeconds()
+			// PROGRESS, not phase. An object part-way through a large archive stays
+			// in "scrubbing" for as long as the archive takes, so judging it on
+			// phase age warned about every healthy long run -- measured at three
+			// false alarms on a 19-minute, 60-file bundle whose files_done was
+			// climbing throughout.
+			secs := j.ProgressSeconds()
 			if secs < every.Seconds() {
-				// Phase changed recently: it is moving, just not quickly.
+				// It finished a file, or changed phase, recently: moving, just not
+				// quickly.
 				warned = ""
 				continue
 			}
@@ -312,10 +358,13 @@ func (w *Worker) watchStalls(ctx context.Context) {
 				level = "now"
 				warned = stamp
 			}
-			w.log.Warn("object has not changed phase for an unusually long time; "+
-				"it may be stalled rather than slow",
-				"key", key, "phase", j.Phase, "phase_seconds", int64(secs),
-				"files_done", j.FilesDone, "state", level)
+			w.log.Warn("object has made no observable progress for an unusually long "+
+				"time; it may be stalled rather than slow",
+				"key", key, "phase", j.Phase,
+				"no_progress_seconds", int64(secs),
+				"phase_seconds", int64(j.PhaseSeconds()),
+				"files_done", j.FilesDone, "current_file", j.CurrentFile,
+				"state", level)
 		}
 	}
 }
@@ -777,6 +826,7 @@ func (w *Worker) processObject(ctx context.Context, o store.Object) {
 	job.Status = "processing"
 	job.Phase = "reading"
 	job.PhaseSince = time.Now()
+	job.ProgressSince = job.PhaseSince
 	w.jobs.Upsert(job)
 	w.log.Info("processing object", "key", o.Key, "size", o.Size)
 
@@ -936,14 +986,33 @@ func (w *Worker) processObject(ctx context.Context, o store.Object) {
 	// with no way to distinguish slow from wedged.
 	job.Phase = "unpacking"
 	job.PhaseSince = time.Now()
+	job.ProgressSince = job.PhaseSince
 	w.jobs.Upsert(job)
 	filesDone := 0
+	membersTotal := 0
+	// How many members the walk has found so far, so the card can say "file 7 of 10"
+	// rather than a count with no denominator. It rises when a nested archive opens,
+	// which is honest: what is inside a member is not known until the walk reaches it.
+	rep.OnMembers(func(n int) {
+		membersTotal = n
+		j := job
+		j.FilesTotal = n
+		w.jobs.Upsert(j)
+	})
 	rep.OnFile(func(f report.FileEntry) {
+		// A scrubbed FILENAME files its own report entry, which is right for the audit
+		// record and wrong for a progress count: a 10-member tar with two renamed
+		// members reported "12 files", so the number the user watched disagreed with
+		// the archive they uploaded. Names are annotations on a member, not members.
+		if f.Detail == report.DetailFilenameScrubbed {
+			return
+		}
 		filesDone++
 		if filesDone == 1 {
 			// First member out of the container: unpacking is demonstrably over.
 			job.Phase = "scrubbing"
 			job.PhaseSince = time.Now()
+			job.ProgressSince = job.PhaseSince
 		}
 		w.log.Debug("scrubbed file", "key", o.Key, "path", f.Path, "status", f.Status,
 			"bytes_in", f.BytesIn, "bytes_out", f.BytesOut, "detail", f.Detail)
@@ -955,7 +1024,11 @@ func (w *Worker) processObject(ctx context.Context, o store.Object) {
 		}
 		j := job
 		j.FilesDone = filesDone
-		j.CurrentFile = f.Path
+		j.CurrentFile = displayPath(res.Matcher, f.Path)
+		// Finishing a file IS progress, and stamping it here is what stops the stall
+		// warning firing on a healthy multi-file scrub.
+		j.ProgressSince = time.Now()
+		j.FilesTotal = membersTotal
 		w.jobs.Upsert(j)
 	})
 
@@ -1003,6 +1076,7 @@ func (w *Worker) processObject(ctx context.Context, o store.Object) {
 
 	job.Phase = "writing"
 	job.PhaseSince = time.Now()
+	job.ProgressSince = job.PhaseSince
 	job.FilesDone = filesDone
 	w.jobs.Upsert(job)
 
@@ -1102,17 +1176,18 @@ func (w *Worker) processObject(ctx context.Context, o store.Object) {
 	job.Phase = ""
 	job.CurrentFile = ""
 	job.FilesDone = filesDone
+	job.FilesTotal = membersTotal
 	job.Matches = sum.TotalMatches
 	job.BytesIn = int(inSize)
 	job.BytesOut = int(out.Size())
 	job.ByLabel = sum.MatchesByLabel
 	job.Passthrough = sum.FilesPassthrough
-	job.PassthroughPaths = sum.Passthroughs
+	job.PassthroughPaths = displayNotes(res.Matcher, sum.Passthroughs)
 	job.BinarySkipped = sum.FilesBinarySkip
-	job.BinarySkipPaths = sum.BinarySkips
+	job.BinarySkipPaths = displayNotes(res.Matcher, sum.BinarySkips)
 	job.Verdict = verdict
 	job.NotInspected = sum.FilesNotInspected
-	job.NotInspectedSet = sum.NotInspected
+	job.NotInspectedSet = displayNotes(res.Matcher, sum.NotInspected)
 	job.ResidualHits = sum.ResidualHits
 	job.ResidualSamples = sum.ResidualSamples
 	record(job)

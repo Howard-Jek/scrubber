@@ -81,6 +81,7 @@
   <symbol id="i-history" viewBox="0 0 24 24"><path d="M3 12a9 9 0 1 0 3-6.7L3 8"/><path d="M3 3v5h5"/><path d="M12 7v5l3 2"/></symbol>
   <symbol id="i-refresh" viewBox="0 0 24 24"><path d="M20 11A8 8 0 0 0 6.3 5.7L4 8"/><path d="M4 4v4h4"/><path d="M4 13a8 8 0 0 0 13.7 5.3L20 16"/><path d="M20 20v-4h-4"/></symbol>
   <symbol id="i-alert-triangle" viewBox="0 0 24 24"><path d="M10.3 4.3 2.5 18a2 2 0 0 0 1.7 3h15.6a2 2 0 0 0 1.7-3L13.7 4.3a2 2 0 0 0-3.4 0z"/><path d="M12 9v4M12 17h.01"/></symbol>
+  <symbol id="i-tag" viewBox="0 0 24 24"><path d="M20.6 13.4 12 22l-9-9V3h10l7.6 7.6a2 2 0 0 1 0 2.8z"/><path d="M7.5 7.5h.01"/></symbol>
   <symbol id="i-point" viewBox="0 0 24 24"><circle cx="12" cy="12" r="3" fill="currentColor" stroke="none"/></symbol>
   <symbol id="i-sun" viewBox="0 0 24 24"><circle cx="12" cy="12" r="4"/><path d="M12 2v2M12 20v2M4.9 4.9l1.4 1.4M17.7 17.7l1.4 1.4M2 12h2M20 12h2M4.9 19.1l1.4-1.4M17.7 6.3l1.4-1.4"/></symbol>
   <symbol id="i-moon" viewBox="0 0 24 24"><path d="M12 3a6 6 0 0 0 9 9 9 9 0 1 1-9-9z"/></symbol>
@@ -102,6 +103,13 @@
     <div style="margin-left:auto; display:flex; align-items:center; gap:8px;">
       <div style="display:flex; align-items:center; gap:6px; font-size:12px; color:var(--color-text-secondary); background:var(--color-background-primary); border:0.5px solid var(--color-border-tertiary); padding:5px 10px; border-radius:var(--border-radius-md);">
         <svg class="icn" style="font-size:15px;" aria-hidden="true"><use href="#i-shield-check"/></svg> policy: <span id="policyName">default</span>
+      </div>
+      <!-- Which build is actually serving this page. It reads "unknown" until
+           /api/version answers and "dev" for a binary built without the stamp;
+           neither is dressed up as a release number, because the entire point of
+           the chip is telling you what is really deployed. -->
+      <div id="verChip" title="Build serving this page" style="display:flex; align-items:center; gap:6px; font-size:12px; font-family:var(--font-mono); color:var(--color-text-secondary); background:var(--color-background-primary); border:0.5px solid var(--color-border-tertiary); padding:5px 10px; border-radius:var(--border-radius-md);">
+        <svg class="icn" style="font-size:15px;" aria-hidden="true"><use href="#i-tag"/></svg> <span id="verText">…</span>
       </div>
       <button id="themeBtn" aria-label="Switch colour theme" title="Switch colour theme" style="padding:6px 9px; line-height:0;">
         <svg class="icn" style="font-size:16px;" aria-hidden="true"><use id="themeIcon" href="#i-moon"/></svg>
@@ -188,14 +196,56 @@
   var totals={}, labelRows={}, ruleData=[];
 
   function esc(s){return String(s).replace(/[&<>]/g,function(c){return{'&':'&amp;','<':'&lt;','>':'&gt;'}[c];});}
+
+  // Turn the engine's internal path into something a person reads.
+  //
+  // The engine addresses a member as "<object key>!<path inside>", one "!" per level
+  // of nesting, so a member of a tar inside a tar.gz arrives as
+  // "abc123-bundle.tar.gz!inner.tar!logs/app.log". The leading object key is noise --
+  // the card is already titled with the file the user dropped -- and the "!" reads as
+  // punctuation rather than structure. Dropping the first segment and showing the rest
+  // as "inner.tar › logs/app.log" says the same thing in the shape people expect.
+  //
+  // The path arrives ALREADY REDACTED from the server: a member path can carry the
+  // same data as a member body (which is why SCRUB_FILENAMES exists), and this value
+  // goes over an unauthenticated endpoint, so the worker runs the policy over it
+  // before it leaves. Nothing here should try to redact -- it would be too late and
+  // in the wrong place.
+  function prettyPath(p){
+    if(!p) return '';
+    var parts=String(p).split('!');
+    if(parts.length>1) parts=parts.slice(1);   // drop the object key
+    return parts.join(' › ');
+  }
+
+  // Which build is serving this page. Fetched rather than templated in so the chip
+  // reflects the process actually answering requests -- during a rollout that is the
+  // question being asked, and a value baked into the HTML would answer for whichever
+  // pod happened to serve the document.
+  (function(){
+    var el=document.getElementById('verText');
+    if(!el) return;
+    fetch('/api/version').then(function(r){ return r.ok?r.json():null; }).then(function(d){
+      el.textContent=(d&&d.version)||'unknown';
+    }).catch(function(){ el.textContent='unknown'; });
+  })();
   // Elapsed time in a phase that reports no other progress. Shown instead of a
   // bar so a long unpack reads as "still working, 4m12s in" rather than as a
   // percentage nothing measured.
+  // Durations are always h/m/s, never a bare second count.
+  //
+  // A finished scrub used to report "12043.6s", which is a number you have to do
+  // arithmetic on before it means anything -- and at the scale that actually
+  // matters, a bundle that has been running for hours, it is exactly the reading
+  // that made "is this stuck?" hard to answer at a glance. Seconds are kept in the
+  // h/m/s form rather than dropped, so a long run stays precise instead of
+  // rounding to a flat "3h".
   function fmtDur(s){
-    if(s<60) return s+'s';
-    var m=Math.floor(s/60), r=s%60;
-    if(m<60) return m+'m'+(r<10?'0':'')+r+'s';
-    return Math.floor(m/60)+'h'+((m%60)<10?'0':'')+(m%60)+'m';
+    s=Math.max(0,Math.round(s));
+    var h=Math.floor(s/3600), m=Math.floor((s%3600)/60), r=s%60;
+    if(h) return h+'h '+(m<10?'0':'')+m+'m '+(r<10?'0':'')+r+'s';
+    if(m) return m+'m '+(r<10?'0':'')+r+'s';
+    return r+'s';
   }
 
   // The policy can hold hundreds of terms. The list is filterable, grouped into
@@ -307,16 +357,31 @@
       +'background:transparent; color:var(--color-text-tertiary); '
       +'border:0.5px solid var(--color-border-tertiary); border-radius:var(--border-radius-md);">Withdraw</button></div>'
       +'<div style="margin-top:10px; height:6px; background:var(--color-background-tertiary); border-radius:999px; overflow:hidden;"><div class="bar" style="height:100%; width:0%; background:var(--accent); border-radius:999px; transition:width .25s;"></div></div>'
-      +'<div class="meta" style="display:flex; justify-content:space-between; margin-top:7px; font-size:12px; color:var(--color-text-tertiary);"><span class="pct">0%</span><span class="el">0.0s</span></div>'
+      +'<div class="meta" style="display:flex; justify-content:space-between; margin-top:7px; font-size:12px; color:var(--color-text-tertiary);"><span class="pct">0%</span><span class="el">0s</span></div>'
+      // The file being scrubbed right now. The server has always reported it; the
+      // page only ever put it in a title attribute, so the one detail that tells
+      // you WHICH file a long run is sitting on was invisible unless you happened
+      // to hover. Truncated from the left, because the distinguishing part of a
+      // path inside a bundle is the end of it.
+      +'<div class="cur" style="margin-top:5px; font-size:11px; font-family:var(--font-mono); color:var(--color-text-tertiary); white-space:nowrap; overflow:hidden; text-overflow:ellipsis;"></div>'
       +'<div class="done"></div>';
     list.appendChild(card);
     var bar=card.querySelector('.bar'), st=card.querySelector('.st'), pct=card.querySelector('.pct'),
         elp=card.querySelector('.el'), meta=card.querySelector('.meta'), done=card.querySelector('.done'),
-        cx=card.querySelector('.cx');
+        cur=card.querySelector('.cur'), cx=card.querySelector('.cx');
     var cancelled=false;
-    var tick=setInterval(function(){ elp.textContent=((Date.now()-start)/1000).toFixed(1)+'s'; },100);
+    // Tracks whether files_done is actually advancing. The server reports the
+    // current count, never whether it moved, so only the client can tell "slow"
+    // from "stuck" -- and that distinction is the whole question when a bundle has
+    // been running for hours.
+    var lastDone=-1, lastDoneAt=Date.now();
+    // How long without a new file before the card says so. Long enough that a big
+    // member scrubbing normally does not trip it, short enough to beat a human
+    // wondering.
+    var STALL_HINT=90;
+    var tick=setInterval(function(){ elp.textContent=fmtDur((Date.now()-start)/1000); },500);
     function setp(p){ p=Math.round(p); bar.style.width=p+'%'; pct.textContent=p+'%'; }
-    function fail(m){ clearInterval(tick); if(cx) cx.style.display='none'; st.innerHTML='<span style="color:var(--color-text-danger)">'+esc(m)+'</span>'; bar.style.background='var(--color-text-danger)'; }
+    function fail(m){ clearInterval(tick); if(cur) cur.textContent=''; if(cx) cx.style.display='none'; st.innerHTML='<span style="color:var(--color-text-danger)">'+esc(m)+'</span>'; bar.style.background='var(--color-text-danger)'; }
 
     fetch('/api/uploads',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({name:file.name})})
       .then(function(r){ if(!r.ok) throw 0; return r.json(); })
@@ -418,9 +483,59 @@
           st.title=s.queue_position?'Scrubbing runs one file at a time, in upload order':'';
         } else if(s.files_done>0){
           // Real progress when the server has it.
-          creep=Math.max(creep,Math.min(95,60+Math.log(1+s.files_done)*8));
-          st.textContent=(s.phase==='writing'?'Writing… ':'Scrubbing… ')+s.files_done+' file'+(s.files_done===1?'':'s');
-          if(s.current_file) st.title=s.current_file;
+          //
+          // The bar is a log curve because the total file count is not known until
+          // the walk finishes -- there is no honest fraction to draw. What it must
+          // not do is imply completeness: log(1+n)*8 reaches its 95% ceiling at 78
+          // files, so a 5000-file bundle sat at "92%" for hours and read as wedged.
+          // The bar is now capped well short of full and the REAL signals -- how
+          // many files, how long, which file right now -- carry the information.
+          // With a member count the bar can be REAL: the upload occupied 0-55%, so
+          // the scrub occupies the rest in proportion to files actually done. Without
+          // one (a bare .log, or an archive not yet opened) fall back to the log curve,
+          // which at least never claims to be finished.
+          var total=s.files_total||0;
+          if(total>0){
+            creep=Math.max(creep,60+Math.min(1,s.files_done/total)*35);
+          } else {
+            creep=Math.max(creep,Math.min(88,60+Math.log(1+s.files_done)*8));
+          }
+          var secs=Math.round(s.phase_seconds||0);
+          // "file 7 of 10" is the phrasing the count was added for. The denominator can
+          // grow when a nested archive opens; that is honest, and better than a fixed
+          // total that would be wrong.
+          var label=(s.phase==='writing'?'Writing… ':'Scrubbing… ')
+            +(total>0 ? ('file '+s.files_done+' of '+total)
+                      : (s.files_done+' file'+(s.files_done===1?'':'s')));
+          // Elapsed used to vanish the moment the first file landed, so the one
+          // reading that distinguishes "slow" from "stuck" was hidden exactly when
+          // it started to matter.
+          if(secs) label+=' · '+fmtDur(secs);
+          // A file count that has not moved is the actual stall signal, and it is
+          // the client that can see it -- the server only reports the current value,
+          // not whether it changed. Naming the file it is sitting on turns "it is
+          // stuck" into something you can act on.
+          if(s.files_done!==lastDone){ lastDone=s.files_done; lastDoneAt=Date.now(); }
+          // progress_seconds is the server's own answer to "when did anything last
+          // happen", and it survives a page reload where the client-side timer does
+          // not. Prefer it, fall back to local tracking for an older service.
+          var stallSecs=(typeof s.progress_seconds==='number')
+            ? s.progress_seconds
+            : (Date.now()-lastDoneAt)/1000;
+          if(stallSecs>STALL_HINT){
+            st.innerHTML=esc(label)+' <span style="color:var(--color-text-warning);">— no new file in '
+              +esc(fmtDur(stallSecs))+'</span>';
+            st.title=(s.current_file?'Still on: '+s.current_file+'\n':'')
+              +'The scrub itself has no timeout: a single very large file can hold '
+              +'the queue for a long time. Withdraw it if it must not.';
+          } else {
+            st.textContent=label;
+            st.title=s.current_file?'Current file: '+s.current_file:'';
+          }
+          // The whole point of the line: WHICH member is being worked on. It used
+          // to live only in a title attribute, so the detail that tells you where a
+          // long run is sitting was invisible unless you thought to hover.
+          cur.textContent=s.current_file ? '↳ '+prettyPath(s.current_file) : '';
         } else {
           // Unpacking: a container is expanded in full before its first member is
           // scrubbed, so there is no per-file progress to report yet and the bar
@@ -432,6 +547,9 @@
           var secs=Math.round(s.phase_seconds||0);
           st.textContent=(isArch?'Unpacking':'Reading')+(secs?' — '+fmtDur(secs):'…');
           st.title='No per-file progress is available until the container is fully expanded';
+          // Named rather than blank, so the gap before the first member is a state the
+          // reader recognises instead of an absence they have to interpret.
+          cur.textContent=isArch?'↳ expanding the container — no members yet':'';
         }
         setp(creep);
         setTimeout(function(){poll(key,creep);},1200);
@@ -443,9 +561,10 @@
 
     function finish(s,key){
       clearInterval(tick); meta.style.display='none';
+      if(cur) cur.textContent='';
       // Nothing left to withdraw: the output is written.
       if(cx) cx.style.display='none';
-      var secs=((Date.now()-start)/1000).toFixed(1);
+      var secs=fmtDur((Date.now()-start)/1000);
       // One coverage question, one answer. The UI used to read `passthrough`, which
       // excluded files skipped as binary — so a UTF-16 log that was never inspected
       // drew a green check here.
@@ -463,7 +582,7 @@
         st.innerHTML='<span style="display:inline-flex; align-items:center; gap:5px; color:var(--color-text-warning); background:var(--color-background-warning); padding:3px 9px; border-radius:var(--border-radius-md);">'
           +'<svg class="icn" style="font-size:14px;" aria-hidden="true"><use href="#i-alert-triangle"/></svg>'+ni+' file'+(ni===1?'':'s')+' NOT inspected</span>';
       } else {
-        st.innerHTML='<span style="display:inline-flex; align-items:center; gap:5px; color:var(--color-text-success); background:var(--color-background-success); padding:3px 9px; border-radius:var(--border-radius-md);"><svg class="icn" style="font-size:14px;" aria-hidden="true"><use href="#i-check"/></svg>Scrubbed in '+secs+'s</span>';
+        st.innerHTML='<span style="display:inline-flex; align-items:center; gap:5px; color:var(--color-text-success); background:var(--color-background-success); padding:3px 9px; border-radius:var(--border-radius-md);"><svg class="icn" style="font-size:14px;" aria-hidden="true"><use href="#i-check"/></svg>Scrubbed in '+secs+'</span>';
       }
       var bl=s.by_label||{}; Object.keys(bl).forEach(function(l){ bump(l,bl[l]); });
       var chips=Object.keys(bl).map(function(l){return '<span style="font-family:var(--font-mono); font-size:12px; color:var(--color-text-secondary); background:var(--color-background-secondary); padding:3px 8px; border-radius:var(--border-radius-md);">'+esc(l)+' ×'+bl[l]+'</span>';}).join('');

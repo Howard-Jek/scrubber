@@ -2,11 +2,11 @@
 #
 # Air-gap note: override BASE_BUILD_IMAGE / BASE_RUNTIME_IMAGE to your
 # Artifactory-mirrored images, and GOPROXY to your Artifactory Go proxy, at build:
-#   podman build -f deploy/Containerfile \
+#   podman build -f deploy/Containerfile --build-arg VERSION=0.8.1 \
 #     --build-arg BASE_BUILD_IMAGE=<artifactory>/docker-public/golang:1.25 \
 #     --build-arg BASE_RUNTIME_IMAGE=<artifactory>/docker-public/ubi9/ubi-micro:latest \
 #     --build-arg GOPROXY=https://<artifactory>/artifactory/api/go/go-remote \
-#     -t <artifactory>/docker-local/scrubberd:0.8.0 .
+#     -t <artifactory>/docker-local/scrubberd:0.8.1 .
 
 ARG BASE_BUILD_IMAGE=docker.io/library/golang:1.25
 ARG BASE_RUNTIME_IMAGE=registry.access.redhat.com/ubi9/ubi-micro:latest
@@ -15,12 +15,17 @@ ARG BASE_RUNTIME_IMAGE=registry.access.redhat.com/ubi9/ubi-micro:latest
 FROM ${BASE_BUILD_IMAGE} AS build
 ARG GOPROXY=https://proxy.golang.org
 ARG GOFLAGS=
+# Stamped into the binary and surfaced at /api/version, in the scrubber_build_info
+# metric, in the startup log and in the UI footer. Keep it equal to the image tag:
+# the point of the field is answering "which build is running here?", and a version
+# that disagrees with the tag answers it wrongly.
+ARG VERSION=dev
 ENV GOPROXY=${GOPROXY} GOFLAGS=${GOFLAGS} CGO_ENABLED=0
 WORKDIR /src
 COPY go.mod go.sum ./
 RUN go mod download
 COPY . .
-RUN go build -trimpath -ldflags="-s -w" -o /out/scrubberd ./cmd/scrubberd
+RUN go build -trimpath -ldflags="-s -w -X main.version=${VERSION}" -o /out/scrubberd ./cmd/scrubberd
 
 # ---- runtime stage ----
 FROM ${BASE_RUNTIME_IMAGE}

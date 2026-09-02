@@ -340,7 +340,11 @@ spec:
         - name: artifactory-pull   # only if pulling from a private Artifactory repo
       containers:
         - name: scrubberd
-          image: <ARTIFACTORY_DOCKER_HOST>/docker-local/scrubberd:0.8.0
+          # Build this with --build-arg VERSION=0.8.1 so the tag and the version the
+          # process reports are the same string. It is surfaced at /api/version, in
+          # the scrubber_build_info metric, in the first startup log line and in the
+          # UI header -- an unstamped build reports "dev" rather than guessing.
+          image: <ARTIFACTORY_DOCKER_HOST>/docker-local/scrubberd:0.8.1
           ports:
             - containerPort: 8080
           envFrom:

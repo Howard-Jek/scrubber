@@ -24,6 +24,14 @@ import (
 // renamed the output.
 const ObjectSuffix = ".report.json"
 
+// DetailFilenameScrubbed is the Detail on the entry a scrubbed FILENAME files.
+//
+// Named rather than repeated as a literal because two packages have to agree on it:
+// the pipeline writes it, and the worker's progress counter skips it. A filename is
+// an annotation on a member, not a member of its own, and counting it made a
+// 10-member archive report "12 files" to the person watching.
+const DetailFilenameScrubbed = "filename scrubbed"
+
 // DigestSuffix is the companion compact record, keyed the same way.
 //
 // The full report carries every match with its location and original value, so
@@ -384,11 +392,21 @@ type Report struct {
 	BytesIn  int `json:"bytes_in,omitempty"`
 	BytesOut int `json:"bytes_out,omitempty"`
 
-	mu     sync.Mutex
-	audit  AuditLevel
-	redact bool
-	salt   []byte
-	onFile func(FileEntry)
+	mu sync.Mutex
+	// membersSeen is the running count NoteMembers has been told about.
+	membersSeen int
+	audit       AuditLevel
+	redact      bool
+	salt        []byte
+	onFile      func(FileEntry)
+	// onMembers reports the running count of archive members DISCOVERED, so a client
+	// can show "file 7 of 10" instead of a number with no denominator.
+	//
+	// Running, not final: whether a member is itself a container is decided from its
+	// first bytes when the walk reaches it, so a nested archive raises the total
+	// part-way through. A denominator that grows is honest; one fixed too early is
+	// wrong in the flattering direction, pinning the bar at 100% while work continues.
+	onMembers func(int)
 	// deltas runs parallel to Files and holds each entry's exact contribution to
 	// Summary, so a discarded subtree can be un-counted at any audit level (the
 	// retained per-match detail is trimmed or absent below AuditFull).
@@ -409,6 +427,10 @@ type summaryDelta struct {
 	binarySkip   bool // whether it appended a BinarySkips note
 	notInspected bool // whether it appended a NotInspected note
 	reason       Reason
+	// detail is carried so a rollback can un-count exactly what the record counted:
+	// the file tally skips filename-scrub entries, and both directions must agree or
+	// a rolled-back subtree leaves the total off by the number of renames in it.
+	detail       string
 	residualHits int
 	// retained is how much of the report-wide match budget this entry consumed, so
 	// undoing the entry gives the budget back rather than permanently spending it on
@@ -425,8 +447,15 @@ type summaryDelta struct {
 // a binary skip was a problem to the log and not a problem to HasUnscrubbed. That
 // disagreement is how UTF-16 text left the pipeline unscrubbed while the run reported
 // clean. One function, one answer, both directions.
-func (r *Report) countStatus(status Status, reason Reason, sign int) {
-	r.Summary.FilesTotal += sign
+func (r *Report) countStatus(status Status, reason Reason, detail string, sign int) {
+	// A scrubbed FILENAME files its own entry, and it is right that it does -- the
+	// audit record should show the rename. It is not a FILE, though, and counting it
+	// as one made the same run report "10 of 10" while it was working and "12 files"
+	// in its history, which is exactly the kind of disagreement that makes a reader
+	// stop trusting both numbers. Its matches still count; only the file tally skips it.
+	if detail != DetailFilenameScrubbed {
+		r.Summary.FilesTotal += sign
+	}
 	switch status.Disposition() {
 	case Inspected:
 		r.Summary.FilesInspected += sign
@@ -515,7 +544,7 @@ func (r *Report) Rollback(mark int, path string, status Status, reason Reason, d
 		return
 	}
 	for _, d := range r.deltas[mark:] {
-		r.countStatus(d.status, d.reason, -1)
+		r.countStatus(d.status, d.reason, d.detail, -1)
 		if d.passthrough && len(r.Summary.Passthroughs) > 0 {
 			r.Summary.Passthroughs = r.Summary.Passthroughs[:len(r.Summary.Passthroughs)-1]
 		}
@@ -553,6 +582,32 @@ func (r *Report) OnFile(fn func(FileEntry)) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	r.onFile = fn
+}
+
+// OnMembers registers the members-discovered callback. Same contract as OnFile: it
+// runs under the report lock, so it must be cheap and must not call back in.
+func (r *Report) OnMembers(fn func(int)) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	r.onMembers = fn
+}
+
+// NoteMembers records that n more archive members have been discovered, and reports
+// the running total.
+//
+// Called once per container as it is opened, BEFORE any of its members is scrubbed,
+// which is what makes a denominator available from the first file rather than only
+// once the archive is finished.
+func (r *Report) NoteMembers(n int) {
+	if n <= 0 {
+		return
+	}
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	r.membersSeen += n
+	if r.onMembers != nil {
+		r.onMembers(r.membersSeen)
+	}
 }
 
 // New constructs a Report with the given transparency settings.
@@ -639,11 +694,11 @@ func (r *Report) record(path string, status Status, reason Reason, detail string
 	r.Files = append(r.Files, entry)
 
 	// Summary accounting, mirrored into a delta so it can be undone exactly.
-	delta := summaryDelta{status: status, reason: reason}
+	delta := summaryDelta{status: status, reason: reason, detail: detail}
 	if r.audit != AuditOff {
 		delta.retained = keep
 	}
-	r.countStatus(status, reason, +1)
+	r.countStatus(status, reason, detail, +1)
 
 	// Name every hole, once, in the list the verdict reads. Passthroughs and
 	// BinarySkips are the older split of the same information, kept for reports and
