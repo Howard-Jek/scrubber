@@ -1,7 +1,9 @@
 # The shell scripts run on Linux -- in a container, on a build agent, on the cluster.
-# A Windows checkout without this gives them CRLF, and `#!/usr/bin/env bash` fails
-# with "bash: No such file or directory", which reads as a missing interpreter
-# rather than as a line ending. Found when memory-matrix.sh would not start.
+# Checked out on Windows without this they get CRLF, and the shebang line then ends
+# in a carriage return: the kernel goes looking for an interpreter whose name has a
+# stray control character on the end, and reports "No such file or directory". That
+# reads as a missing interpreter rather than as a line ending, which is why
+# memory-matrix.sh had never once run from a Windows checkout.
 *.sh text eol=lf
 Containerfile text eol=lf
 
