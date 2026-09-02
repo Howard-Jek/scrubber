@@ -36,7 +36,7 @@ import (
 
 // version is the release this binary was built from. It is stamped at build time:
 //
-//	go build -ldflags "-X main.version=0.8.0" ./cmd/scrubberd
+//	go build -ldflags "-X main.version=0.8.3" ./cmd/scrubberd
 //
 // and deploy/Containerfile passes the VERSION build-arg through to exactly that.
 // The default is deliberately "dev" rather than a number: a binary that was built
@@ -398,6 +398,13 @@ func realMain(log *slog.Logger) error {
 		"scratch_declared_bytes", scratchBytes,
 		"scratch_source", scratchSource,
 		"pod_cpus", res.CPUs,
+		// The request, not just GOMAXPROCS. A pod can look like four cores to the
+		// runtime and be promised a tenth of one; the second number is what decides
+		// how long a bundle takes on a busy node.
+		"cpu_request_milli", res.CPURequestMilli,
+		"cpu_limit_milli", res.CPULimitMilli,
+		"cpu_source", res.CPUSource,
+		"expected_full_bundle_drain", expectedDrain(res, wcfg.Limits.MaxTotalBytes),
 		"mem_scale", memScale,
 		// Repeated on this line as well as the startup line above, because this is
 		// the line an operator screenshots when the caps are not what they expected,
@@ -436,15 +443,21 @@ func realMain(log *slog.Logger) error {
 	// nowhere near the cap, and this is the one check whose input is a guess about
 	// hardware rather than a declared resource.
 	if wcfg.ScrubTimeout > 0 {
-		if need := time.Duration(wcfg.Limits.MaxTotalBytes/scrubFloorBytesPerSec) * time.Second; need > wcfg.ScrubTimeout {
-			log.Warn("SCRUB_TIMEOUT may be too short for the largest bundle this pod will accept; "+
-				"an object that exceeds it FAILS and is not retried",
+		rate, rateWhy := drainRate(res)
+		if need := time.Duration(wcfg.Limits.MaxTotalBytes/rate) * time.Second; need > wcfg.ScrubTimeout {
+			log.Warn("SCRUB_TIMEOUT is too short for the largest bundle this pod will accept "+
+				"at the CPU it is guaranteed; an object that exceeds it FAILS and is not retried",
 				"scrub_timeout", wcfg.ScrubTimeout.String(),
 				"max_expand_bytes", wcfg.Limits.MaxTotalBytes,
-				"needed_at_floor_rate", need.String(),
-				"floor_bytes_per_sec", scrubFloorBytesPerSec,
-				"fix", "raise SCRUB_TIMEOUT to at least the needed value, lower MAX_EXPAND_BYTES, "+
-					"or give the pod more CPU; SCRUB_TIMEOUT=0 removes the bound")
+				"needed_at_guaranteed_cpu", need.String(),
+				"assumed_bytes_per_sec", rate,
+				"rate_basis", rateWhy,
+				"cpu_request_milli", res.CPURequestMilli,
+				"cpu_limit_milli", res.CPULimitMilli,
+				"fix", "raise requests.cpu (a scrub is single-threaded, so one core is the most "+
+					"one object can use and anything below that stretches it proportionally), "+
+					"or raise SCRUB_TIMEOUT to at least the needed value, or lower "+
+					"MAX_EXPAND_BYTES; SCRUB_TIMEOUT=0 removes the bound")
 		}
 	} else {
 		log.Warn("SCRUB_TIMEOUT is 0: nothing bounds a scrub. One large or deeply nested "+
@@ -664,6 +677,46 @@ func deriveCaps(res podres.Limits) caps {
 // Returns 1 when the ceiling is unknown, which reproduces exactly the caps that
 // shipped: an undetectable limit must fall back to a measured configuration, not
 // to an extrapolation from a number nobody has.
+// drainRate estimates how fast this pod can actually scrub, in bytes per second,
+// and says what the estimate rests on.
+//
+// The guarantee, not the ceiling. requests.cpu is the share the scheduler promised
+// and the only figure that still holds when the node is busy; limits.cpu is what the
+// pod may burst to when it is not. A pod declaring `requests.cpu: 100m, limits.cpu:
+// 4` is four cores to the Go runtime and a tenth of one under load — a 40x spread in
+// how long a bundle takes, and the slow end is the end that trips a timeout.
+//
+// Capped at one core because the walk is single-threaded: WORKERS is clamped to 1
+// and the Engine is not safe for concurrent Process calls, so a request above 1000m
+// makes one object no faster. It makes the pod steadier under load, which is worth
+// having, but not shorter.
+// expectedDrain is how long a full-sized bundle should take on this pod, rendered
+// for the startup line. It is the number to compare against SCRUB_TIMEOUT, and the
+// number to check first when someone reports that a scrub is taking hours.
+func expectedDrain(res podres.Limits, maxExpand int64) string {
+	if maxExpand <= 0 {
+		return "unknown"
+	}
+	rate, _ := drainRate(res)
+	return (time.Duration(maxExpand/rate) * time.Second).String()
+}
+
+func drainRate(res podres.Limits) (int64, string) {
+	if res.CPURequestMilli <= 0 {
+		return scrubFloorBytesPerSec, "requests.cpu not declared; assuming a squeezed pod"
+	}
+	milli := res.CPURequestMilli
+	if milli > 1000 {
+		milli = 1000
+	}
+	rate := scrubBytesPerCoreSec * milli / 1000
+	if rate < 1 {
+		rate = 1
+	}
+	return rate, fmt.Sprintf("%dm guaranteed of one usable core at %d B/s per core",
+		res.CPURequestMilli, int64(scrubBytesPerCoreSec))
+}
+
 func podScale(memBytes int64) float64 {
 	if memBytes <= 0 {
 		return 1
@@ -790,17 +843,23 @@ const (
 	// that shipped before it existed, and it is a defensible choice for a deployment
 	// with no queue contention -- but it is what lets one bundle run for hours.
 	defaultScrubTimeout = time.Hour
-	// scrubFloorBytesPerSec is the pessimistic drain rate the timeout is checked
-	// against: half the 3.5 MB/s measured on a throttled container, so the check
-	// complains only about a budget that cannot plausibly finish a full-sized bundle
-	// on any pod.
+	// scrubBytesPerCoreSec is how fast one core drains expanded content.
 	//
-	// It has to be half of a MEASURED rate rather than a round pessimistic number.
-	// At 1 MiB/s the default hour looks too short for the default 4 GiB cap and the
-	// shipped configuration warns about itself on every start — which is the failure
-	// the false stall warning in 0.8.1 already taught: a warning that fires on
-	// correct behaviour trains the reader to ignore the real one.
-	scrubFloorBytesPerSec = 7 << 18 // 1.75 MiB/s
+	// Measured, not guessed: 480 MiB of log content through the real matcher took
+	// 59.5s single-threaded on an unthrottled modern core, or 8.4 MB/s. This is set
+	// below that because an OpenShift worker core is usually slower than a developer
+	// one and the number is used to warn, not to promise.
+	//
+	// Per CORE, and one object never uses more than one of them: the walk is
+	// single-threaded and WORKERS is clamped to 1. That is why limits.cpu buys a
+	// single scrub nothing above 1 core, and why the figure that matters for how
+	// long a bundle takes is the pod's CPU REQUEST.
+	scrubBytesPerCoreSec = 6 << 20 // 6 MiB/s
+	// scrubFloorBytesPerSec is the rate assumed when the CPU request is not
+	// declared, so the timeout check still has something to judge against. Roughly a
+	// third of a core at the rate above -- pessimistic, because an undeclared request
+	// is exactly the pod that gets squeezed hardest on a busy node.
+	scrubFloorBytesPerSec = 2 << 20 // 2 MiB/s
 )
 
 // cachedReady wraps a readiness check so concurrent probes share one in-flight

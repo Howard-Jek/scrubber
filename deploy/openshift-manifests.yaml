@@ -358,11 +358,11 @@ spec:
         - name: artifactory-pull   # only if pulling from a private Artifactory repo
       containers:
         - name: scrubberd
-          # Build this with --build-arg VERSION=0.8.2 so the tag and the version the
+          # Build this with --build-arg VERSION=0.8.3 so the tag and the version the
           # process reports are the same string. It is surfaced at /api/version, in
           # the scrubber_build_info metric, in the first startup log line and in the
           # UI header -- an unstamped build reports "dev" rather than guessing.
-          image: <ARTIFACTORY_DOCKER_HOST>/docker-local/scrubberd:0.8.2
+          image: <ARTIFACTORY_DOCKER_HOST>/docker-local/scrubberd:0.8.3
           ports:
             - containerPort: 8080
           envFrom:
@@ -397,6 +397,31 @@ spec:
                   containerName: scrubberd
                   resource: limits.ephemeral-storage
                   divisor: "1"
+            # CPU, in MILLICORES -- note divisor "1m", not "1". The default divisor
+            # is whole cores and it ROUNDS UP, so a container requesting 100m would
+            # be handed "1" and the process would believe it had a full core. The
+            # value arrives as a bare integer ("100"), which is why the variable
+            # names carry the unit.
+            #
+            # The REQUEST is the one that matters. limits.cpu is the burst ceiling
+            # and is what the Go runtime sizes GOMAXPROCS from; requests.cpu is the
+            # share the scheduler actually promised, and it is what still holds when
+            # the node is busy. A scrub is single-threaded, so one object can never
+            # use more than one core however high the limit is -- but it is stretched
+            # in proportion to anything below one core. The startup line reports both,
+            # plus how long a full-sized bundle should take at the guaranteed rate.
+            - name: POD_CPU_REQUEST_MILLI
+              valueFrom:
+                resourceFieldRef:
+                  containerName: scrubberd
+                  resource: requests.cpu
+                  divisor: "1m"
+            - name: POD_CPU_LIMIT_MILLI
+              valueFrom:
+                resourceFieldRef:
+                  containerName: scrubberd
+                  resource: limits.cpu
+                  divisor: "1m"
           volumeMounts:
             - name: policies
               mountPath: /etc/scrubber/policies

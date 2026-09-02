@@ -48,6 +48,15 @@ const unlimited = 1 << 50
 const (
 	envMemoryLimit    = "POD_MEMORY_LIMIT"
 	envEphemeralLimit = "POD_EPHEMERAL_LIMIT"
+	// Named for their units on purpose. The Downward API renders cpu in the
+	// divisor's units, and with divisor "1m" the value arrives as a BARE INTEGER
+	// COUNT OF MILLICORES -- "100", not "100m". A variable called POD_CPU_REQUEST
+	// holding "100" reads as a hundred cores to anyone who has not checked the
+	// manifest, and parsing it that way is a 1000x error in the optimistic
+	// direction. The name carries the unit so neither the code nor the reader has
+	// to guess.
+	envCPURequest = "POD_CPU_REQUEST_MILLI"
+	envCPULimit   = "POD_CPU_LIMIT_MILLI"
 )
 
 // Limits is what the container may use. A zero field means "could not tell",
@@ -76,6 +85,22 @@ type Limits struct {
 	// needs no separate detection here — it is reported so the startup log shows
 	// the whole picture in one place.
 	CPUs int
+	// CPURequestMilli is `requests.cpu` in millicores, or 0 when not declared.
+	//
+	// This, not CPUs, is what a scrub is GUARANTEED. limits.cpu becomes the cgroup
+	// bandwidth ceiling and is what the pod may burst to on an idle node;
+	// requests.cpu becomes its share weight and is what survives a busy one. A pod
+	// declaring `requests.cpu: 100m, limits.cpu: 4` looks like four cores to the Go
+	// runtime and is one tenth of a core when the node is full — a 40x spread in
+	// how long a bundle takes, and the low end is the one an operator gets paged
+	// for.
+	CPURequestMilli int64
+	// CPULimitMilli is `limits.cpu` in millicores, or 0 when not declared. Reported
+	// alongside the request so the startup log shows the spread between what the
+	// pod may use and what it is promised.
+	CPULimitMilli int64
+	// CPUSource names where the CPU figures came from, for the startup log.
+	CPUSource string
 }
 
 // Detect reads the container's limits. It never fails: anything it cannot
@@ -84,7 +109,30 @@ func Detect() Limits {
 	l := Limits{CPUs: runtime.GOMAXPROCS(0)}
 	l.MemoryBytes, l.MemorySource = detectMemory()
 	l.ScratchBytes, l.ScratchSource = detectScratch()
+	l.CPURequestMilli, l.CPULimitMilli, l.CPUSource = detectCPU()
 	return l
+}
+
+// detectCPU reads the declared CPU request and limit.
+//
+// Declared only, like scratch and for the same reason: what a container can measure
+// from the inside is the ceiling (the cgroup bandwidth quota), and the ceiling is
+// not the guarantee. Nothing in the cgroup tree says what share the scheduler
+// promised this pod when the node is contended — cpu.weight is relative to whatever
+// else happens to be running — so a measured fallback would produce an authoritative
+// number that is wrong in the optimistic direction.
+func detectCPU() (req, lim int64, source string) {
+	req, okReq := parseCPUMilli(lookupEnv(envCPURequest))
+	lim, okLim := parseCPUMilli(lookupEnv(envCPULimit))
+	switch {
+	case okReq && okLim:
+		return req, lim, "downward API " + envCPURequest + " + " + envCPULimit
+	case okReq:
+		return req, 0, "downward API " + envCPURequest
+	case okLim:
+		return 0, lim, "downward API " + envCPULimit
+	}
+	return 0, 0, "not declared"
 }
 
 // detectMemory prefers the declared limit over the measured one, then tries cgroup
@@ -128,6 +176,34 @@ func detectScratch() (int64, string) {
 		return n, "downward API " + envEphemeralLimit
 	}
 	return 0, "not declared"
+}
+
+// parseCPUMilli reads a millicore count.
+//
+// MILLICORES, always, whether or not the "m" suffix is present. That is what the
+// manifest's `divisor: "1m"` produces (a bare "100"), and accepting the suffix as
+// well only means an operator who sets the variable by hand in the obvious
+// Kubernetes spelling gets the same answer rather than a silent 1000x.
+//
+// Deliberately NOT accepting a fractional core count. "0.5" would have to mean half
+// a core here and half a millicore under the variable's own name, and there is no
+// reading of that which is safe to guess at: a wrong guess either stretches the
+// expected drain time by 1000x or shrinks it by the same, and one of those makes a
+// pod look healthy that is about to time out every large bundle.
+func parseCPUMilli(s string, present bool) (int64, bool) {
+	if !present {
+		return 0, false
+	}
+	s = strings.TrimSpace(s)
+	s = strings.TrimSuffix(s, "m")
+	if s == "" || s == "max" {
+		return 0, false
+	}
+	n, err := strconv.ParseInt(s, 10, 64)
+	if err != nil || n < 0 {
+		return 0, false
+	}
+	return n, true
 }
 
 // parseMemLimit interprets one byte-valued ceiling, from a cgroup file or from an

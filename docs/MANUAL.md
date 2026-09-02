@@ -678,6 +678,8 @@ Supplied as environment variables, in practice via a ConfigMap plus a Secret.
 | `MAX_OBJECT_BYTES` | *derived* | Ceiling on the uploaded (compressed) object — the only cap that turns an upload away. Derived as 41.7% of `MAX_EXPAND_BYTES`; 1707Mi as shipped. |
 | `SPILL_THRESHOLD` | *derived* | Payloads above this go to `/work` individually. Scaled from the pod's memory (4Mi at 2Gi, 8Mi as shipped), floored at 512Ki. |
 | `SPILL_RESIDENT_MAX` | *derived* | Aggregate in-memory budget. **This is what bounds RSS**, together with `MAX_LEAF_BYTES` — on its own it does not, because the leaf being scrubbed is read back off disk outside this accounting. Scaled from the pod's memory (64Mi at 2Gi, 128Mi as shipped). |
+| `POD_CPU_REQUEST_MILLI` | — | `requests.cpu` in **millicores**, via the Downward API with `divisor: "1m"` (the value arrives as a bare integer). What a scrub is guaranteed, and what the timeout check sizes against. Undeclared falls back to a pessimistic 2 MiB/s. |
+| `POD_CPU_LIMIT_MILLI` | — | `limits.cpu` in millicores. Reported only — a single scrub cannot exceed one core. |
 | `SCRUB_TIMEOUT` | `1h` | Total budget for one object. Past it the walk is abandoned **between members** and the object **fails**, with no output, no report, and the input moved aside rather than retried. The only setting that bounds compute — see [What bounds the scrub](#what-bounds-the-scrub). `0` disables. |
 | `STALL_WARN_AFTER` | `5m` | How long the in-flight object may sit in one phase before the worker logs that it may be stalled. **A log threshold, never a kill** — see [What bounds the scrub](#what-bounds-the-scrub). Zero disables. |
 | `TRANSFER_STALL_TIMEOUT` | `60s` | Abandon an object-storage transfer that has moved **no bytes** for this long. Not a deadline on the transfer. Also bounds metadata calls (10× for listings). Negative disables, restoring an unbounded wait. |
@@ -707,9 +709,9 @@ Supplied as environment variables, in practice via a ConfigMap plus a Secret.
 
 ```sh
 # 1. build + push the image (air-gap: override BASE_*_IMAGE / GOPROXY to Artifactory mirrors)
-podman build -f deploy/Containerfile -t <artifactory>/docker-local/scrubberd:0.8.2 .
-podman push <artifactory>/docker-local/scrubberd:0.8.2
-#    (air-gapped: transfer dist/scrubberd-0.8.0.tar and `podman load -i` on the target)
+podman build -f deploy/Containerfile -t <artifactory>/docker-local/scrubberd:0.8.3 .
+podman push <artifactory>/docker-local/scrubberd:0.8.3
+#    (air-gapped: transfer dist/scrubberd-0.8.3.tar and `podman load -i` on the target)
 
 # 2. prereqs: MinIO creds Secret + named-policy ConfigMap
 oc create secret generic scrubber-secret \
@@ -754,7 +756,7 @@ instead and the kubelet evicts the pod mid-object, with no report at all.
 
 The running build is reported three ways, so "which version is deployed?" can be
 answered from wherever the question came up: `GET /api/version` returns
-`{"version":"0.8.0"}`, the `scrubber_build_info` metric carries it as a label, and
+`{"version":"0.8.3"}`, the `scrubber_build_info` metric carries it as a label, and
 the UI shows it as a chip in the header. All three read the same string, stamped at
 build time with `-ldflags "-X main.version=..."` from the `VERSION` build-arg in
 `deploy/Containerfile`. **Keep that arg equal to the image tag** — a version that
@@ -1063,6 +1065,32 @@ The failure text says where the deadline landed — the phase, how many files of
 many were finished, the last one completed, how long it had gone without finishing one
 — then what happened to the object and what to change. Member paths in it are redacted
 the same way `current_file` is, because `/api/status` is unauthenticated.
+
+**What the pod tells it, and what it does with each.**
+
+| declared | detected from | what it sizes |
+| --- | --- | --- |
+| `limits.memory` | Downward API, then cgroup | `MAX_LEAF_BYTES` and the peak-RSS gate |
+| `limits.ephemeral-storage` | Downward API, or `SCRATCH_BYTES` | `MAX_EXPAND_BYTES`, and through it `MAX_OBJECT_BYTES` |
+| `requests.cpu` | Downward API (`divisor: 1m`) | the expected drain time, and whether `SCRUB_TIMEOUT` can cover it |
+| `limits.cpu` | Downward API, and GOMAXPROCS | reported only |
+
+`limits.cpu` is reported rather than used, and that is not an oversight. A scrub is
+single-threaded — `WORKERS` is clamped to 1 and the engine is not safe for concurrent
+`Process` calls — so **one object can never use more than one core however high the
+limit is.** Raising `limits.cpu` above `1` makes the pod steadier under load; it does
+not make a bundle finish sooner.
+
+What does move the drain time is `requests.cpu`, because that is the share the
+scheduler promised and the only one that still holds when the node is busy. A pod
+declaring `requests.cpu: 100m, limits.cpu: 4` looks like four cores to the Go runtime
+and is a tenth of one under contention — a 40x spread, and the slow end is the end
+that trips a timeout. The startup line reports both figures and
+`expected_full_bundle_drain`, which is the number to compare against `SCRUB_TIMEOUT`:
+
+```
+cpu_request_milli=100 cpu_limit_milli=4000 expected_full_bundle_drain=1h53m46s
+```
 
 **Sizing it.** From measurement, not patience. The matcher runs at roughly **8 MB/s** of
 expanded content on one unthrottled modern core and about **3.5 MB/s** on a container

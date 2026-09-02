@@ -10,6 +10,69 @@ For what to verify on your own cluster after taking a new image, see
 
 ---
 
+## 0.8.3 — size the timeout from the CPU the pod is promised, not the one it may borrow
+
+Prompted by a real deployment: `requests.cpu: 100m`, `limits.cpu: 4`,
+`requests.memory: 256Mi`, `limits.memory: 8Gi`, and a reasonable expectation that the
+service would read all four and work around them. It read two.
+
+**CPU was detected and then ignored.** `podres.CPUs` was GOMAXPROCS, reported on the
+startup line and used by nothing. Worse, GOMAXPROCS follows `limits.cpu` — the burst
+ceiling — while what a scrub actually gets on a busy node is `requests.cpu`. For the
+deployment above that is the difference between four cores and a tenth of one, a 40x
+spread in how long a bundle takes, and the slow end is the end that trips the timeout
+0.8.2 just introduced. `SCRUB_TIMEOUT`'s sizing check used a flat 1.75 MB/s and would
+have stayed silent while every large bundle on that pod failed.
+
+`requests.cpu` and `limits.cpu` now arrive through the Downward API and the check is
+computed from the guarantee. On the deployment above:
+
+```
+cpu_request_milli=100  cpu_limit_milli=4000  expected_full_bundle_drain=1h53m46s
+WARN  SCRUB_TIMEOUT is too short for the largest bundle this pod will accept at the
+      CPU it is guaranteed ... needed_at_guaranteed_cpu=1h53m46s scrub_timeout=1h0m0s
+```
+
+Raising `requests.cpu` to `1` takes the same bundle to **11m22s** and silences it.
+Raising it beyond `1` does nothing for a single object: the walk is single-threaded and
+`WORKERS` is clamped to 1, so **`limits.cpu` above one core cannot make a bundle
+finish sooner** — it only makes the pod steadier when the node is busy. That is now
+stated on the startup line, in the manual and in the manifest, because "give it more
+CPU" is the first thing anyone tries and most of it goes nowhere.
+
+> **Units.** The Downward API renders cpu in the divisor's units, and the default
+> divisor is whole cores **rounded up** — a container requesting `100m` is handed
+> `"1"`. The manifest sets `divisor: "1m"`, which yields a bare `"100"`. The variables
+> are therefore named `POD_CPU_REQUEST_MILLI` / `POD_CPU_LIMIT_MILLI`: a variable
+> called `POD_CPU_REQUEST` holding `"100"` reads as a hundred cores, and parsing it
+> that way is a 1000x error in the flattering direction. This was written the wrong
+> way round first and caught by reading the derived numbers back.
+
+**The memory side, measured rather than assumed.** `scripts/memory-matrix.sh` had
+never actually been run — it needs Linux, a real MinIO and real disk. Run now against
+`limits.memory: 8Gi` / 14Gi ephemeral, both worst-case shapes end to end:
+
+| shape | | matches | time | peak RSS |
+|---|---|---|---|---|
+| tiny (90,000 members, 352 MiB) | scrubbed | 18,900,000 | 153s | 981 MiB |
+| big (50 × 10 MiB incompressible) | scrubbed | 169,481 | 173s | 1060 MiB |
+
+**1060 MiB peak against a 4915 MiB target, 7132 MiB headroom, zero temp files leaked.**
+The `est_peak_rss_bytes` the service prints for that pod is 3.75 GiB — it errs high on
+purpose, and it errs high by about 3.5x, which is worth knowing before sizing
+`requests.memory` from it.
+
+**`-race` run, finally.** Also never run: the dev box has no cgo toolchain. Clean
+across every package on Linux, including the timer goroutine 0.8.2 added.
+
+**Shell scripts were unrunnable from a Windows checkout.** No `.gitattributes`, so
+every `.sh` got CRLF and `#!/usr/bin/env bash` failed with *"bash: No such file or
+directory"* — which reads as a missing interpreter, not a line ending. That is why the
+memory matrix had never run here. Added, covering `*.sh`, `Containerfile` and the
+YAML.
+
+---
+
 ## 0.8.2 — a scrub nothing could stop, and a progress bar that could never finish
 
 Both found from one report: an object sitting at three hours, and a bar that had been

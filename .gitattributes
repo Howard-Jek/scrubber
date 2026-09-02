@@ -1,0 +1,10 @@
+# The shell scripts run on Linux -- in a container, on a build agent, on the cluster.
+# A Windows checkout without this gives them CRLF, and `#!/usr/bin/env bash` fails
+# with "bash: No such file or directory", which reads as a missing interpreter
+# rather than as a line ending. Found when memory-matrix.sh would not start.
+*.sh text eol=lf
+Containerfile text eol=lf
+
+# Same reasoning for anything else read by a Linux tool rather than by an editor.
+*.yaml text eol=lf
+*.yml text eol=lf
