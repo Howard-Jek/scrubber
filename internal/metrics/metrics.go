@@ -144,6 +144,21 @@ func RegisterQueue(reg prometheus.Registerer, depth, inflight func() float64) {
 // healthy. This one is read at scrape time and keeps climbing.
 //
 // Alert on it above the slowest scrub you are willing to call normal.
+// RegisterBuildInfo publishes the running version as a labelled constant gauge.
+//
+// The value is always 1; the information is in the label. That is the standard
+// build-info shape (kube-state-metrics, node_exporter, Go's own collector) and it
+// exists so a dashboard can join version onto any other series -- "did the drain
+// rate change when 0.8.0 rolled out?" -- and so "which version is in this
+// namespace?" is a query rather than an oc exec.
+func RegisterBuildInfo(reg prometheus.Registerer, version string) {
+	reg.MustRegister(prometheus.NewGaugeFunc(prometheus.GaugeOpts{
+		Name:        "scrubber_build_info",
+		Help:        "Build information. Always 1; read the version label.",
+		ConstLabels: prometheus.Labels{"version": version},
+	}, func() float64 { return 1 }))
+}
+
 func RegisterProgress(reg prometheus.Registerer, phaseSeconds func() float64) {
 	reg.MustRegister(prometheus.NewGaugeFunc(prometheus.GaugeOpts{
 		Name: "scrubber_inflight_phase_seconds",

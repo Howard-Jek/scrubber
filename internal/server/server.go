@@ -68,7 +68,12 @@ type Deps struct {
 	// Nudge tells the worker that new work may have landed, so an object uploaded
 	// moments ago is discovered on the next second rather than the next poll
 	// interval. Optional; must be non-blocking and safe from any goroutine.
-	Nudge         func()
+	Nudge func()
+	// Version is the running build, surfaced at GET /api/version and in the UI
+	// footer. Empty renders as "unknown" rather than as a blank, so a build that
+	// forgot the stamp is visibly unstamped instead of looking like a missing
+	// element.
+	Version       string
 	DefaultPolicy string // policy shown/edited in the UI
 	AllowEdit     bool   // permit PUT /api/policy from the UI
 	InputBucket   string
@@ -195,6 +200,7 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("/api/history", s.apiHistory)
 	mux.HandleFunc("/api/report", s.apiReport)
 	mux.HandleFunc("/api/queue", s.apiQueue)
+	mux.HandleFunc("/api/version", s.apiVersion)
 	mux.HandleFunc("/api/cancel", s.apiCancel)
 	// Static front page.
 	mux.HandleFunc("/", s.index)
@@ -204,6 +210,21 @@ func (s *Server) Handler() http.Handler {
 func (s *Server) healthz(w http.ResponseWriter, _ *http.Request) {
 	w.WriteHeader(http.StatusOK)
 	_, _ = w.Write([]byte("ok"))
+}
+
+// apiVersion answers "which build is this?" without a shell into the pod.
+//
+// Deliberately data-free and unauthenticated, like /healthz: it is safe on the
+// external Route, and the whole value of a version endpoint is that it can be read
+// from wherever the confusion started.
+func (s *Server) apiVersion(w http.ResponseWriter, _ *http.Request) {
+	v := s.d.Version
+	if v == "" {
+		// An unstamped build must say so rather than render as an empty string,
+		// which in a UI footer is indistinguishable from a missing element.
+		v = "unknown"
+	}
+	writeJSON(w, map[string]any{"version": v})
 }
 
 func (s *Server) readyz(w http.ResponseWriter, _ *http.Request) {

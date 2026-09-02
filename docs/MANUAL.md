@@ -20,6 +20,7 @@ behind it, sizing and memory, the service, metrics, the web UI, and benchmarking
   - [Web front page](#web-front-page)
 - [Updating the default policy and presets](#updating-the-default-policy-and-presets)
 - [Benchmarking](#benchmarking)
+- [Nothing bounds the scrub itself](#nothing-bounds-the-scrub-itself)
 - [Troubleshooting by symptom](#troubleshooting-by-symptom)
 - [Notes and limitations](#notes-and-limitations)
 
@@ -677,7 +678,7 @@ Supplied as environment variables, in practice via a ConfigMap plus a Secret.
 | `MAX_OBJECT_BYTES` | *derived* | Ceiling on the uploaded (compressed) object — the only cap that turns an upload away. Derived as 41.7% of `MAX_EXPAND_BYTES`; 1707Mi as shipped. |
 | `SPILL_THRESHOLD` | *derived* | Payloads above this go to `/work` individually. Scaled from the pod's memory (4Mi at 2Gi, 8Mi as shipped), floored at 512Ki. |
 | `SPILL_RESIDENT_MAX` | *derived* | Aggregate in-memory budget. **This is what bounds RSS**, together with `MAX_LEAF_BYTES` — on its own it does not, because the leaf being scrubbed is read back off disk outside this accounting. Scaled from the pod's memory (64Mi at 2Gi, 128Mi as shipped). |
-| `STALL_WARN_AFTER` | `5m` | How long the in-flight object may sit in one phase before the worker logs that it may be stalled. A log threshold, never a kill. Zero disables. |
+| `STALL_WARN_AFTER` | `5m` | How long the in-flight object may sit in one phase before the worker logs that it may be stalled. **A log threshold, never a kill** — see [Nothing bounds the scrub itself](#nothing-bounds-the-scrub-itself). Zero disables. |
 | `TRANSFER_STALL_TIMEOUT` | `60s` | Abandon an object-storage transfer that has moved **no bytes** for this long. Not a deadline on the transfer. Also bounds metadata calls (10× for listings). Negative disables, restoring an unbounded wait. |
 | `ALLOW_CANCEL` | `true` | Enable `POST /api/cancel`. A cancel must still present the token this server minted for that key at upload time. |
 | `ALLOW_CANCEL_ANY` | `false` | Drop the token requirement, so any caller can withdraw any key. **Do not enable without real authentication in front of the Route** — `/api/queue` and `/api/history` both publish live input keys, so this turns a two-line loop into a durable evacuation of every user's work. It exists because clearing *somebody else's* stuck object is the operator's real need. |
@@ -750,6 +751,15 @@ instead and the kubelet evicts the pod mid-object, with no report at all.
 
 ### Metrics
 
+The running build is reported three ways, so "which version is deployed?" can be
+answered from wherever the question came up: `GET /api/version` returns
+`{"version":"0.8.0"}`, the `scrubber_build_info` metric carries it as a label, and
+the UI shows it as a chip in the header. All three read the same string, stamped at
+build time with `-ldflags "-X main.version=..."` from the `VERSION` build-arg in
+`deploy/Containerfile`. **Keep that arg equal to the image tag** — a version that
+disagrees with the tag answers the question wrongly, which is worse than the
+`dev` an unstamped build honestly reports.
+
 `/metrics` exposes, alongside the per-object counters (`scrubber_objects_total{status}`,
 `scrubber_matches_total`, `scrubber_passthrough_total`, `scrubber_errors_total`,
 `scrubber_bytes_in_total`, `scrubber_bytes_out_total`, `scrubber_process_seconds`):
@@ -764,6 +774,7 @@ instead and the kubelet evicts the pod mid-object, with no report at all.
 | `scrubber_discovery_failures_total` | Failed listings of the input bucket. **Alert on this** — rising steadily while every per-object counter stays flat means no work is being discovered at all, and the service looks idle rather than broken |
 | `scrubber_queue_wait_seconds` | Arrival → start of scrubbing |
 | `scrubber_object_latency_seconds` | Arrival → finished; what a user actually waits |
+| `scrubber_build_info{version}` | Always 1; the running build is in the label. Join it onto any other series to answer "did this change when 0.8.0 rolled out?", and query it to answer "which version is in this namespace?" without an `oc exec` |
 | `scrubber_inflight_phase_seconds` | Seconds the in-flight object has spent in its current phase, 0 when idle. **The series that separates a slow object from a wedged one** — neither probe can, since `/healthz` answers 200 whatever the worker is doing and `/readyz` only says the backend is reachable |
 
 `scrubber_process_seconds` starts counting only once an object reaches the front of the
@@ -1015,6 +1026,33 @@ overrun the volume where the pod would be evicted.
 
 ---
 
+## Nothing bounds the scrub itself
+
+Worth stating plainly, because the timeouts have names that sound like they cover
+it and they do not:
+
+| Setting | What it bounds | Kills a slow scrub? |
+| --- | --- | --- |
+| `TRANSFER_STALL_TIMEOUT` | one object-storage transfer that has moved **no bytes** | no |
+| `LIST_TIMEOUT` | one bucket listing | no |
+| `API_STORAGE_BUDGET` | the storage time one HTTP request may spend | no |
+| `STALL_WARN_AFTER` | nothing — it **only logs** | no |
+
+All four bound **I/O**. None bounds **compute**. The walk takes no context, so a
+bundle that is expanding and scrubbing runs to completion however long that takes;
+`Engine.Abort` is the only thing that stops it, and the only thing wired to Abort is
+an operator pressing **Withdraw**. That is deliberate — killing a scrub mid-flight
+destroys work, and how long is too long depends on the bundle, which the process
+does not know.
+
+The consequence to plan for: **one slow object holds the queue.** The consumer is
+single and strictly FCFS, so everything behind it waits. Withdraw is the escape
+hatch, and `scrubber_inflight_phase_seconds` is the series to alert on.
+
+Note also that a transfer trickling bytes slowly never trips the stall guard — the
+guard fires on *no* movement, not on *slow* movement, because a large object over a
+congested link legitimately takes minutes.
+
 ## Troubleshooting by symptom
 
 Sizing problems are easier to reason about forwards than backwards, and an operator
@@ -1053,6 +1091,24 @@ estimate crosses 60% of `limits.memory`. Raise `limits.memory` or lower the cap.
 Read the reason code on the report, and note that the three size caps have different
 blast radii — see [the blast-radius table](#the-compressed-object-ceiling). Nothing errored, so error counters
 will not show it; alert on `scrubber_files_not_inspected_total` by reason.
+
+**A bundle has been "Scrubbing… N files" for hours and the bar will not move.**
+First, read the bar as decoration: it is a log curve over `files_done`, capped well
+short of full, because the total file count is unknown until the walk ends and there
+is no honest fraction to draw. Before v0.8.0 it reached its 95% ceiling at 78 files,
+so any real bundle sat at "92%" for the whole run and looked wedged.
+
+The real signals are on the same card: elapsed time, the file count, and the file
+being scrubbed right now. If the count is advancing, it is slow, not stuck — and the
+card says so. If it has not advanced, the card says **"no new file in …"**, which is
+the reading that distinguishes the two.
+
+A count that is genuinely stuck means one member is taking that long. Check
+`scrubber_files_not_inspected_total{reason="leaf-cap"}`: before v0.8.0 nothing
+bounded a single file, so one very large log could hold the queue indefinitely while
+the matcher worked through it and the GC thrashed on three or four copies of it.
+`MAX_LEAF_BYTES` is what turns that into a flagged passthrough. And note that no
+timeout will end it — see [Nothing bounds the scrub itself](#nothing-bounds-the-scrub-itself).
 
 **The caps are not what the manifest says.** Read `scratch_source` in the startup
 `resource limits` line. `default (undeclared)` means neither `SCRATCH_BYTES` nor
