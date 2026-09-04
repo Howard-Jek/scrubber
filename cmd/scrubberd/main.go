@@ -36,7 +36,7 @@ import (
 
 // version is the release this binary was built from. It is stamped at build time:
 //
-//	go build -ldflags "-X main.version=0.8.3" ./cmd/scrubberd
+//	go build -ldflags "-X main.version=0.8.4" ./cmd/scrubberd
 //
 // and deploy/Containerfile passes the VERSION build-arg through to exactly that.
 // The default is deliberately "dev" rather than a number: a binary that was built

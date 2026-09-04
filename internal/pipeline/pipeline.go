@@ -435,13 +435,12 @@ func (e *Engine) scrubMemberName(origPath, name string, inBytes int64) (string, 
 // materialises the answer. When nothing changed it returns the caller's original
 // slice untouched, so byte-for-byte fidelity is exact rather than reconstructed.
 func (e *Engine) Process(path string, data []byte, depth int) []byte {
-	in, err := spill.FromBytes(data, e.Limits.Spill)
-	if err != nil {
-		// Cannot even stage the input: emit it verbatim rather than fail.
-		e.Report.Record(path, report.StatusPassthrough,
-			fmt.Sprintf("could not stage payload: %v", err), len(data), len(data), nil)
-		return data
-	}
+	// The caller's bytes are already whole in memory -- that is what this entry
+	// point means -- so wrap them rather than copy them out to scratch and read
+	// them back. FromBytes spilled every input above the threshold, and Head and
+	// Bytes then read it off disk again, for nothing.
+	mark := e.Report.Mark()
+	in := spill.Wrap(data)
 	defer in.Close()
 	defer e.Release()
 
@@ -454,9 +453,13 @@ func (e *Engine) Process(path string, data []byte, depth int) []byte {
 	if err != nil {
 		// The scrubbed result exists but cannot be read back. Returning the original
 		// is the safe answer, but the matches recorded for it never reached an
-		// output, so they must not stay counted.
-		e.Report.Record(path, report.StatusPassthrough,
-			fmt.Sprintf("could not read back scrubbed payload: %v", err), len(data), len(data), nil)
+		// output, so they must not stay counted -- and this is a hole, so it needs
+		// the reason code every other hole carries. Recording it through Record gave
+		// it ReasonUnclassified, which is the tripwire the corpus asserts nobody
+		// trips; the corpus never caught it because it drives ProcessBlob directly.
+		e.Report.Rollback(mark, path, report.StatusPassthrough, report.ReasonScratch,
+			fmt.Sprintf("could not read the scrubbed payload back from scratch storage (%v); "+
+				"passed through unchanged and NOT scrubbed", err), len(data), len(data))
 		return data
 	}
 	return b

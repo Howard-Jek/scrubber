@@ -84,11 +84,18 @@ data:
   # or a leaked temp file. The matches gate is the one a memory check cannot replace:
   # a cap set too low stops bounding anything and starts silently emitting unscrubbed
   # files, which looks like a pass if you only watch memory.
-  WORKERS: "1"                    # queue concurrency. Kept for config compatibility
-                                  # and CLAMPED to 1 -- a higher value is ignored
-                                  # (with a warning) because concurrent scrubs on a
-                                  # single CPU only slow each other down and would
-                                  # multiply the memory budget above.
+  # How many objects are scrubbed AT ONCE, bounded at 8. Not a free throughput dial:
+  # each consumer holds its own leaf in heap and its own expansion on /work, so
+  # MAX_EXPAND_BYTES and MAX_LEAF_BYTES are DIVIDED by this number. Raising it trades
+  # the size of the largest bundle for the number in flight.
+  #
+  # The stronger reason to raise it is isolation. The walk is only cooperatively
+  # interruptible, so an object blocked in a syscall cannot be taken away from its
+  # consumer -- and with a single consumer that wedges the entire queue behind it.
+  #
+  # replicas: 1 remains a CORRECTNESS requirement whatever this is: the queue lives in
+  # the pod, so two pods polling one bucket would double-process.
+  WORKERS: "1"
   QUEUE_MAX: "10000"              # cap on the in-memory pending set. Anything beyond
                                   # it stays in the bucket and is picked up later;
                                   # the service warns when it truncates.
@@ -97,6 +104,35 @@ data:
   # kill: a large bundle legitimately spends minutes in one phase. Pair it with an
   # alert on scrubber_inflight_phase_seconds, which is the same signal as a metric.
   STALL_WARN_AFTER: "5m"
+  # Abandon an object that publishes NO progress for this long, so one wedged bundle
+  # cannot hold a consumer forever. "0" disables it, which is the default.
+  #
+  # Not SCRUB_TIMEOUT: that is a TOTAL budget and fires on healthy work that is merely
+  # large. This fires only when nothing has moved, so it can be set far tighter. Every
+  # long stretch of the walk publishes a heartbeat -- each member, each container as it
+  # opens, both object-storage transfers every 8MiB, and the archive rebuild every 4MiB
+  # -- so "no progress" means stopped rather than busy. The one stretch that stays
+  # silent is expanding a container before its first member is scrubbed, which is
+  # local-disk bound; do not set this below about 10m without measuring that.
+  #
+  # It is cooperative. An object blocked in a syscall never reaches a poll site and
+  # cannot be abandoned at all, which is the other reason to raise WORKERS.
+  STALL_ABORT_AFTER: "0"
+
+  # Report detail. "full" retains every matched CLEARTEXT value, so report size grows
+  # with match count and no cap bounds it -- keep "counts" unless investigating.
+  AUDIT_LEVEL: "counts"
+  # Where a result lands when content the scrub did NOT inspect turns out to contain
+  # policy matches, or could not be read at all. Empty disables diversion and leaves
+  # only the flag, which is not advised: a flag helps only somebody who reads it.
+  REVIEW_PREFIX: "review/"
+  # Bytes the residual scan may read per object. Negative disables it -- do not. It is
+  # the only check that does not depend on the pipeline's own classification.
+  RESIDUAL_BUDGET: "64Mi"
+  # Re-scan every scrubbed file to confirm the policy no longer matches it. Roughly
+  # doubles matcher work (~70% of the drain rate, measured); the failure it guards is
+  # rejected at policy load instead.
+  VERIFY_OUTPUT: "false"
   # The ONLY bound on the scrub itself. Past this, the object is abandoned and
   # FAILS -- no output, no report, and the input is moved aside rather than
   # retried, because a bundle that needs longer than the budget needs longer on
@@ -358,11 +394,11 @@ spec:
         - name: artifactory-pull   # only if pulling from a private Artifactory repo
       containers:
         - name: scrubberd
-          # Build this with --build-arg VERSION=0.8.3 so the tag and the version the
+          # Build this with --build-arg VERSION=0.8.4 so the tag and the version the
           # process reports are the same string. It is surfaced at /api/version, in
           # the scrubber_build_info metric, in the first startup log line and in the
           # UI header -- an unstamped build reports "dev" rather than guessing.
-          image: <ARTIFACTORY_DOCKER_HOST>/docker-local/scrubberd:0.8.3
+          image: <ARTIFACTORY_DOCKER_HOST>/docker-local/scrubberd:0.8.4
           ports:
             - containerPort: 8080
           envFrom:

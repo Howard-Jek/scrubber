@@ -176,11 +176,17 @@ At the edges: the UI requires an explicit acknowledgement before it will downloa
 binary skips, so it was silent on exactly the case it exists for), and `--fail-on-risky`
 is the narrower gate for pipelines that legitimately carry images.
 
-> **One honest limit.** When the expansion budget refuses to decompress a container, the
-> residual scan sees only compressed bytes and finds nothing — so a too-large bundle
-> reports `incomplete`, not `incomplete-risky`, however much it contains. Refusing to
-> expand is precisely what stops anything looking inside. The hole is still named with
-> reason `expansion-budget`.
+> **A hole nobody could see into is risky by itself.** The scan decompresses now — gzip,
+> zlib, bzip2, xz, zstd, and zip entries — so a bundle the *walk* refused to expand is
+> still read by the *net*, within its own budget, and escalates on what it finds. When a
+> recognised container yields nothing decodable at all — encrypted, an unsupported codec,
+> a stream cut off before its content — the run is `incomplete-risky` on that basis alone
+> and is diverted to `review/`. A clean scan of something nobody could open is the absence
+> of a scan, not a reassurance.
+>
+> Until 0.8.4 this read the other way: the scan was handed the compressed bytes, found
+> nothing at any stride, and a too-large or password-protected bundle was filed as merely
+> `incomplete` beside genuinely clean work.
 
 > **The narrow hole, for contrast.** A file above `MAX_LEAF_BYTES` (the per-file cap; see
 > [Sizing the pod](#sizing-the-pod)) is skipped with reason `leaf-cap`, and *only that
@@ -582,7 +588,13 @@ Three things worth taking from this:
 > Watch `scrubber_files_not_inspected_total{reason="leaf-cap"}` for individual files being
 > turned away, and `scrubber_objects_total{status="too_large"}` for whole uploads.
 
-`WORKERS` is retained for configuration compatibility but is **clamped to 1**; a higher
+`WORKERS` sets how many objects are scrubbed at once (bounded at 8). It is not a free
+throughput dial — the caps are divided by it, so more objects in flight means a smaller
+largest bundle. Its other purpose is isolation: the walk is only cooperatively
+interruptible, so an object blocked in a syscall cannot be taken away from its consumer,
+and with a single consumer that wedges the whole queue behind it.
+
+Historical note, since the old text said otherwise: `WORKERS` was a no-op before 0.8.4. A higher
 value is ignored with a warning. Concurrent scrubs on a single CPU do not add throughput,
 and they multiply both budgets above.
 
@@ -667,7 +679,13 @@ Supplied as environment variables, in practice via a ConfigMap plus a Secret.
 | `PREFIX_POLICY_MAP` | — | JSON object mapping key prefix → policy name. |
 | `PROCESSED_ACTION` | `move` | `move` (to `processed/`) or `delete`. |
 | `POLL_INTERVAL` | `15s` | Discovery interval. Does **not** govern drain rate. |
-| `WORKERS` | `1` | Clamped to 1; higher values warn and are ignored. |
+| `WORKERS` | `1` | Objects scrubbed concurrently, bounded at 8. `MAX_EXPAND_BYTES` and `MAX_LEAF_BYTES` are **divided** by it, so raising it trades bundle size for parallelism. `replicas: 1` remains a correctness requirement regardless. |
+| `STALL_ABORT_AFTER` | `0` (off) | Abandon an object that publishes **no** progress for this long, so one wedged bundle cannot hold a consumer forever. Not `SCRUB_TIMEOUT`: that is a total budget and fires on healthy work that is merely large, while this fires only when nothing has moved, so it can be set far tighter. Cooperative — an object blocked in a syscall never reaches a poll site. |
+| `PROCESSED_PREFIX` | `processed/` | Where a finished input is moved under `PROCESSED_ACTION=move`. |
+| `JOBS_HISTORY` | `200` | In-memory job records kept. A cache, not the record of truth — status falls back to object storage. |
+| `SCRATCH_RECLAIM` | `true` | Sweep temp files orphaned by a previous process at startup. Safe only at `replicas: 1`, which is required anyway. |
+| `ENSURE_BUCKETS` | `false` | Create the buckets at startup if absent. Wants bucket-creation rights the service does not otherwise need. |
+| `MINIO_REGION` | — | Only if your S3 endpoint requires one. |
 | `QUEUE_MAX` | `10000` | Cap on the in-memory pending set; the service warns when it truncates. |
 | `FINALIZE_GRACE` | `15s` | On shutdown, how long a finished object may keep writing its output. Keep inside `terminationGracePeriodSeconds`. |
 | `POD_MEMORY_LIMIT` | — | Downward API `limits.memory` in bytes (`divisor: "1"`). Preferred over the cgroup because it is the number the operator wrote. Governs the memory-scaled caps only. |
@@ -709,9 +727,9 @@ Supplied as environment variables, in practice via a ConfigMap plus a Secret.
 
 ```sh
 # 1. build + push the image (air-gap: override BASE_*_IMAGE / GOPROXY to Artifactory mirrors)
-podman build -f deploy/Containerfile -t <artifactory>/docker-local/scrubberd:0.8.3 .
-podman push <artifactory>/docker-local/scrubberd:0.8.3
-#    (air-gapped: transfer dist/scrubberd-0.8.3.tar and `podman load -i` on the target)
+podman build -f deploy/Containerfile -t <artifactory>/docker-local/scrubberd:0.8.4 .
+podman push <artifactory>/docker-local/scrubberd:0.8.4
+#    (air-gapped: transfer dist/scrubberd-0.8.4.tar and `podman load -i` on the target)
 
 # 2. prereqs: MinIO creds Secret + named-policy ConfigMap
 oc create secret generic scrubber-secret \
@@ -756,7 +774,7 @@ instead and the kubelet evicts the pod mid-object, with no report at all.
 
 The running build is reported three ways, so "which version is deployed?" can be
 answered from wherever the question came up: `GET /api/version` returns
-`{"version":"0.8.3"}`, the `scrubber_build_info` metric carries it as a label, and
+`{"version":"0.8.4"}`, the `scrubber_build_info` metric carries it as a label, and
 the UI shows it as a chip in the header. All three read the same string, stamped at
 build time with `-ldflags "-X main.version=..."` from the `VERSION` build-arg in
 `deploy/Containerfile`. **Keep that arg equal to the image tag** — a version that
