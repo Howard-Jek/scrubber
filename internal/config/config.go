@@ -30,6 +30,11 @@ type Config struct {
 	Literals           []Term   `json:"literals"`
 	Regex              []Term   `json:"regex"`
 	Presets            []string `json:"presets"`
+	// PresetReplacements overrides the label a named preset writes. It exists
+	// because a preset's label can itself match another preset: "[IPV4]" is a word
+	// with a digit in it, which is exactly the shape the hostname preset looks for,
+	// so a policy naming both could not load. Every key must also appear in Presets.
+	PresetReplacements map[string]string `json:"preset_replacements"`
 }
 
 // Load reads, validates and compiles the terms file at path.
@@ -100,20 +105,33 @@ func (cfg *Config) Compile() (*scrub.Matcher, error) {
 		})
 	}
 
+	enabled := map[string]bool{}
 	for _, name := range cfg.Presets {
 		p, ok := presets[name]
 		if !ok {
 			return nil, fmt.Errorf("unknown preset %q (available: %s)", name, availablePresets())
 		}
+		enabled[name] = true
 		rule := scrub.Rule{
 			ID:          "preset:" + name,
 			Replacement: p.replacement,
 			Pattern:     p.pattern,
 		}
+		if override, ok := cfg.PresetReplacements[name]; ok {
+			if override == "" {
+				return nil, fmt.Errorf("preset_replacements[%q]: empty replacement", name)
+			}
+			rule.Replacement = override
+		}
 		if p.valid != nil {
 			rule.SetValidator(p.valid)
 		}
 		rules = append(rules, rule)
+	}
+	for name := range cfg.PresetReplacements {
+		if !enabled[name] {
+			return nil, fmt.Errorf("preset_replacements names %q, which is not in presets", name)
+		}
 	}
 
 	if len(rules) == 0 {

@@ -13,16 +13,28 @@
 // getting those wrong. A UTF-16 log misfiled as binary still contains a recognisable
 // address; this finds it.
 //
+// It does, however, decompress. A refused .tar.gz used to be scanned as gzip bytes,
+// which contain no text at any stride, so the one shape the pipeline most needed a
+// second opinion on -- a compressed bundle it had declined to open -- was the one
+// shape the net could not see into. The scan now unwraps gzip, zlib, bzip2, xz and
+// zstd, and walks zip entries, before extracting text; a payload that is a
+// recognised container and yields nothing decodable is reported as opaque, which is
+// the verdict's cue that "nothing found" here means "could not look".
+//
 // The result is a signal, not a verdict: "the tool skipped this and it demonstrably
 // contains the sort of thing the tool exists to remove — look at it". False positives
 // on genuine binary are possible and acceptable at that strength.
 package residual
 
 import (
+	"archive/zip"
+	"bufio"
 	"io"
 	"sort"
 	"strings"
 
+	"github.com/howard/scrubber/internal/archive"
+	"github.com/howard/scrubber/internal/detect"
 	"github.com/howard/scrubber/internal/scrub"
 	"github.com/howard/scrubber/internal/spill"
 )
@@ -39,6 +51,9 @@ const (
 	chunkSize = 64 << 10
 	// alignment is the widest code unit extraction handles (UTF-32).
 	alignment = 4
+	// maxNesting bounds how many compression layers the scan will unwrap. Two is a
+	// .tar.gz inside a zip; anything deeper is not a shape real bundles take.
+	maxNesting = 3
 )
 
 // Result is what a scan found.
@@ -52,6 +67,13 @@ type Result struct {
 	// Truncated marks a payload larger than the budget, so a zero result reads as
 	// "nothing found in the first N bytes" rather than "nothing here".
 	Truncated bool
+	// Decoded is how many bytes the matcher actually saw, after any decompression.
+	Decoded int64
+	// Opaque reports that the payload is a recognised compressed or archive format
+	// from which nothing could be decoded -- encrypted, an unsupported method, a
+	// header without a body. A clean result is then no reassurance at all, and the
+	// verdict treats it accordingly.
+	Opaque bool
 }
 
 // Summary renders the labels as a stable, sorted, disclosure-safe string.
@@ -89,7 +111,8 @@ func itoa(n int) string {
 	return string(b[i:])
 }
 
-// Scan reads up to budget bytes of b and applies m to every text run it can find.
+// Scan reads up to budget bytes of b and applies m to every text run it can find,
+// unwrapping any compression it recognises on the way.
 //
 // budget <= 0 uses DefaultBudget. A nil blob or nil matcher scans nothing.
 func Scan(b *spill.Blob, m *scrub.Matcher, budget int64) (Result, error) {
@@ -104,27 +127,139 @@ func Scan(b *spill.Blob, m *scrub.Matcher, budget int64) (Result, error) {
 		res.Truncated = true
 	}
 
-	rc, err := b.Reader()
+	s := &scanner{m: m, budget: budget, labels: map[string]int{}}
+
+	// Zip needs random access; everything else streams.
+	head, err := b.Head(512)
 	if err != nil {
 		return res, err
 	}
-	defer rc.Close()
+	if detect.DetectFormat(head) == detect.Zip {
+		ra, closer, err := b.ReaderAt()
+		if err != nil {
+			return res, err
+		}
+		defer closer.Close()
+		s.scanZip(ra, b.Size(), 0)
+	} else {
+		rc, err := b.Reader()
+		if err != nil {
+			return res, err
+		}
+		defer rc.Close()
+		s.scanStream(rc, 0)
+	}
 
+	// A recognised container that yielded nothing is still worth looking at as raw
+	// bytes: it costs one more bounded pass and it is how plaintext sitting beside
+	// an unusable header gets found. It does NOT clear Opaque — reading the outside
+	// of a box is not the same as opening it.
+	if s.recognised && s.decoded == 0 && !s.exhausted() {
+		if rc, err := b.Reader(); err == nil {
+			s.extract(rc)
+			rc.Close()
+		}
+	}
+
+	res.Hits, res.Labels, res.Decoded = s.hits, s.labels, s.decoded
+	res.Opaque = s.recognised && s.decoded == 0
+	return res, nil
+}
+
+// scanner carries one scan's budget and tallies across nested streams.
+type scanner struct {
+	m      *scrub.Matcher
+	budget int64
+	read   int64 // bytes handed to the extractor, across every layer; bounds the budget
+	// decoded is the subset of read that came from INSIDE a container, i.e. after a
+	// decompressor or a zip entry. It is what Opaque is judged on: scanning the raw
+	// bytes of a container nobody could open proves nothing about its contents.
+	decoded int64
+	hits    int
+	labels  map[string]int
+	// recognised is set once any layer identified a container or compressed
+	// format. Together with read == 0 it means "there was something to look into
+	// and looking failed", which is what Opaque reports.
+	recognised bool
+}
+
+func (s *scanner) exhausted() bool { return s.read >= s.budget }
+
+// scanZip walks a zip's entries, decoding each that will decode and scanning the
+// result. An entry that will not open -- encrypted, an unsupported method -- is
+// skipped; the others still get looked at, which is the whole point.
+func (s *scanner) scanZip(ra io.ReaderAt, size int64, depth int) {
+	s.recognised = true
+	zr, err := zip.NewReader(ra, size)
+	if err != nil {
+		return
+	}
+	for _, f := range zr.File {
+		if s.exhausted() {
+			return
+		}
+		if f.Flags&0x1 != 0 || strings.HasSuffix(f.Name, "/") {
+			continue
+		}
+		rc, err := f.Open()
+		if err != nil {
+			continue
+		}
+		before := s.read
+		s.scanStream(rc, depth+1)
+		s.decoded += s.read - before
+		rc.Close()
+	}
+}
+
+// scanStream sniffs the stream's first bytes and either unwraps a compression
+// layer it recognises or extracts text from the bytes as they are. Errors from a
+// decoder end that layer: whatever had decoded by then has been scanned.
+func (s *scanner) scanStream(r io.Reader, depth int) {
+	br := bufio.NewReaderSize(r, chunkSize)
+	head, _ := br.Peek(512)
+	f := detect.DetectFormat(head)
+	switch f {
+	case detect.Gzip, detect.Zlib, detect.Bzip2, detect.Xz, detect.Zstd:
+		if depth >= maxNesting {
+			break
+		}
+		s.recognised = true
+		dec, cl, err := archive.NewDecoder(f, br)
+		if err != nil {
+			// A header the decoder refuses: the bytes are all there is to look at.
+			s.extract(br)
+			return
+		}
+		before := s.read
+		s.scanStream(dec, depth+1)
+		s.decoded += s.read - before
+		if cl != nil {
+			cl.Close()
+		}
+		return
+	case detect.SevenZip, detect.Rar:
+		// Recognised, unreadable. The raw bytes are scanned anyway on the off
+		// chance -- some 7z members are stored uncompressed -- but a clean result
+		// is not evidence of anything, and recognised says so.
+		s.recognised = true
+	}
+	s.extract(br)
+}
+
+// extract applies the matcher to every reading of the stream's bytes, in chunks,
+// until the budget is spent or the stream ends.
+func (s *scanner) extract(r io.Reader) {
 	buf := make([]byte, chunkSize)
-	var (
-		carry  []byte // a partial trailing code unit, held back to keep units aligned
-		read   int64
-		labels = map[string]int{}
-		hits   int
-	)
-	for read < budget {
+	var carry []byte // a partial trailing code unit, held back to keep units aligned
+	for !s.exhausted() {
 		want := int64(len(buf))
-		if left := budget - read; left < want {
+		if left := s.budget - s.read; left < want {
 			want = left
 		}
-		n, rerr := io.ReadFull(rc, buf[:want])
+		n, rerr := io.ReadFull(r, buf[:want])
 		if n > 0 {
-			read += int64(n)
+			s.read += int64(n)
 			chunk := buf[:n]
 			if len(carry) > 0 {
 				chunk = append(append([]byte{}, carry...), chunk...)
@@ -137,21 +272,19 @@ func Scan(b *spill.Blob, m *scrub.Matcher, budget int64) (Result, error) {
 				carry = append([]byte{}, chunk[len(chunk)-rem:]...)
 				chunk = chunk[:len(chunk)-rem]
 			}
-			for _, text := range extract(chunk) {
-				if _, ms := m.Scrub(text); len(ms) > 0 {
-					hits += len(ms)
+			for _, text := range readingsOf(chunk) {
+				if _, ms := s.m.Scrub(text); len(ms) > 0 {
+					s.hits += len(ms)
 					for _, mm := range ms {
-						labels[mm.Replacement]++
+						s.labels[mm.Replacement]++
 					}
 				}
 			}
 		}
 		if rerr != nil {
-			break // io.EOF or io.ErrUnexpectedEOF: the payload is exhausted
+			return // EOF, a short final read, or a decoder giving up: the layer is exhausted
 		}
 	}
-	res.Hits, res.Labels = hits, labels
-	return res, nil
 }
 
 // readings enumerates how Latin-script text can be laid out in fixed-width code
@@ -169,7 +302,7 @@ var readings = []struct{ stride, offset int }{
 	{4, 3}, // UTF-32BE
 }
 
-// extract returns the candidate texts hidden in a chunk of arbitrary bytes.
+// readingsOf returns the candidate texts hidden in a chunk of arbitrary bytes.
 //
 // Each reading keeps the printable bytes and replaces everything else with a newline,
 // so unrelated runs cannot be glued into a match that spans them. A multi-byte
@@ -177,7 +310,7 @@ var readings = []struct{ stride, offset int }{
 // what makes it precise: real UTF-16 Latin text has a NUL in every high byte and
 // arbitrary binary does not, so binary decimates into separators rather than into
 // plausible text.
-func extract(chunk []byte) []string {
+func readingsOf(chunk []byte) []string {
 	if len(chunk) < 2 {
 		return nil
 	}

@@ -15,6 +15,7 @@ import (
 	"fmt"
 	"io"
 	"os"
+	"syscall"
 
 	"github.com/howard/scrubber/internal/archive"
 	"github.com/howard/scrubber/internal/detect"
@@ -133,6 +134,18 @@ type Engine struct {
 	// every SIGTERM into a discarded scrub.
 	Abort func() bool
 
+	// Progress, when set, is called while the walk is doing long work that files
+	// no report entry, with a description of the stage and the bytes written so far.
+	//
+	// Rebuilding a container and recompressing it happen AFTER the last member has
+	// been recorded, and nothing on that path touches the report: no callback
+	// fires, the progress stamp is never refreshed, and the member that finished
+	// last stays on the record as though the walk were still working on it. On a
+	// large bundle that is minutes of honest work published as no progress at all
+	// — which is what makes the stall warner announce that an object "may be
+	// stalled rather than slow" while naming a file it had already finished.
+	Progress func(stage string, bytes int64)
+
 	// budget is the remaining cumulative expansion allowance, reset on each
 	// depth-0 Process call.
 	budget int64
@@ -216,6 +229,59 @@ func (e *Engine) Aborted() bool {
 	return e.aborted
 }
 
+// WasAborted reports whether the walk actually observed the abort and stopped
+// early. Unlike Aborted it does not poll the predicate.
+//
+// The difference decides whether finished work is delivered or destroyed. A
+// deadline that expires in the gap between the walk returning and the caller
+// asking must not condemn a scrub that is already complete: polling there failed
+// an object for overrunning a budget it had in fact met, threw the output away,
+// and moved the input aside so it was never retried. An hour of work, discarded
+// at the moment it succeeded.
+func (e *Engine) WasAborted() bool { return e.aborted }
+
+// errAborted stops a long write when the walk is told to stop. It never reaches a
+// report: repack recognises it and returns the input unchanged, exactly as every
+// other aborted path does.
+var errAborted = errors.New("walk aborted")
+
+// progressEveryBytes is how often a rebuild publishes a heartbeat. The abort is
+// polled on every write instead: the predicate is a pair of atomic loads, while
+// publishing copies a job record and takes a lock, and a rebuild that could only
+// be stopped every few megabytes would not be interruptible at all on a small
+// archive.
+const progressEveryBytes = 4 << 20
+
+// abortWriter makes rebuilding a container interruptible.
+//
+// Repacking a multi-gigabyte bundle is minutes of work that reports no progress
+// and, before this, could not be stopped: the abort was polled before the repack
+// and never again, so a deadline that expired during the rebuild was noticed only
+// once the rebuild had finished.
+type abortWriter struct {
+	w     io.Writer
+	e     *Engine
+	stage string
+	n     int64
+	next  int64
+}
+
+func (a *abortWriter) Write(p []byte) (int, error) {
+	if a.e.Aborted() {
+		return 0, errAborted
+	}
+	a.n += int64(len(p))
+	// The first bytes out fire a heartbeat, so the record says "rebuilding" from
+	// the moment the rebuild starts rather than once four megabytes have gone by.
+	if a.n > 0 && a.n >= a.next {
+		a.next = a.n + progressEveryBytes
+		if a.e.Progress != nil {
+			a.e.Progress(a.stage, a.n)
+		}
+	}
+	return a.w.Write(p)
+}
+
 // ResidualFindings reports what the safety net found in content this walk did not
 // inspect: the match count and a disclosure-safe label breakdown.
 func (e *Engine) ResidualFindings() (int, map[string]int) { return e.residualHits, e.residualLabels }
@@ -242,6 +308,14 @@ func (e *Engine) residualScan(path string, reason report.Reason, b *spill.Blob) 
 		e.residualLeft -= n
 	} else {
 		e.residualLeft = 0
+	}
+	if res.Opaque {
+		// A recognised container that yielded nothing readable: encrypted, an
+		// unsupported method, a stream cut off before its first byte of content.
+		// A clean scan of something nobody could open is the ABSENCE of a scan,
+		// not a reassurance, and the verdict has to treat it that way — this is
+		// what stops a password-protected bundle leaving as merely "incomplete".
+		e.Report.NoteOpaque()
 	}
 	if res.Hits == 0 {
 		return
@@ -361,13 +435,12 @@ func (e *Engine) scrubMemberName(origPath, name string, inBytes int64) (string, 
 // materialises the answer. When nothing changed it returns the caller's original
 // slice untouched, so byte-for-byte fidelity is exact rather than reconstructed.
 func (e *Engine) Process(path string, data []byte, depth int) []byte {
-	in, err := spill.FromBytes(data, e.Limits.Spill)
-	if err != nil {
-		// Cannot even stage the input: emit it verbatim rather than fail.
-		e.Report.Record(path, report.StatusPassthrough,
-			fmt.Sprintf("could not stage payload: %v", err), len(data), len(data), nil)
-		return data
-	}
+	// The caller's bytes are already whole in memory -- that is what this entry
+	// point means -- so wrap them rather than copy them out to scratch and read
+	// them back. FromBytes spilled every input above the threshold, and Head and
+	// Bytes then read it off disk again, for nothing.
+	mark := e.Report.Mark()
+	in := spill.Wrap(data)
 	defer in.Close()
 	defer e.Release()
 
@@ -380,9 +453,13 @@ func (e *Engine) Process(path string, data []byte, depth int) []byte {
 	if err != nil {
 		// The scrubbed result exists but cannot be read back. Returning the original
 		// is the safe answer, but the matches recorded for it never reached an
-		// output, so they must not stay counted.
-		e.Report.Record(path, report.StatusPassthrough,
-			fmt.Sprintf("could not read back scrubbed payload: %v", err), len(data), len(data), nil)
+		// output, so they must not stay counted -- and this is a hole, so it needs
+		// the reason code every other hole carries. Recording it through Record gave
+		// it ReasonUnclassified, which is the tripwire the corpus asserts nobody
+		// trips; the corpus never caught it because it drives ProcessBlob directly.
+		e.Report.Rollback(mark, path, report.StatusPassthrough, report.ReasonScratch,
+			fmt.Sprintf("could not read the scrubbed payload back from scratch storage (%v); "+
+				"passed through unchanged and NOT scrubbed", err), len(data), len(data))
 		return data
 	}
 	return b
@@ -547,7 +624,15 @@ func (e *Engine) handleLeaf(path string, in *spill.Blob) (*spill.Blob, bool) {
 			"detected binary content", in)
 		return in, false
 	}
-	scrubbed, matches := e.Matcher.Scrub(text)
+	// The abort is polled inside the matcher, not only between members. A single
+	// file can be large enough to outlast the whole scrub budget on a throttled
+	// pod, and an uninterruptible member is how a walk came to run past its
+	// deadline and then have every byte of that work discarded for missing it.
+	scrubbed, matches, stopped := e.Matcher.ScrubAbortable(text, e.Abort)
+	if stopped {
+		e.aborted = true
+		return in, false
+	}
 	if len(matches) == 0 {
 		e.Report.Record(path, report.StatusUnchanged, enc.String(), int(in.Size()), int(in.Size()), nil)
 		return in, false
@@ -620,6 +705,41 @@ func (e *Engine) handleCompressed(f detect.Format, path string, in *spill.Blob, 
 	defer inner.Close()
 	e.take(inner.Size())
 
+	if meta != nil && meta.Truncated {
+		// A stream that ends before its content does -- a partial upload, nearly
+		// always. Salvage it only where there are member boundaries to salvage TO.
+		//
+		// A truncated ARCHIVE still holds N complete entries, and ReadTar carries
+		// the unreadable remainder through byte for byte, so scrubbing the entries
+		// costs nothing: that is the case worth rescuing, and refusing it used to
+		// send every readable log in a partial bundle out untouched.
+		//
+		// A truncated BARE stream has no such structure. Rebuilding it from the
+		// prefix would drop the undecodable tail from the output, and where only a
+		// few bytes decoded it would replace the user's file with a stub. That one
+		// is passed through whole and flagged; the residual scan decompresses the
+		// prefix now, so a truncated log full of live data is still caught there.
+		salvage := false
+		if head, herr := inner.Head(512); herr == nil {
+			switch detect.DetectFormat(head) {
+			case detect.Tar, detect.Zip:
+				salvage = true
+			}
+		}
+		if !salvage {
+			e.skip(path, report.StatusPassthrough, report.ReasonMalformed,
+				fmt.Sprintf("%s stream ends before its content does; passed through unchanged and "+
+					"NOT scrubbed (%d bytes decoded, and they were scanned for policy matches)",
+					f, inner.Size()), in)
+			return in, false
+		}
+		e.Report.NoteMembers(1)
+		e.Report.Skip(path, report.StatusPassthrough, report.ReasonMalformed,
+			fmt.Sprintf("%s stream ends before its content does; the %d bytes that decoded hold "+
+				"complete archive entries, which are scrubbed, and the undecodable tail is dropped",
+				f, inner.Size()), int(in.Size()), int(inner.Size()))
+	}
+
 	// Charged above, then lent back for the descent to the extent the walk charges
 	// what is inside it: for a .tar.gz the members below pay for the same bytes, and
 	// only one of the two should count against the operator's expansion budget.
@@ -638,10 +758,17 @@ func (e *Engine) handleCompressed(f detect.Format, path string, in *spill.Blob, 
 		e.residualScan(path, report.ReasonScratch, in)
 		return in, false
 	}
-	cerr := archive.CompressTo(w, f, processed, meta)
+	cerr := archive.CompressTo(&abortWriter{w: w, e: e, stage: "recompressing the " + f.String()},
+		f, processed, meta)
 	size, serr := w.Seek(0, io.SeekCurrent)
 	if closeErr := w.Close(); cerr == nil {
 		cerr = closeErr
+	}
+	if errors.Is(cerr, errAborted) {
+		// Stopped mid-recompress. Hand back the input like every other aborted
+		// path, so nothing half-written can reach an output.
+		out.Close()
+		return in, false
 	}
 	if cerr != nil || serr != nil {
 		out.Close()
@@ -675,7 +802,7 @@ func (e *Engine) handleTar(path string, in *spill.Blob, depth int) (*spill.Blob,
 	}
 	// Close through a defer so a panic inside ReadTar cannot leak the handle; the
 	// closure scopes it to the read rather than to the whole member walk below.
-	members, err := func() ([]archive.TarMember, error) {
+	members, tail, err := func() ([]archive.TarMember, *archive.TarTail, error) {
 		defer rc.Close()
 		return archive.ReadTar(rc, e.budget, e.Limits.MaxMembers, e.Limits.Spill)
 	}()
@@ -684,6 +811,20 @@ func (e *Engine) handleTar(path string, in *spill.Blob, depth int) (*spill.Blob,
 		return in, false
 	}
 	defer archive.CloseTar(members)
+	if tail != nil {
+		defer tail.Raw.Close()
+		// The archive ends early. Every member that WAS readable is still scrubbed
+		// below; the unparseable remainder is carried through byte for byte and
+		// declared here. Discarding the readable members because the last one was
+		// cut short is how a partial upload of a log bundle went out whole and
+		// untouched.
+		e.Report.NoteMembers(1)
+		e.Report.Skip(path, report.StatusPassthrough, report.ReasonMalformed,
+			fmt.Sprintf("tar ends before its last entry does (%v); the %d entries that could be "+
+				"read are scrubbed and the unreadable remainder is carried through untouched",
+				tail.Err, len(members)),
+			int(in.Size()), int(in.Size()))
+	}
 	// Announced before the member loop, so a watcher has a denominator from the very
 	// first file rather than only once the archive has finished. Only the regular
 	// entries: a directory or a symlink files no report entry, so counting it here
@@ -738,7 +879,7 @@ func (e *Engine) handleTar(path string, in *spill.Blob, depth int) (*spill.Blob,
 		return in, false
 	}
 	return e.repack(mark, path, "tar", in, func(w io.Writer) error {
-		return archive.WriteTarTo(w, members)
+		return archive.WriteTarTo(w, members, tail)
 	})
 }
 
@@ -783,6 +924,25 @@ func (e *Engine) handleZip(path string, in *spill.Blob, depth int) (*spill.Blob,
 		if members[i].IsDir() {
 			continue
 		}
+		if members[i].Raw {
+			// This entry could not be decoded, so it travels in the stored form it
+			// arrived in and the rest of the archive is scrubbed around it. Before
+			// this, one such entry failed the whole zip and every readable log in
+			// it was emitted untouched.
+			n := int(members[i].Body.Size())
+			reason, detail := report.ReasonMalformed,
+				fmt.Sprintf("zip entry could not be decoded (%v); carried through in its stored "+
+					"form and NOT scrubbed", members[i].Err)
+			if members[i].Encrypted {
+				reason, detail = report.ReasonEncrypted,
+					"zip entry is encrypted, so its contents cannot be read or scrubbed; carried "+
+						"through in its stored form. Ask the sender for an unencrypted copy"
+			}
+			e.Report.Skip(memberPath, report.StatusPassthrough, reason, detail, n, n)
+			// Nothing could be read out of it, so nothing can vouch for it either.
+			e.Report.NoteOpaque()
+			continue
+		}
 		// See handleTar: charged in the loop above, lent back for whatever the descent
 		// charges against this member's own contents.
 		// The member is already in the total noteMembers announced. Say so, so that a
@@ -795,6 +955,7 @@ func (e *Engine) handleZip(path string, in *spill.Blob, depth int) (*spill.Blob,
 		if memberChanged {
 			members[i].Body.Close()
 			members[i].Body = out
+			members[i].Changed = true
 			changed = true
 		}
 	}
@@ -811,7 +972,15 @@ func (e *Engine) handleZip(path string, in *spill.Blob, depth int) (*spill.Blob,
 		return in, false
 	}
 	return e.repack(mark, path, "zip", in, func(w io.Writer) error {
-		return archive.WriteZipTo(w, members)
+		// Reopened for the write: every member the walk did not change is copied
+		// across from here in its stored form, which is both byte-exact and free
+		// of a needless re-deflate.
+		src, closer, err := in.ReaderAt()
+		if err != nil {
+			return err
+		}
+		defer closer.Close()
+		return archive.WriteZipTo(w, members, src, in.Size())
 	})
 }
 
@@ -821,22 +990,38 @@ func (e *Engine) handleZip(path string, in *spill.Blob, depth int) (*spill.Blob,
 // roll the subtree back rather than merely record: otherwise the report would claim
 // replacements that never reached an output, which is the one direction a
 // transparency report must never be wrong in.
-func (e *Engine) repack(mark int, path, kind string, in *spill.Blob, write func(io.Writer) error) (*spill.Blob, bool) {
+func (e *Engine) repack(mark report.Mark, path, kind string, in *spill.Blob, write func(io.Writer) error) (*spill.Blob, bool) {
 	fail := func(err error) (*spill.Blob, bool) {
-		e.Report.Rollback(mark, path, report.StatusPassthrough, report.ReasonRepackFailed,
-			fmt.Sprintf("could not rebuild %s (%v); passed through unchanged and NOT scrubbed", kind, err),
+		// A full scratch volume is a different problem from a hostile bundle, and
+		// the read side has always said so. The write side used to call both
+		// "repack-failed", sending an operator hunting a corrupt upload when the
+		// real answer was that /work had run out.
+		reason := report.ReasonRepackFailed
+		detail := fmt.Sprintf("could not rebuild %s (%v); passed through unchanged and NOT scrubbed", kind, err)
+		if errors.Is(err, spill.ErrSpill) || errors.Is(err, syscall.ENOSPC) {
+			reason = report.ReasonScratch
+			detail = fmt.Sprintf("could not write the rebuilt %s to scratch storage (%v); passed "+
+				"through unchanged and NOT scrubbed", kind, err)
+		}
+		e.Report.Rollback(mark, path, report.StatusPassthrough, reason, detail,
 			int(in.Size()), int(in.Size()))
-		e.residualScan(path, report.ReasonRepackFailed, in)
+		e.residualScan(path, reason, in)
 		return in, false
 	}
 	out, w, err := e.stageCreated(spill.Create())
 	if err != nil {
 		return fail(err)
 	}
-	werr := write(w)
+	werr := write(&abortWriter{w: w, e: e, stage: "rebuilding the " + kind})
 	size, serr := w.Seek(0, io.SeekCurrent)
 	if closeErr := w.Close(); werr == nil {
 		werr = closeErr
+	}
+	if errors.Is(werr, errAborted) {
+		// Told to stop mid-rebuild. Hand back the input: the enclosing levels
+		// collapse to unchanged and nothing half-written can reach an output.
+		out.Close()
+		return in, false
 	}
 	if werr != nil || serr != nil {
 		out.Close()

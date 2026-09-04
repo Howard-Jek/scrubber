@@ -4,12 +4,17 @@
 // isolated — one failure is recorded and skipped, never crashing the loop.
 //
 // Scheduling is split in two. A producer lists the bucket on a ticker and hands the
-// eligible objects to an arrival-ordered queue; a single consumer takes them one at
-// a time. That serialization is deliberate: the pod has one CPU and a memory budget
-// sized for one object, so running several scrubs at once trades throughput for
-// nothing and pushes resident memory toward the container limit. The poll interval
-// governs how quickly *new* work is discovered, not how fast the queue drains — the
-// consumer takes the next object the instant it finishes one.
+// eligible objects to an arrival-ordered queue; WORKERS consumers take them in
+// order, one object each. The poll interval governs how quickly *new* work is
+// discovered, not how fast the queue drains — a consumer takes the next object the
+// instant it finishes one.
+//
+// WORKERS defaults to 1 and the resource caps are divided by it, so raising it
+// trades the size of the largest bundle for the number in flight rather than
+// promising each consumer the whole volume. The second reason to raise it is not
+// throughput at all: with one consumer a single wedged object blocks every upload
+// behind it, and the walk is only cooperatively interruptible, so an object stuck
+// in a syscall cannot be taken away from it.
 package worker
 
 import (
@@ -55,10 +60,29 @@ type Config struct {
 	// not bound the drain rate: the consumer takes the next queued object as soon
 	// as it finishes one.
 	PollInterval time.Duration
-	// Workers is retained for configuration compatibility and is clamped to 1.
-	// Objects are processed one at a time, in arrival order; a higher value would
-	// restore exactly the contention this queue exists to remove.
+	// Workers is how many objects are scrubbed concurrently, in arrival order.
+	// Bounded by maxWorkers; below 1 means 1.
+	//
+	// It is not free and it is not a throughput dial on its own: each consumer
+	// holds its own leaf in heap and its own expansion on /work, so cmd/scrubberd
+	// divides MAX_EXPAND_BYTES and MAX_LEAF_BYTES by this number. Two consumers on
+	// the same pod scrub two bundles at once, each at most half the size.
 	Workers int
+	// StallAbortAfter is how long an object may publish NO progress before it is
+	// abandoned and the consumer moves on. Zero disables it.
+	//
+	// Different from ScrubTimeout, and the difference is the point. ScrubTimeout is
+	// a total budget and fires on healthy work that is merely large; this fires
+	// only when nothing has moved, so it can be far tighter without threatening a
+	// legitimate bundle. It is only trustworthy because every long stretch of the
+	// walk now publishes a heartbeat — before that, a container rebuild reported
+	// no progress for its whole duration and this would have killed healthy runs.
+	//
+	// It is still cooperative: the flag is polled between members, inside the
+	// matcher and on every write of a rebuild. An object blocked in a syscall
+	// never reaches a poll site, so it cannot be taken away from its consumer at
+	// all — which is the other reason WORKERS exists.
+	StallAbortAfter time.Duration
 	// QueueMax bounds the in-memory pending set. Anything beyond it is still in the
 	// bucket and is picked up by a later poll.
 	QueueMax       int
@@ -123,6 +147,11 @@ const termsSuffix = ".terms.json"
 // the reports bucket.
 const reportSuffix = report.ObjectSuffix
 
+// maxWorkers bounds concurrent scrubs. Each consumer holds its own leaf in heap
+// and its own expansion on scratch, and the caps are divided by the count, so
+// beyond a handful every bundle becomes too small to be worth accepting.
+const maxWorkers = 8
+
 // Worker ties together the store, policy registry, metrics, queue and config.
 type Worker struct {
 	store    store.ObjectStore
@@ -157,9 +186,15 @@ type Worker struct {
 	discoveryFails    int
 	discoveryFailedAt time.Time
 	discoveryLoggedAt time.Time
-	// running describes the object being scrubbed right now, or nil when idle.
-	// There is exactly one consumer, so this is a single value rather than a map.
-	running *inflight
+	// running describes the objects being scrubbed right now, keyed by object key.
+	//
+	// A map rather than a single value, and that is a correctness requirement
+	// rather than a generalisation: with one pointer a second consumer overwrote
+	// the first one's registration, after which a cancel aborted whichever object
+	// happened to register last and commit() marked the wrong one delivered. A
+	// withdrawal could be accepted for a bundle that was already in the output
+	// bucket, which is the one thing CancelTooLate exists to prevent.
+	running map[string]*inflight
 }
 
 // inflight is the handle a cancel needs on the object currently being scrubbed.
@@ -177,6 +212,12 @@ type inflight struct {
 	// bucket. After that a cancel cannot un-deliver it, and saying otherwise would
 	// tell an operator their data was withdrawn when it was published.
 	committed bool
+	// stalled is tripped by the stall watchdog when this object has published no
+	// progress for StallAbortAfter. It is a third abort reason, kept apart from
+	// the cancel flag because the three mean different things to whoever is
+	// waiting: a withdrawal was asked for, a timeout means the budget was too
+	// small, and this means the object stopped.
+	stalled *atomic.Bool
 }
 
 // retryBackoff returns how long to hold an object back after n consecutive
@@ -210,15 +251,22 @@ func New(s store.ObjectStore, p *policy.Registry, m *metrics.Metrics, jl *metric
 	if cfg.CancelledPrefix == "" {
 		cfg.CancelledPrefix = "cancelled/"
 	}
-	// Clamped rather than defaulted. Honouring a larger value would let a single
-	// config line reintroduce concurrent scrubs behind a queue that claims to have
-	// removed them, and the pod's memory budget only covers one object.
-	if cfg.Workers != 1 {
-		if cfg.Workers > 1 {
-			log.Warn("WORKERS is clamped to 1: objects are scrubbed one at a time in arrival order",
-				"requested", cfg.Workers)
-		}
+	// How many objects are scrubbed at once. Bounded rather than pinned, and the
+	// bound is what makes raising it safe: cmd/scrubberd divides the expansion and
+	// leaf caps by this number, so more objects in flight means a smaller largest
+	// bundle rather than a pod that promises every worker the whole volume and
+	// gets evicted when two of them take it.
+	//
+	// It was pinned to 1 for a long time, and correctly: a single *inflight
+	// pointer meant a second consumer overwrote the first one's registration, so
+	// a cancel reached the wrong object. That is a map now.
+	if cfg.Workers < 1 {
 		cfg.Workers = 1
+	}
+	if cfg.Workers > maxWorkers {
+		log.Warn("WORKERS is above the supported maximum and has been clamped",
+			"requested", cfg.Workers, "clamped_to", maxWorkers)
+		cfg.Workers = maxWorkers
 	}
 	if cfg.MaxObjectBytes <= 0 {
 		cfg.MaxObjectBytes = 512 << 20 // never 0/unbounded: the read cap prevents OOM
@@ -229,6 +277,7 @@ func New(s store.ObjectStore, p *policy.Registry, m *metrics.Metrics, jl *metric
 	return &Worker{
 		store: s, policies: p, metrics: m, jobs: jl, cfg: cfg, log: log,
 		q:          queue.New(cfg.QueueMax),
+		running:    map[string]*inflight{},
 		nudge:      make(chan struct{}, 1),
 		deferUntil: map[string]time.Time{},
 		attempts:   map[string]int{},
@@ -317,14 +366,20 @@ func displayNotes(m *scrub.Matcher, notes []report.Note) []report.Note {
 // being updated by exactly the stall it is meant to reveal.
 func (w *Worker) InflightPhaseSeconds() float64 {
 	inflight, _ := w.q.Snapshot(0)
-	if len(inflight) == 0 {
-		return 0
+	// The WORST object in flight, not an arbitrary one: this is the series an
+	// operator alerts on, and with several consumers a healthy object finishing
+	// beside a wedged one must not reset it to zero.
+	worst := 0.0
+	for _, key := range inflight {
+		j, ok := w.jobs.Get(key)
+		if !ok || j.Done() {
+			continue
+		}
+		if s := j.PhaseSeconds(); s > worst {
+			worst = s
+		}
 	}
-	j, ok := w.jobs.Get(inflight[0])
-	if !ok || j.Done() {
-		return 0
-	}
-	return j.PhaseSeconds()
+	return worst
 }
 
 // watchStalls logs when the in-flight object has sat in one phase longer than
@@ -335,53 +390,90 @@ func (w *Worker) InflightPhaseSeconds() float64 {
 // that an upload is stuck: without it the log's last line is "processing object",
 // which is equally consistent with working and with wedged.
 func (w *Worker) watchStalls(ctx context.Context) {
-	every := w.cfg.StallWarnAfter
-	if every <= 0 {
+	warnAfter, abortAfter := w.cfg.StallWarnAfter, w.cfg.StallAbortAfter
+	if warnAfter <= 0 && abortAfter <= 0 {
 		return
 	}
-	t := time.NewTicker(every)
+	// Tick fast enough that the abort threshold is honoured to within a fraction
+	// of itself, rather than rounded up to whatever the warning interval happens
+	// to be.
+	tick := warnAfter
+	if tick <= 0 || (abortAfter > 0 && abortAfter/4 < tick) {
+		tick = abortAfter / 4
+	}
+	if tick < time.Second {
+		tick = time.Second
+	}
+	t := time.NewTicker(tick)
 	defer t.Stop()
-	warned := ""
+	// Per key, because several objects can be in flight and a warning about one
+	// must not suppress the first warning about another.
+	warned := map[string]string{}
 	for {
 		select {
 		case <-ctx.Done():
 			return
 		case <-t.C:
 			inflight, _ := w.q.Snapshot(0)
-			if len(inflight) == 0 {
-				warned = ""
-				continue
+			live := make(map[string]struct{}, len(inflight))
+			for _, key := range inflight {
+				live[key] = struct{}{}
+				j, ok := w.jobs.Get(key)
+				if !ok || j.Done() {
+					continue
+				}
+				// PROGRESS, not phase. An object part-way through a large archive stays
+				// in "scrubbing" for as long as the archive takes, so judging it on
+				// phase age warned about every healthy long run -- measured at three
+				// false alarms on a 19-minute, 60-file bundle whose files_done was
+				// climbing throughout.
+				secs := j.ProgressSeconds()
+
+				// Nothing has moved for the whole abort budget. Take it away from its
+				// consumer so the queue behind it drains.
+				//
+				// This is only trustworthy because every long stretch of the walk now
+				// publishes a heartbeat: expanding a container, scrubbing one large
+				// file and rebuilding the archive all report. Before that, a rebuild
+				// was silent for its entire duration and this check would have
+				// destroyed healthy work.
+				if abortAfter > 0 && secs >= abortAfter.Seconds() {
+					if w.abortStalled(key) {
+						w.log.Error("object has published no progress for its stall budget and is "+
+							"being abandoned so the rest of the queue can continue",
+							"key", key, "phase", j.Phase,
+							"no_progress_seconds", int64(secs),
+							"stall_abort_after", abortAfter,
+							"files_done", j.FilesDone, "current_file", j.CurrentFile)
+					}
+					continue
+				}
+
+				if warnAfter <= 0 || secs < warnAfter.Seconds() {
+					// It finished a file, or changed phase, recently: moving, just not
+					// quickly.
+					delete(warned, key)
+					continue
+				}
+				stamp := key + "|" + j.Phase
+				level := "still"
+				if warned[key] != stamp {
+					level = "now"
+					warned[key] = stamp
+				}
+				w.log.Warn("object has made no observable progress for an unusually long "+
+					"time; it may be stalled rather than slow",
+					"key", key, "phase", j.Phase,
+					"no_progress_seconds", int64(secs),
+					"phase_seconds", int64(j.PhaseSeconds()),
+					"files_done", j.FilesDone, "current_file", j.CurrentFile,
+					"state", level)
 			}
-			key := inflight[0]
-			j, ok := w.jobs.Get(key)
-			if !ok || j.Done() {
-				continue
+			for k := range warned {
+				if _, ok := live[k]; !ok {
+					delete(warned, k)
+				}
 			}
-			// PROGRESS, not phase. An object part-way through a large archive stays
-			// in "scrubbing" for as long as the archive takes, so judging it on
-			// phase age warned about every healthy long run -- measured at three
-			// false alarms on a 19-minute, 60-file bundle whose files_done was
-			// climbing throughout.
-			secs := j.ProgressSeconds()
-			if secs < every.Seconds() {
-				// It finished a file, or changed phase, recently: moving, just not
-				// quickly.
-				warned = ""
-				continue
-			}
-			stamp := key + "|" + j.Phase
-			level := "still"
-			if warned != stamp {
-				level = "now"
-				warned = stamp
-			}
-			w.log.Warn("object has made no observable progress for an unusually long "+
-				"time; it may be stalled rather than slow",
-				"key", key, "phase", j.Phase,
-				"no_progress_seconds", int64(secs),
-				"phase_seconds", int64(j.PhaseSeconds()),
-				"files_done", j.FilesDone, "current_file", j.CurrentFile,
-				"state", level)
 		}
 	}
 }
@@ -391,9 +483,11 @@ func (w *Worker) watchStalls(ctx context.Context) {
 // shutdown so the process does not exit while an object is mid-flight.
 func (w *Worker) Run(ctx context.Context) {
 	var wg sync.WaitGroup
-	wg.Add(3)
+	wg.Add(2 + w.cfg.Workers)
 	go func() { defer wg.Done(); w.discover(ctx) }()
-	go func() { defer wg.Done(); w.consume(ctx) }()
+	for i := 0; i < w.cfg.Workers; i++ {
+		go func(n int) { defer wg.Done(); w.consume(ctx, n) }(i)
+	}
 	go func() { defer wg.Done(); w.watchStalls(ctx) }()
 	wg.Wait()
 	w.log.Info("worker stopped")
@@ -578,11 +672,11 @@ func (w *Worker) sweepDeferrals(present map[string]struct{}) {
 // consume is the single consumer: take the head of the queue, scrub it to
 // completion, repeat. On cancellation it stops taking new work, which is what keeps
 // the process from starting a minute-long object moments before it is killed.
-func (w *Worker) consume(ctx context.Context) {
+func (w *Worker) consume(ctx context.Context, n int) {
 	for {
 		it, ok := w.q.Next(ctx)
 		if !ok {
-			w.log.Info("worker consumer stopping")
+			w.log.Info("worker consumer stopping", "consumer", n)
 			return
 		}
 		w.handle(ctx, it)
@@ -680,8 +774,8 @@ func (w *Worker) Cancel(ctx context.Context, key string) (string, error) {
 
 func (w *Worker) cancel(ctx context.Context, key string) (CancelOutcome, error) {
 	w.mu.Lock()
-	if w.running != nil && w.running.key == key {
-		if w.running.committed {
+	if r, ok := w.running[key]; ok {
+		if r.committed {
 			w.mu.Unlock()
 			return CancelTooLate, nil
 		}
@@ -690,8 +784,8 @@ func (w *Worker) cancel(ctx context.Context, key string) (CancelOutcome, error) 
 		// all. Disposal is deliberately left to the worker: two goroutines mutating
 		// the same input object is how a cancel races a finalize.
 		w.cancelled[key] = time.Now()
-		w.running.flag.Store(true)
-		abort := w.running.abort
+		r.flag.Store(true)
+		abort := r.abort
 		w.mu.Unlock()
 		abort()
 		w.log.Warn("cancel accepted for the object being scrubbed; aborting the walk", "key", key)
@@ -747,23 +841,40 @@ func (w *Worker) unmarkCancelled(key string) {
 	delete(w.cancelled, key)
 }
 
-// beginInflight registers the running object so a cancel can reach it, and
+// beginInflight registers a running object so a cancel can reach it, and
 // reports false if the key was already withdrawn while it sat in the queue.
-func (w *Worker) beginInflight(key string, abort context.CancelFunc, flag *atomic.Bool) bool {
+func (w *Worker) beginInflight(key string, abort context.CancelFunc, flag, stalled *atomic.Bool) bool {
 	w.mu.Lock()
 	defer w.mu.Unlock()
 	if _, off := w.cancelled[key]; off {
 		return false
 	}
-	w.running = &inflight{key: key, abort: abort, flag: flag}
+	w.running[key] = &inflight{key: key, abort: abort, flag: flag, stalled: stalled}
 	return true
 }
 
-// endInflight clears the registration.
-func (w *Worker) endInflight() {
+// abortStalled trips the stall flag on a running object, reporting whether it was
+// this call that did so — the watchdog fires on a ticker and must log once, not on
+// every tick until the walk unwinds.
+//
+// A committed object is left alone: its output is already in the output bucket, so
+// stopping the walk would achieve nothing and the bookkeeping still has to finish.
+func (w *Worker) abortStalled(key string) bool {
 	w.mu.Lock()
 	defer w.mu.Unlock()
-	w.running = nil
+	r, ok := w.running[key]
+	if !ok || r.committed || r.stalled == nil || r.stalled.Load() {
+		return false
+	}
+	r.stalled.Store(true)
+	return true
+}
+
+// endInflight clears one object's registration.
+func (w *Worker) endInflight(key string) {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	delete(w.running, key)
 }
 
 // commit is the point of no return, and it is a single atomic transition on
@@ -778,8 +889,8 @@ func (w *Worker) commit(key string) bool {
 	if _, off := w.cancelled[key]; off {
 		return false
 	}
-	if w.running != nil && w.running.key == key {
-		w.running.committed = true
+	if r, ok := w.running[key]; ok {
+		r.committed = true
 	}
 	return true
 }
@@ -842,15 +953,21 @@ func (w *Worker) processObject(ctx context.Context, o store.Object) {
 	// continues to the next member boundary, and what an operator needs is where the
 	// budget actually ran out.
 	var expiredAt atomic.Pointer[position]
+	// stalled latches when the watchdog decides this object has stopped moving.
+	// A third reason, kept apart from the other two because the operator's next
+	// move differs: a withdrawal was asked for, a timeout means the budget was too
+	// small for the bundle, and this means the object stopped while the rest of
+	// the queue was still draining.
+	var stalled atomic.Bool
 	ctx, abort := context.WithCancel(ctx)
 	defer abort()
-	if !w.beginInflight(o.Key, abort, &aborted) {
+	if !w.beginInflight(o.Key, abort, &aborted, &stalled) {
 		// Withdrawn while it waited in the queue. Nothing has been read, so there is
 		// nothing to undo; the input was already disposed of by Cancel.
 		w.log.Info("skipping object withdrawn before it started", "key", o.Key)
 		return
 	}
-	defer w.endInflight()
+	defer w.endInflight(o.Key)
 
 	job.Status = "processing"
 	job.Phase = "reading"
@@ -875,6 +992,13 @@ func (w *Worker) processObject(ctx context.Context, o store.Object) {
 			p.noProgress = time.Since(job.ProgressSince)
 		}
 		return p
+	}
+
+	// Stamped as a transfer streams. Runs on this goroutine, inside the copy, so
+	// it touches the same locals every other publisher does.
+	beat := func() {
+		job.ProgressSince = time.Now()
+		w.jobs.Upsert(job)
 	}
 
 	// The object's deadline. Nothing else bounds the walk, so without this a single
@@ -977,6 +1101,45 @@ func (w *Worker) processObject(ctx context.Context, o store.Object) {
 			"current_file", p.currentFile, "elapsed", roundDur(time.Since(start)))
 	}
 
+	// stalledExit fails an object the watchdog found had stopped moving.
+	//
+	// Disposed of like a timeout, and for the same reason: leaving it in the bucket
+	// means the next poll picks it up, wedges another consumer on it, and does so
+	// forever. Re-uploading is the retry, and it is a decision for a person who has
+	// looked at why it stopped.
+	stalledExit := func(p position) {
+		w.metrics.Errors.Inc()
+		w.metrics.Objects.WithLabelValues("no_progress").Inc()
+		disposition := "The input was left in the bucket."
+		if err := w.finish(ctx, o.Key); err != nil {
+			w.log.Warn("could not move a stalled input aside; it stays in the input bucket "+
+				"and will be picked up again", "key", o.Key, "err", err)
+			disposition = "The input could NOT be moved aside (" + err.Error() +
+				"), so it stays in the input bucket and will be attempted again."
+		} else {
+			w.clearDeferral(o.Key)
+			switch w.cfg.Action {
+			case ActionDelete:
+				disposition = "The input was moved aside rather than deleted: this deployment " +
+					"deletes finished inputs, but an object the service refused to process is " +
+					"not a finished one, and it may be the only copy."
+			default:
+				disposition = "The input was moved to " + w.cfg.ProcessedPrefix + o.Key +
+					" and will NOT be retried automatically; re-upload it to try again."
+			}
+		}
+		job.Status = "error"
+		job.Phase = ""
+		job.FilesDone, job.FilesTotal, job.CurrentFile = filesDone, membersTotal, currentFile
+		job.Error = stallDetail(w.cfg.StallAbortAfter, time.Since(start), p, disposition)
+		record(job)
+		w.log.Error("object abandoned after publishing no progress; the queue continues",
+			"key", o.Key, "stall_abort_after", w.cfg.StallAbortAfter,
+			"elapsed", roundDur(time.Since(start)),
+			"phase", p.phase, "files_done", p.filesDone, "files_total", p.filesTotal,
+			"current_file", p.currentFile, "no_progress", roundDur(p.noProgress))
+	}
+
 	// timedOutExit fails an object that outran its budget.
 	//
 	// Terminal, and the input is disposed of exactly as an oversized one is. Leaving
@@ -1026,7 +1189,8 @@ func (w *Worker) processObject(ctx context.Context, o store.Object) {
 		fail(fmt.Errorf("stage input: %w", err))
 		return
 	}
-	inSize, err := w.store.GetLimitedTo(ctx, w2, w.cfg.InputBucket, o.Key, w.cfg.MaxObjectBytes)
+	inSize, err := w.store.GetLimitedTo(ctx, &heartbeatWriter{w: w2, tick: beat},
+		w.cfg.InputBucket, o.Key, w.cfg.MaxObjectBytes)
 	if cerr := w2.Close(); err == nil {
 		err = cerr
 	}
@@ -1100,13 +1264,29 @@ func (w *Worker) processObject(ctx context.Context, o store.Object) {
 	// How many members the walk has found so far, so the card can say "file 7 of 10"
 	// rather than a count with no denominator. It rises when a nested archive opens,
 	// which is honest: what is inside a member is not known until the walk reaches it.
+	// One publisher for both callbacks, reading the live counters.
+	//
+	// They used to write different subsets of the record onto different copies:
+	// OnFile updated a local copy and left the outer job untouched, so the next
+	// OnMembers published FilesDone 0, an empty CurrentFile and a ProgressSince
+	// frozen at the first file. Opening a nested archive therefore reset the card
+	// to "unpacking", showed "no new file in 12m", and re-armed the stall warning
+	// on an object that was moving steadily through its members — the exact false
+	// alarm ProgressSince was added to remove.
+	publish := func() {
+		j := job
+		j.FilesDone, j.FilesTotal, j.CurrentFile = filesDone, membersTotal, currentFile
+		w.jobs.Upsert(j)
+	}
 	rep.OnMembers(func(n int) {
 		membersTotal = n
-		j := job
-		j.FilesTotal = n
-		w.jobs.Upsert(j)
+		// Finishing a container read IS observable movement, and it is often the
+		// end of a long silent stretch: noteMembers fires once the whole archive
+		// has been parsed.
+		job.ProgressSince = time.Now()
+		publish()
 	})
-	rep.OnFile(func(f report.FileEntry) {
+	rep.OnFile(func(f report.FileEntry, done int) {
 		// A scrubbed FILENAME files its own report entry, which is right for the audit
 		// record and wrong for a progress count: a 10-member tar with two renamed
 		// members reported "12 files", so the number the user watched disagreed with
@@ -1114,7 +1294,11 @@ func (w *Worker) processObject(ctx context.Context, o store.Object) {
 		if f.Detail == report.DetailFilenameScrubbed {
 			return
 		}
-		filesDone++
+		// Assigned from the report's own tally, not incremented locally. A
+		// rollback lowers that tally when a subtree is discarded, and a counter
+		// that only ever went up reported "file 4 of 3" after a failed repack —
+		// with the live view and the stored digest disagreeing threefold.
+		filesDone = done
 		if filesDone == 1 {
 			// First member out of the container: unpacking is demonstrably over.
 			job.Phase = "scrubbing"
@@ -1130,14 +1314,10 @@ func (w *Worker) processObject(ctx context.Context, o store.Object) {
 				"status", f.Status, "detail", f.Detail)
 		}
 		currentFile = displayPath(res.Matcher, f.Path)
-		j := job
-		j.FilesDone = filesDone
-		j.CurrentFile = currentFile
 		// Finishing a file IS progress, and stamping it here is what stops the stall
 		// warning firing on a healthy multi-file scrub.
-		j.ProgressSince = time.Now()
-		j.FilesTotal = membersTotal
-		w.jobs.Upsert(j)
+		job.ProgressSince = time.Now()
+		publish()
 	})
 
 	eng := &pipeline.Engine{
@@ -1149,14 +1329,38 @@ func (w *Worker) processObject(ctx context.Context, o store.Object) {
 		// Two reasons resolve to one predicate because the walk's behaviour is
 		// identical either way -- stop, rebuild nothing, hand back the input. Which
 		// of them fired is read below, where it decides what the object BECAME.
-		Abort: func() bool { return aborted.Load() || timedOut.Load() },
+		Abort: func() bool { return aborted.Load() || timedOut.Load() || stalled.Load() },
+		// The rebuild is the one stretch of the walk that files no report entry,
+		// so it is the one stretch that used to look identical to a wedged
+		// process: the last member stayed on the record, the progress stamp went
+		// stale, and the stall warner announced that an object rebuilding a
+		// multi-gigabyte archive "may be stalled rather than slow" while naming a
+		// file it had in fact already finished.
+		Progress: func(stage string, n int64) {
+			if job.Phase != "repacking" {
+				job.Phase = "repacking"
+				job.PhaseSince = time.Now()
+			}
+			job.ProgressSince = time.Now()
+			currentFile = stage
+			publish()
+		},
 	}
 	// Release every blob the walk staged. This runs before the panic recovery
 	// above (defers unwind last-registered-first), so a bug anywhere in the
 	// pipeline costs one object rather than a temp file that outlives it.
 	defer eng.Release()
 	out, changed := eng.ProcessBlob(o.Key, input, 0)
-	if eng.Aborted() {
+	// WasAborted, not Aborted: ask whether the walk STOPPED, not whether the
+	// deadline has passed by the time we get here. Aborted re-polls the predicate,
+	// so a timer firing in the gap between the walk finishing and this line
+	// condemned a scrub that was already complete — the output was discarded, the
+	// input was moved aside, and it was never retried. The work was done and it
+	// was thrown away for being late.
+	//
+	// A withdrawal that lands in the same gap is still honoured: commit() below is
+	// the gate for that, and it closes the door under one lock.
+	if eng.WasAborted() {
 		// Stopped mid-walk. Everything staged is released by the defers above; no
 		// output, report or digest is written, and the verdict below is deliberately
 		// never computed — an object that did not finish has no coverage answer to
@@ -1169,12 +1373,26 @@ func (w *Worker) processObject(ctx context.Context, o store.Object) {
 			cancelledExit()
 			return
 		}
+		if stalled.Load() {
+			stalledExit(at())
+			return
+		}
 		p := at()
 		if snap := expiredAt.Load(); snap != nil {
 			p = *snap
 		}
 		timedOutExit(p)
 		return
+	}
+	if timedOut.Load() {
+		// The budget expired, but the walk had already finished. Delivering is the
+		// only defensible answer: the work is complete, and discarding it would
+		// cost the user their scrub AND file the input away unretried. The overrun
+		// is still worth a line — it means the budget is too small for the bundles
+		// this pod is being sent, which is a capacity signal.
+		w.log.Warn("object finished after its scrub budget expired; delivering the completed "+
+			"result rather than discarding it. Raise requests.cpu or SCRUB_TIMEOUT",
+			"key", o.Key, "budget", w.cfg.ScrubTimeout, "elapsed", roundDur(time.Since(start)))
 	}
 	if changed {
 		// ProcessBlob returns the input itself when nothing changed, so only close
@@ -1248,7 +1466,8 @@ func (w *Worker) processObject(ctx context.Context, o store.Object) {
 	// `ls /work` while still counting against the emptyDir sizeLimit.
 	err = func() error {
 		defer outRC.Close()
-		return w.store.PutStream(ctx, w.cfg.OutputBucket, outKey, outRC, out.Size(), "")
+		return w.store.PutStream(ctx, w.cfg.OutputBucket, outKey,
+			&heartbeatReader{r: outRC, tick: beat}, out.Size(), "")
 	}()
 	if err != nil {
 		fail(fmt.Errorf("put output: %w", err))

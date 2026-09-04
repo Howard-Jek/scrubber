@@ -44,7 +44,12 @@ type corpusRow struct {
 	// residual is whether the safety net should find the policy inside content the
 	// walk declined to inspect.
 	wantResidual bool
-	limits       *Limits
+	// wantOpaque is whether this shape is a container the safety net could not see
+	// INTO at all -- encrypted, an unsupported codec, a stream cut off before its
+	// content. A clean scan of one of those is the absence of a scan, so it makes
+	// the run risky on its own, with or without hits.
+	wantOpaque bool
+	limits     *Limits
 }
 
 func corpusUTF16(t *testing.T, s string, be, bom bool) []byte {
@@ -146,13 +151,13 @@ func corpusRows() []corpusRow {
 			wantStatus: report.StatusScrubbed, wantDisp: report.Inspected,
 		},
 		{
-			name: "utf-32be with BOM",
-			body: func(t *testing.T) []byte { return corpusUTF32(t, text, true, true) },
+			name:       "utf-32be with BOM",
+			body:       func(t *testing.T) []byte { return corpusUTF32(t, text, true, true) },
 			wantStatus: report.StatusScrubbed, wantDisp: report.Inspected,
 		},
 		{
-			name: "utf-32be no BOM",
-			body: func(t *testing.T) []byte { return corpusUTF32(t, text, true, false) },
+			name:       "utf-32be no BOM",
+			body:       func(t *testing.T) []byte { return corpusUTF32(t, text, true, false) },
 			wantStatus: report.StatusScrubbed, wantDisp: report.Inspected,
 		},
 
@@ -222,19 +227,19 @@ func corpusRows() []corpusRow {
 			name:       "bzip2 (read-only format)",
 			body:       raw("BZh9" + text), // not real bzip2; DetectFormat only reads the header
 			wantStatus: report.StatusUnsupported, wantDisp: report.NotInspected,
-			wantReason: report.ReasonUnsupported, wantResidual: true,
+			wantReason: report.ReasonUnsupported, wantResidual: true, wantOpaque: true,
 		},
 		{
 			name:       "7z",
 			body:       raw("7z\xbc\xaf\x27\x1c" + text),
 			wantStatus: report.StatusUnsupported, wantDisp: report.NotInspected,
-			wantReason: report.ReasonUnsupported, wantResidual: true,
+			wantReason: report.ReasonUnsupported, wantResidual: true, wantOpaque: true,
 		},
 		{
 			name:       "rar",
 			body:       raw("Rar!\x1a\x07\x00" + text),
 			wantStatus: report.StatusUnsupported, wantDisp: report.NotInspected,
-			wantReason: report.ReasonUnsupported, wantResidual: true,
+			wantReason: report.ReasonUnsupported, wantResidual: true, wantOpaque: true,
 		},
 
 		// --- magic-byte false positives: plain text that looks like a container ---
@@ -245,15 +250,16 @@ func corpusRows() []corpusRow {
 
 		// --- guards: each trips with its own reason, none of them "unclassified" ---
 		{
-			// The budget trips *before* decompression, so the scan sees only compressed
-			// bytes and honestly finds nothing. The run is still incomplete and named;
-			// it just cannot be escalated, because refusing to expand is exactly what
-			// stopped us seeing inside. Documented rather than papered over.
+			// The budget trips before the WALK decompresses it, but the safety net has
+			// its own bounded budget and decompresses it anyway -- which is the whole
+			// point: a bundle refused for being too big used to leave as merely
+			// "incomplete", scanned as gzip bytes that contain no text at any stride,
+			// and landed in the normal output beside genuinely clean work.
 			name:       "expansion budget exceeded",
 			body:       func(t *testing.T) []byte { return corpusTarGz(t, "logs/app.log", []byte(text)) },
 			limits:     tight,
 			wantStatus: report.StatusGuardTripped, wantDisp: report.NotInspected,
-			wantReason: report.ReasonExpandBudget,
+			wantReason: report.ReasonExpandBudget, wantResidual: true,
 		},
 		{
 			name: "member cap exceeded",
@@ -384,8 +390,12 @@ func TestCorpus(t *testing.T) {
 				t.Errorf("residual scan found hits = %v, want %v (hits=%d, samples=%v)",
 					got, want, rep.Summary.ResidualHits, rep.Summary.ResidualSamples)
 			}
+			if got, want := rep.Summary.UnscannableHoles > 0, tc.wantOpaque; got != want {
+				t.Errorf("hole the scan could not see into = %v, want %v (unscannable=%d)",
+					got, want, rep.Summary.UnscannableHoles)
+			}
 			wantVerdict := report.VerdictIncomplete
-			if tc.wantResidual {
+			if tc.wantResidual || tc.wantOpaque {
 				wantVerdict = report.VerdictIncompleteRisky
 			}
 			if v := rep.Summary.Verdict(); v != wantVerdict {

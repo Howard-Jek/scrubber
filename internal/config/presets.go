@@ -1,6 +1,9 @@
 package config
 
-import "strings"
+import (
+	"net/netip"
+	"strings"
+)
 
 // presetRule defines a built-in PII pattern. valid is an optional second-stage
 // check applied to a candidate span to suppress false positives.
@@ -21,14 +24,21 @@ var presets = map[string]presetRule{
 		pattern:     `\b(?:(?:25[0-5]|2[0-4][0-9]|1?[0-9]?[0-9])\.){3}(?:25[0-5]|2[0-4][0-9]|1?[0-9]?[0-9])\b`,
 		replacement: "[IPV4]",
 	},
+	// The shape is deliberately loose -- any run of hex groups and colons, with an
+	// optional dotted IPv4 tail for the mapped form -- and the validator does the
+	// real work by parsing the candidate as an address. The previous pattern
+	// required every group to be present, so it could not see "fe80::1" or
+	// "2001:db8::1" (the forms addresses are actually written in) while it matched
+	// "12:30:45", which is every syslog timestamp, and every MAC address.
 	"ipv6": {
-		pattern:     `\b(?:[0-9A-Fa-f]{1,4}:){2,7}[0-9A-Fa-f]{1,4}\b`,
+		pattern:     `[0-9A-Fa-f]{0,4}(?::[0-9A-Fa-f]{0,4}){2,7}(?:\.[0-9]{1,3}){0,3}`,
 		replacement: "[IPV6]",
+		valid:       isIPv6,
 	},
 	"credit_card": {
 		pattern:     `\b\d(?:[ -]?\d){12,18}\b`,
 		replacement: "[CARD]",
-		valid:       luhn,
+		valid:       cardNumber,
 	},
 	"ssn": {
 		pattern:     `\b\d{3}-\d{2}-\d{4}\b`,
@@ -42,8 +52,15 @@ var presets = map[string]presetRule{
 		pattern:     `\beyJ[A-Za-z0-9_\-]+\.eyJ[A-Za-z0-9_\-]+\.[A-Za-z0-9_\-]+`,
 		replacement: "[JWT]",
 	},
+	// A bare ten-digit run is not a phone number: it is an epoch timestamp, a
+	// process id, an order number. Separators are required unless the number
+	// carries a country code or area-code parentheses, and the parentheses have to
+	// balance -- "555) 123-4567" used to match.
 	"phone_us": {
-		pattern:     `\b(?:\+?1[ .\-]?)?\(?\d{3}\)?[ .\-]?\d{3}[ .\-]?\d{4}\b`,
+		pattern: `\+1[ .\-]?(?:\(\d{3}\)|\d{3})[ .\-]?\d{3}[ .\-]?\d{4}\b` +
+			`|\b1[ .\-](?:\(\d{3}\)|\d{3})[ .\-]?\d{3}[ .\-]?\d{4}\b` +
+			`|\(\d{3}\)[ .\-]?\d{3}[ .\-]?\d{4}\b` +
+			`|\b\d{3}[ .\-]\d{3}[ .\-]\d{4}\b`,
 		replacement: "[PHONE]",
 	},
 	// Windows/NetBIOS account: DOMAIN\user. Anchored on the backslash, so very low
@@ -101,6 +118,38 @@ func looksLikeHostname(s string) bool {
 	for i := 0; i < len(s); i++ {
 		if s[i] == '-' || (s[i] >= '0' && s[i] <= '9') {
 			return true
+		}
+	}
+	return false
+}
+
+// isIPv6 accepts a candidate only if it parses as an IPv6 address AND has enough
+// substance to be one in a log: at least two hex groups, or one after a leading
+// "::". The parse is what rejects timestamps and MAC addresses (neither has eight
+// groups or a "::"); the group rule is what rejects "d::" out of "std::vector" and
+// the bare "::" of every C++ scope, both of which parse as valid addresses.
+func isIPv6(s string) bool {
+	addr, err := netip.ParseAddr(s)
+	if err != nil || !addr.Is6() {
+		return false
+	}
+	groups := 0
+	for _, g := range strings.Split(s, ":") {
+		if g != "" {
+			groups++
+		}
+	}
+	return groups >= 2 || (groups == 1 && strings.HasPrefix(s, "::"))
+}
+
+// cardNumber validates a candidate card-number span: it must carry an issuer
+// prefix a payment network actually uses, and pass Luhn. The prefix check is what
+// keeps millisecond epoch timestamps out -- thirteen digits starting with 1, which
+// Luhn alone accepted one time in ten.
+func cardNumber(s string) bool {
+	for i := 0; i < len(s); i++ {
+		if s[i] >= '0' && s[i] <= '9' {
+			return s[i] >= '3' && s[i] <= '6' && luhn(s)
 		}
 	}
 	return false

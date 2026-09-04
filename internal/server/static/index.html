@@ -563,7 +563,9 @@
           // "file 7 of 10" is the phrasing the count was added for. The denominator can
           // grow when a nested archive opens; that is honest, and better than a fixed
           // total that would be wrong.
-          var label=(s.phase==='writing'?'Writing… ':'Scrubbing… ')
+          // "repacking" is real work with no per-file progress to show: the members
+          // are done and the container is being rebuilt around them.
+          var label=(s.phase==='writing'?'Writing… ':s.phase==='repacking'?'Rebuilding… ':'Scrubbing… ')
             +(total>0 ? ('file '+s.files_done+' of '+total)
                       : (s.files_done+' file'+(s.files_done===1?'':'s')));
           // Elapsed used to vanish the moment the first file landed, so the one

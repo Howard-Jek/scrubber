@@ -143,6 +143,7 @@ one rule must be present.
 | `regex[].pattern` | RE2 regular expression (Go syntax). Validated at load time. |
 | `*.replacement` | Per-rule override of `default_replacement`. |
 | `presets[]` | Built-in PII patterns to enable. |
+| `preset_replacements` | Override the label a named preset writes, e.g. `{"ipv4":"[IP_V4]"}`. Every key must also appear in `presets`. |
 
 Precedence is **literals → regex → presets**, in file order. When two rules could
 match the same span, the earlier one wins.
@@ -152,16 +153,23 @@ match the same span, the earlier one wins.
 | Name | Matches | Replacement |
 |---|---|---|
 | `email` | Email addresses | `[EMAIL]` |
-| `ipv4` / `ipv6` | IP addresses | `[IPV4]` / `[IPV6]` |
-| `credit_card` | 13–19 digit card numbers, **Luhn-validated** | `[CARD]` |
+| `ipv4` | IPv4 addresses | `[IPV4]` |
+| `ipv6` | IPv6 addresses, validated by parsing — including `::` forms. Does **not** match syslog timestamps or MAC addresses | `[IPV6]` |
+| `credit_card` | 13–19 digit card numbers, **Luhn-validated** and required to carry a real issuer prefix (3–6), so millisecond timestamps are not matched | `[CARD]` |
 | `ssn` | US SSNs (`###-##-####`) | `[SSN]` |
 | `aws_key` | AWS access key IDs (`AKIA…`/`ASIA…`) | `[AWS_KEY]` |
 | `jwt` | JSON Web Tokens | `[JWT]` |
-| `phone_us` | US phone numbers | `[PHONE]` |
+| `phone_us` | US phone numbers. Separators required unless country-coded, so bare 10-digit ids and epoch seconds are not matched | `[PHONE]` |
 | `windows_account` | `DOMAIN\user` (e.g. `ACME\jsmith`) | `[ACCOUNT]` |
 | `upn` | `user@domain` logins | `[UPN]` |
 | `fqdn` | Host names (e.g. `db-prod-01.internal.acme.com`); skips filenames like `app.log` | `[FQDN]` |
 | `hostname` | Short single-label hosts; requires a digit or hyphen so plain words aren't matched | `[HOST]` |
+
+> **`hostname` cannot be combined with `ipv4` or `ipv6` as they stand.** The labels
+> `[IPV4]` and `[IPV6]` are words containing a digit, which is exactly what `hostname`
+> matches, so the policy would not converge and is refused at load. Give one of them a
+> label `hostname` cannot read as a word — an underscore does it:
+> `"preset_replacements": { "ipv4": "[IP_V4]", "ipv6": "[IP_V6]" }`.
 
 > **Prefer exact strings where you have them.** `literals` are false-positive-free.
 > `fqdn` and especially `hostname` match by *shape* and are the noisiest — anchoring
@@ -216,6 +224,7 @@ alert on. Every uninspected file carries exactly one.
 | `expansion-budget` | Would exceed `MAX_EXPAND_BYTES`. Every member of that container is emitted unscrubbed. **Fix:** raise the `/work` volume (and both `ephemeral-storage` values and `SCRATCH_BYTES`) — 3.5x the expanded size you need. Not memory. |
 | `leaf-cap` | One **file** larger than `MAX_LEAF_BYTES` — too large to hold contiguously in heap. Only that file is passed through; the rest of the archive is still scrubbed. **Fix:** raise `limits.memory` — the cap scales at 96 MiB per 2 GiB of pod, so 4Gi admits 192 MiB files and 8Gi admits 384 MiB — or scrub that one file with the CLI, which has no leaf cap. Not the volume. |
 | `member-cap` | Archive exceeds `MAX_MEMBERS`. |
+| `encrypted` | A zip entry is encrypted, so its contents cannot be read or scrubbed. Only that entry is affected — it travels in its stored form and the rest of the archive is still scrubbed. **Fix:** ask the sender for an unencrypted copy. |
 | `depth-cap` | Nesting exceeds `MAX_DEPTH`. |
 | `scratch-unavailable` | Could not spill to disk. |
 | `repack-failed` | Scrubbed, then could not be rebuilt — rolled back and emitted verbatim. |
@@ -228,7 +237,7 @@ alert on. Every uninspected file carries exactly one.
 | --- | --- | --- |
 | `complete` | Everything was inspected. | Normal output |
 | `incomplete` | Something was skipped, and scanning it found nothing sensitive. | Normal output, named and flagged |
-| `incomplete-risky` | Something was skipped **and it contains policy matches**. | Diverted to `review/` |
+| `incomplete-risky` | Something was skipped **and** either it contains policy matches, or it could not be read at all. | Diverted to `review/` |
 
 Diversion is the point. A flag only helps somebody who reads it; a key under `review/`
 cannot be picked up by a process looking for finished work. Harmless skips deliberately

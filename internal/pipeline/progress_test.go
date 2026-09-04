@@ -17,7 +17,7 @@ func walkCounts(t *testing.T, data []byte) (done, total int) {
 	t.Helper()
 	rep := report.New("in", "out", report.AuditFull, false, "test")
 	rep.OnMembers(func(n int) { total = n })
-	rep.OnFile(func(f report.FileEntry) {
+	rep.OnFile(func(f report.FileEntry, _ int) {
 		// The worker excludes filename entries from its count for the same reason:
 		// a scrubbed name is an annotation on a member, not a member.
 		if f.Detail == report.DetailFilenameScrubbed {

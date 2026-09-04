@@ -83,10 +83,15 @@ func DetectFormat(header []byte) Format {
 		return SevenZip
 	case bytes.HasPrefix(header, sigRar5), bytes.HasPrefix(header, sigRar4):
 		return Rar
-	case isZlib(header):
-		return Zlib
+	// tar before zlib: the tar test is a 512-byte header with a checksum, the zlib
+	// test is two bytes that one plain-text prefix in thirty-one satisfies. A tar
+	// whose first entry was named "80..." or "home/..." could be sent to inflate,
+	// fail, be retried as a leaf, and be skipped as binary -- a tar of logs out
+	// unscrubbed on the strength of its first filename.
 	case isTar(header):
 		return Tar
+	case isZlib(header):
+		return Zlib
 	default:
 		return Unknown
 	}

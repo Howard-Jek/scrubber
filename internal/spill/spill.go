@@ -111,6 +111,20 @@ type Blob struct {
 	path   string
 	size   int64
 	closed bool
+	// wrapped marks a blob that borrows a caller's buffer outside the resident
+	// accounting, so Close must not give back a reservation it never took.
+	wrapped bool
+}
+
+// Wrap presents a caller-owned byte slice as a Blob without copying it, spilling
+// it, or counting it against the resident budget.
+//
+// For the CLI's top-level input, which is already whole in memory because that is
+// how the CLI works. Wrapping it through FromBytes wrote every file above the
+// spill threshold to a temp file and then read it back -- twice -- for nothing.
+// The caller keeps ownership: do not mutate b while the Blob is in use.
+func Wrap(b []byte) *Blob {
+	return &Blob{mem: b, size: int64(len(b)), wrapped: true}
 }
 
 // tempPrefix names every scratch file this package creates. Reclaim matches on it
@@ -323,7 +337,9 @@ func (b *Blob) Close() error {
 		}
 		return nil
 	}
-	release(int64(len(b.mem)))
+	if !b.wrapped {
+		release(int64(len(b.mem)))
+	}
 	b.mem = nil
 	return nil
 }

@@ -203,7 +203,7 @@ func TestSpillCleansUpOnPanic(t *testing.T) {
 
 	// Panic from the report callback, which fires from deep inside the member loop:
 	// members are staged, the decompressed container is staged, nothing is repacked.
-	eng.Report.OnFile(func(f report.FileEntry) {
+	eng.Report.OnFile(func(f report.FileEntry, _ int) {
 		panic("boom")
 	})
 

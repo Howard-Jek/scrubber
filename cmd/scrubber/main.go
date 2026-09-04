@@ -187,8 +187,11 @@ func processDir(eng *pipeline.Engine, inDir, outDir string, inPlace, dryRun bool
 		data, err := os.ReadFile(path)
 		if err != nil {
 			// Unreadable file: record and skip rather than aborting the whole run.
-			eng.Report.Record(path, report.StatusPassthrough,
-				fmt.Sprintf("could not read file: %v", err), 0, 0, nil)
+			// Through Skip, not Record: a hole needs the reason code that metrics
+			// label and the UI groups by, and Record gives it the "unclassified"
+			// tripwire instead.
+			eng.Report.Skip(path, report.StatusPassthrough, report.ReasonMalformed,
+				fmt.Sprintf("could not read file: %v", err), 0, 0)
 			return nil
 		}
 		result := eng.Process(path, data, 0)

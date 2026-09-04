@@ -10,6 +10,219 @@ For what to verify on your own cluster after taking a new image, see
 
 ---
 
+## 0.8.4 — the unit of failure is the member, not the bundle
+
+The rule on the front page is that a file which was not inspected is never
+reported as clean. That held. What it did not say is that the unit of failure was
+the whole container: one password-protected zip entry, one member compressed with
+a codec Go cannot read, one truncated byte at the end of a partial upload, and
+every readable log in the archive went out **unscrubbed, into the normal output
+bucket, with status `scrubbed`** and verdict `incomplete` rather than
+`incomplete-risky`.
+
+The safety net that exists to catch precisely that could not see it. `residual`
+scans for text at one-, two- and four-byte stride, either byte order — but it was
+handed the *compressed* bytes, which contain no text at any stride. So it found
+nothing, honestly, and the run was filed beside genuinely clean work. The net had
+a hole exactly where it was needed.
+
+### One bad member no longer sinks the archive
+
+`ReadZip` failed the whole archive on the first entry it could not decode. Go's
+`zip.File.Open` has no encryption check at all — it inflates the ciphertext and
+fails somewhere inside, and that failure reads as corruption — so a
+password-protected entry, an LZMA or Deflate64 entry from 7-Zip or WinZip, or a
+bad CRC each cost every other member its scrub.
+
+An undecodable entry is now carried across in its stored form via `OpenRaw`,
+byte for byte, and the rest of the archive is scrubbed around it. The encryption
+flag is read from the general-purpose bit rather than inferred from a failed
+inflate, because the operator's next step differs: ask the sender for the
+password, not for a re-upload. New reason code `encrypted`.
+
+The same mechanism pays for itself on the way out: `WriteZipTo` now copies every
+member the walk did not change in its stored form. No re-deflate, and the output
+bytes are identical to the input's rather than re-derived.
+
+### A truncated bundle keeps what was readable
+
+`ReadTar` discarded every member it had already read when the archive ended
+early, and `DecompressBlob` threw away the decoded prefix. A partial upload —
+the commonest malformed shape there is — therefore went out whole and untouched.
+
+A tar that ends early now keeps its complete entries, and the unparseable
+remainder is carried through byte for byte, so nothing is lost and the readable
+members are scrubbed. A compressed stream that ends early is salvaged only when
+the decoded prefix has member boundaries to salvage to: rebuilding a bare stream
+from a few decoded bytes would replace the user's file with a stub, so that one
+is passed through whole and the residual scan — which decompresses now — is what
+catches it.
+
+### The safety net decompresses, and says when it could not look
+
+`residual.Scan` unwraps gzip, zlib, bzip2, xz and zstd and walks zip entries
+before extracting text, and it distinguishes bytes decoded from *inside* a
+container from raw bytes read off the outside of one. A recognised container that
+yields nothing decodable is reported as opaque, and an opaque hole makes the run
+`incomplete-risky` on its own: a clean scan of something nobody could open is the
+absence of a scan, not a reassurance. Those results are diverted to `review/`,
+where a consumer looking for finished work will not pick them up.
+
+This obsoletes the "one honest limit" note in the manual, which said a bundle
+refused by the expansion budget could not be escalated. It can now.
+
+### A validator rejection no longer swallows what is inside it
+
+`FindAllStringIndex` is non-overlapping, and a candidate a validator rejected
+consumed its span anyway. With `credit_card` before `ssn` — the order
+`strict.json` ships — the string `123-45-6789-1234` was claimed by the card rule,
+failed Luhn, and the scan resumed past it: **the SSN in the middle was never
+scrubbed**. Same shape for a literal inside an `fqdn` candidate that
+`notFileName` rejects.
+
+Other rules now get their turn at that position, with one character of real
+context so `\b` behaves as it does in the whole document. The same rule may not
+re-match a shorter window inside a span it just rejected, or a thirteen-digit run
+that fails its checksum comes straight back as a twelve-digit one.
+
+Attribution is by capture group now rather than by re-running every rule's regexp
+against every match — which also deletes the fallback that could attach the wrong
+rule, and its validator, to a span.
+
+### Presets that were matching the wrong things
+
+- `ipv6` matched `12:30:45` — every syslog timestamp — and every MAC address,
+  while **missing** `fe80::1` and `2001:db8::1`, because it required every group
+  to be present. It is a loose shape validated by `netip.ParseAddr` now.
+- `phone_us` matched bare epoch seconds, any ten-digit id, and the unbalanced
+  `555) 123-4567`. Separators are required unless the number is country-coded,
+  and parentheses must balance.
+- `credit_card` matched 13-digit millisecond timestamps, and Luhn alone let
+  through about one in ten. An issuer prefix of 3–6 is required.
+- `hostname` could not be combined with `ipv4`/`ipv6` at all: the labels
+  `[IPV4]`/`[IPV6]` contain a digit, which is exactly the shape `hostname` looks
+  for, so the policy was refused at load. `preset_replacements` lets a preset's
+  label be overridden, and the convergence error now names that as the fix.
+
+`detect` also tests for tar before zlib. The zlib signature is two bytes that one
+plain-text prefix in thirty-one satisfies, so a tar whose first entry was named
+`80...` or `home/...` could be sent to inflate, fail, be retried as a leaf,
+sniffed as binary and skipped — a tar of logs out unscrubbed on the strength of
+its first filename.
+
+### The warning that could not tell stalled from slow
+
+Prompted by a real incident: a `.tar.gz` of a git repository, warning repeatedly
+that it *"may be stalled rather than slow"*, `no_progress_seconds=2924`,
+`current_file` naming a `pack-*.pack`.
+
+Two things in that line did not mean what they looked like. `state=still` is a
+de-duplication marker — `now` on the first warning for a (key, phase), `still` on
+repeats — carrying no stalled-vs-slow information, and the sentence itself is
+fixed text printed every time. And `current_file` is assigned inside the report's
+`OnFile` callback, so it names the member that most recently **finished**, not
+one being worked on.
+
+The gap it was reporting was real, though. `ProgressSince` advances only in
+`OnFile` and `OnMembers`, and rebuilding a container and recompressing it happen
+*after* the last member is recorded — nothing on that path touches the report. So
+an object busily rebuilding a multi-gigabyte archive published no progress at
+all, kept a finished member on the record as its current file, and was reported
+as possibly stalled for as long as the rebuild took.
+
+`Engine.Progress` is a heartbeat for that stretch: a `repacking` phase, a
+"Rebuilding…" label on the page, and an entry in `phaseDescription` so a failure
+there says so. The two object-storage transfers heartbeat too — the download sits
+in `reading` and the upload in `writing`, each publishing nothing from first byte
+to last, and `TRANSFER_STALL_TIMEOUT` does not cover them because it fires only
+on a transfer that has moved *no* bytes at all.
+
+### The deadline could not reach the work, and then discarded it
+
+`SCRUB_TIMEOUT` was polled at three sites, all of them member or container
+boundaries. Between two boundaries the walk is straight-line code, so a single
+member large enough to outlast the budget ran to completion regardless and a
+rebuild could not be stopped at all. The deadline was a suggestion for exactly
+the objects big enough to need one. The matcher takes an abort predicate now
+(polled per 4096 matches) and the rebuild polls on every write.
+
+Worse: the worker asked `eng.Aborted()` *after* the walk returned, and that
+re-polls the predicate. A timer firing in the gap between the walk finishing and
+that line condemned a scrub that was already complete — output discarded, input
+moved aside as a timeout, never retried. An hour of work thrown away at the
+moment it succeeded. It asks `WasAborted` now — *did the walk stop* — and a
+deadline that expires after a successful walk delivers the result with a line
+saying it overran. A late withdrawal is still honoured; `commit()` is the gate
+for that and always was.
+
+Two smaller ones from the same area: `Report.Rollback` did not undo
+`NoteMembers`, so a failed repack reported **"file 4 of 3"** and the live view
+disagreed with the stored digest threefold; and `OnMembers` published a stale
+copy of the job record, so opening a nested archive reset the card to
+"Unpacking", showed "no new file in 12m", and re-armed the stall warning on an
+object moving steadily through its members.
+
+### WORKERS means something, and a stuck object stops holding the queue
+
+`WORKERS` was not a knob, it was a no-op. `Run()` started exactly one consumer,
+hardcoded, and the value was read only to be compared, warned about and
+overwritten with 1.
+
+What actually blocked concurrency was a correctness bug: `w.running` was a single
+`*inflight` pointer, so a second consumer overwrote the first one's
+registration. A cancel aimed at A reached B, and `commit()` marked whichever
+registered last as delivered — a withdrawal could be accepted for a bundle
+already in the output bucket, which is the one claim `CancelTooLate` exists to
+make impossible. It is a map keyed by object now.
+
+The caps are **divided** by the consumer count rather than promised to each,
+because every worker holds its own leaf in heap and its own expansion on scratch.
+At `WORKERS: 2` with 32Gi of scratch each object gets 4.57 GiB of expansion
+instead of 9.14 GiB. `est_peak_rss` and the scratch estimate multiply by the
+count too — except the spill reservation, which is a process-wide counter every
+worker already shares. Bounded at 8.
+
+`STALL_ABORT_AFTER` abandons an object that publishes **no** progress for its
+budget, so the consumer moves on and the queue behind it drains. Deliberately not
+`SCRUB_TIMEOUT`: that is a total budget and fires on healthy work that is merely
+large, while this fires only when nothing has moved, so it can be set far tighter
+without threatening a legitimate bundle. Off by default. Its own metric label
+(`status="no_progress"`) and its own failure text, because a rising rate here
+points at the scratch volume or the object store rather than at capacity.
+
+It is only trustworthy because the silent stretches now report — before the
+heartbeat work above, a rebuild was silent for its whole duration and this check
+would have destroyed healthy runs. It remains **cooperative**: an object blocked
+in a syscall never reaches a poll site and cannot be abandoned at all, which is
+the other reason `WORKERS` exists.
+
+`watchStalls` walks every in-flight object with per-key warn state, and
+`InflightPhaseSeconds` reports the worst rather than an arbitrary one — with
+several consumers a healthy object finishing beside a wedged one must not reset
+the series an operator alerts on.
+
+### Also
+
+`ENOSPC` during a repack is reported as `scratch-unavailable` rather than
+`repack-failed`; the read side always drew that distinction and the write side
+did not, sending operators hunting a corrupt upload when `/work` was full. The
+CLI's two `Record` call sites go through `Skip`, so they stop tripping the
+`unclassified` tripwire the corpus asserts nobody trips — the corpus never caught
+them because it drives `ProcessBlob` directly. `Process` wraps the caller's bytes
+instead of spilling them to scratch and reading them back twice. `Job.Done()`
+includes `cancelled`, so polling a withdrawn key stops costing two failed object
+reads forever.
+
+### Verification
+
+`go build`, `go vet`, `go test ./... -count=1` green. **`go test -race ./...`
+green on Linux**, including a new test that runs the real consumer loop with four
+workers over sixteen objects — every other test in that package drives `runOnce`,
+which drains on one goroutine, so the detector had never seen two scrubs in
+flight. Corpus rows updated where they encoded the old rule.
+
+Known gaps are recorded in [todo.md](../todo.md) rather than left implied.
+
 ## 0.8.3 — size the timeout from the CPU the pod is promised, not the one it may borrow
 
 Prompted by a real deployment: `requests.cpu: 100m`, `limits.cpu: 4`,
@@ -66,7 +279,9 @@ purpose, and it errs high by about 3.5x, which is worth knowing before sizing
 across every package on Linux, including the timer goroutine 0.8.2 added.
 
 **Shell scripts were unrunnable from a Windows checkout.** No `.gitattributes`, so
-every `.sh` got CRLF and `#!/usr/bin/env bash` failed with *"bash: No such file or
+every `.sh` got CRLF and `#!/usr/bin/env bash
+` failed with *"bash
+: No such file or
 directory"* — which reads as a missing interpreter, not a line ending. That is why the
 memory matrix had never run here. Added, covering `*.sh`, `Containerfile` and the
 YAML.
