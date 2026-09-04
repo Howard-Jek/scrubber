@@ -193,7 +193,9 @@ func realMain(log *slog.Logger) error {
 	log.Info("starting scrubberd", "version", version, "go", runtime.Version())
 
 	res := podres.Detect()
-	c := deriveCaps(res)
+	// Read before the caps are derived: they are divided by it.
+	workers := envInt("WORKERS", 1)
+	c := deriveCaps(res, workers)
 	memScale := c.memScale
 	scaled := func(base int64) int64 { return int64(float64(base) * memScale) }
 	scratchBytes, scratchSource := c.scratchBytes, c.scratchSource
@@ -253,13 +255,19 @@ func realMain(log *slog.Logger) error {
 		PollInterval:    envDuration("POLL_INTERVAL", 15*time.Second),
 		// Clamped to 1 by worker.New. Read from the environment anyway so an
 		// operator who set it higher gets told it is being ignored.
-		Workers:  envInt("WORKERS", 1),
+		Workers:  workers,
 		QueueMax: envInt("QUEUE_MAX", 10000),
 		// Defaults match the shipped manifest. They used to disagree with it and
 		// with the README, which made the startup memory arithmetic unverifiable.
 		MaxObjectBytes: envInt64(probs, "MAX_OBJECT_BYTES", maxObjectDefault),
 		FinalizeGrace:  envDuration("FINALIZE_GRACE", 15*time.Second),
 		StallWarnAfter: envDuration("STALL_WARN_AFTER", 5*time.Minute),
+		// Abandon an object that publishes NO progress for this long, so one wedged
+		// bundle cannot hold a consumer forever. Off by default: it is a new failure
+		// mode for an existing deployment, and it should be a deliberate choice.
+		// Unlike SCRUB_TIMEOUT it does not fire on healthy work that is merely
+		// large, so it can be set far tighter than the total budget.
+		StallAbortAfter: envDuration("STALL_ABORT_AFTER", 0),
 		// The one bound on the walk itself. See worker.Config.ScrubTimeout for why
 		// nothing else is one, and the sizing check below for how this default was
 		// picked against MAX_EXPAND_BYTES.
@@ -341,7 +349,12 @@ func realMain(log *slog.Logger) error {
 	// est_peak_rss is the one still worth sizing against: compare it to limits.memory
 	// and lower MAX_LEAF_BYTES, or raise the memory, if it is close. Re-derive both
 	// with scripts/memory-matrix.sh after any change.
-	budget := wcfg.MaxObjectBytes + wcfg.Limits.MaxTotalBytes
+	// Multiplied by the consumer count: each object in flight brings its own
+	// expansion budget, its own leaf and its own per-member bookkeeping. The one
+	// term that does NOT multiply is the spill reservation, which is a
+	// process-wide counter shared by every worker.
+	nw := int64(wcfg.Workers)
+	budget := nw * (wcfg.MaxObjectBytes + wcfg.Limits.MaxTotalBytes)
 	sp := wcfg.Limits.Spill
 	// The leaf term used to be leafCopies*SPILL_THRESHOLD, which quietly assumed the
 	// spill threshold bounds the largest payload the matcher holds. It does not:
@@ -354,9 +367,9 @@ func realMain(log *slog.Logger) error {
 	if leafBytes <= 0 {
 		leafBytes = wcfg.Limits.MaxTotalBytes
 	}
-	estPeak := int64(float64(sp.ResidentMax+leafCopies*leafBytes)*peakRSSFactor) +
-		runtimeBaselineBytes + int64(wcfg.Limits.MaxMembers)*perMemberBytes
-	scratch := int64(scratchFactor * float64(wcfg.Limits.MaxTotalBytes))
+	estPeak := int64(float64(sp.ResidentMax+nw*leafCopies*leafBytes)*peakRSSFactor) +
+		runtimeBaselineBytes + nw*int64(wcfg.Limits.MaxMembers)*perMemberBytes
+	scratch := nw * int64(scratchFactor*float64(wcfg.Limits.MaxTotalBytes))
 
 	// Let the GC know the ceiling too. Go applies GOMEMLIMIT from the environment
 	// at init, so setting it here would override an operator's explicit value —
@@ -380,7 +393,7 @@ func realMain(log *slog.Logger) error {
 		// bundle came back "incomplete" on a pod with plenty of disk.
 		"max_leaf_bytes", wcfg.Limits.MaxLeafBytes,
 		"max_members", wcfg.Limits.MaxMembers,
-		"queue_concurrency", 1,
+		"queue_concurrency", wcfg.Workers,
 		"queue_max", wcfg.QueueMax,
 		"budget_bytes", budget,
 		"est_peak_rss_bytes", estPeak,
@@ -656,7 +669,10 @@ type caps struct {
 // direction that gets the pod evicted. Undeclared falls back to the sizeLimit the
 // shipped manifest carries, so a deployment that never engages with any of this
 // behaves as it always has.
-func deriveCaps(res podres.Limits) caps {
+func deriveCaps(res podres.Limits, workers int) caps {
+	if workers < 1 {
+		workers = 1
+	}
 	c := caps{
 		scratchBytes:  res.ScratchBytes,
 		scratchSource: res.ScratchSource,
@@ -665,9 +681,13 @@ func deriveCaps(res podres.Limits) caps {
 	if c.scratchBytes <= 0 {
 		c.scratchBytes, c.scratchSource = defaultScratchBytes, "default (undeclared)"
 	}
-	c.expandBytes = int64(float64(c.scratchBytes) / scratchFactor)
+	// Divided among the consumers rather than promised to each. Two workers on one
+	// pod scrub two bundles at once, each at most half the size -- which is the
+	// honest trade, and the alternative is a pod that hands both of them the whole
+	// volume and is evicted the first time they both use it.
+	c.expandBytes = int64(float64(c.scratchBytes) / scratchFactor / float64(workers))
 	c.objectBytes = int64(float64(c.expandBytes) * shippedObjectShare)
-	c.leafBytes = int64(float64(maxLeafBaseline) * c.memScale)
+	c.leafBytes = int64(float64(maxLeafBaseline) * c.memScale / float64(workers))
 	return c
 }
 

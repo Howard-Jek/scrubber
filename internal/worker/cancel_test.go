@@ -188,8 +188,8 @@ func TestCommitIsAtomicWithCancel(t *testing.T) {
 	ms := newMemStore("input", "output", "reports")
 	w, _ := cancelWorker(t, ms)
 
-	var flag atomic.Bool
-	w.beginInflight("k", func() {}, &flag)
+	var flag, stalled atomic.Bool
+	w.beginInflight("k", func() {}, &flag, &stalled)
 
 	// Commit first: a cancel afterwards must be told it is too late.
 	if !w.commit("k") {
@@ -202,12 +202,12 @@ func TestCommitIsAtomicWithCancel(t *testing.T) {
 	if out != CancelTooLate {
 		t.Errorf("outcome = %q, want %q: the output was already written", out, CancelTooLate)
 	}
-	w.endInflight()
+	w.endInflight("k")
 
 	// And the other order: cancel first, commit must refuse.
 	ms.Put(context.Background(), "input", "k2", []byte("x"), "")
-	var flag2 atomic.Bool
-	w.beginInflight("k2", func() {}, &flag2)
+	var flag2, stalled2 atomic.Bool
+	w.beginInflight("k2", func() {}, &flag2, &stalled2)
 	if _, err := w.cancel(context.Background(), "k2"); err != nil {
 		t.Fatalf("cancel: %v", err)
 	}

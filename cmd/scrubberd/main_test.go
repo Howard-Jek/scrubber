@@ -48,7 +48,7 @@ func TestDeriveCapsFollowsDeclaredScratch(t *testing.T) {
 				MemoryBytes:   2 * gib,
 				ScratchBytes:  tc.scratch,
 				ScratchSource: "test",
-			})
+			}, 1)
 			if c.expandBytes < tc.wantExpandAtLeast {
 				t.Errorf("expandBytes = %d (%.2f GiB), want at least %d (%.2f GiB)",
 					c.expandBytes, float64(c.expandBytes)/gib,
@@ -69,8 +69,8 @@ func TestDeriveCapsFollowsDeclaredScratch(t *testing.T) {
 // derivation. The previous default was flat past a point, and flat is precisely the
 // bug: a pod given more disk kept refusing bundles it had room for.
 func TestDeriveCapsIsLinearInScratch(t *testing.T) {
-	base := deriveCaps(podres.Limits{MemoryBytes: 2 * gib, ScratchBytes: 4 * gib})
-	quad := deriveCaps(podres.Limits{MemoryBytes: 2 * gib, ScratchBytes: 16 * gib})
+	base := deriveCaps(podres.Limits{MemoryBytes: 2 * gib, ScratchBytes: 4 * gib}, 1)
+	quad := deriveCaps(podres.Limits{MemoryBytes: 2 * gib, ScratchBytes: 16 * gib}, 1)
 	if got, want := quad.expandBytes, base.expandBytes*4; got != want {
 		t.Errorf("4x the volume gave %d, want exactly %d (%.2fx)",
 			got, want, float64(got)/float64(base.expandBytes))
@@ -87,8 +87,8 @@ func TestDeriveCapsIsLinearInScratch(t *testing.T) {
 // to prevent. The expansion budget is disk; giving the pod more RAM must not license
 // it to fill a volume that did not grow.
 func TestDeriveCapsScratchIsNotMemory(t *testing.T) {
-	small := deriveCaps(podres.Limits{MemoryBytes: 2 * gib, ScratchBytes: 8 * gib})
-	huge := deriveCaps(podres.Limits{MemoryBytes: 64 * gib, ScratchBytes: 8 * gib})
+	small := deriveCaps(podres.Limits{MemoryBytes: 2 * gib, ScratchBytes: 8 * gib}, 1)
+	huge := deriveCaps(podres.Limits{MemoryBytes: 64 * gib, ScratchBytes: 8 * gib}, 1)
 	if small.expandBytes != huge.expandBytes {
 		t.Errorf("expansion cap moved with memory: %d at 2Gi vs %d at 64Gi",
 			small.expandBytes, huge.expandBytes)
@@ -106,7 +106,7 @@ func TestDeriveCapsScratchIsNotMemory(t *testing.T) {
 // volume size — never on a guess from the node's disk, which is the number statfs
 // would offer and the one that gets a pod evicted.
 func TestDeriveCapsUndeclaredScratchFallsBack(t *testing.T) {
-	c := deriveCaps(podres.Limits{MemoryBytes: 2 * gib, ScratchSource: "not declared"})
+	c := deriveCaps(podres.Limits{MemoryBytes: 2 * gib, ScratchSource: "not declared"}, 1)
 	if c.scratchBytes != defaultScratchBytes {
 		t.Errorf("scratchBytes = %d, want the shipped default %d", c.scratchBytes, defaultScratchBytes)
 	}
@@ -124,7 +124,7 @@ func TestDeriveCapsUndeclaredScratchFallsBack(t *testing.T) {
 // clear message. The expansion cap does not reject — it emits the bundle unscrubbed.
 func TestDeriveCapsObjectCapStaysFirst(t *testing.T) {
 	for _, scratch := range []int64{4 * gib, 14 * gib, 64 * gib} {
-		c := deriveCaps(podres.Limits{MemoryBytes: 2 * gib, ScratchBytes: scratch})
+		c := deriveCaps(podres.Limits{MemoryBytes: 2 * gib, ScratchBytes: scratch}, 1)
 		if c.objectBytes >= c.expandBytes {
 			t.Errorf("scratch=%d: objectBytes %d is not below expandBytes %d",
 				scratch, c.objectBytes, c.expandBytes)
@@ -141,7 +141,7 @@ func TestDeriveCapsObjectCapStaysFirst(t *testing.T) {
 // way realMain does.
 func TestDeriveCapsLeafFitsMemoryGate(t *testing.T) {
 	for _, mem := range []int64{2 * gib, 4 * gib, 8 * gib} {
-		c := deriveCaps(podres.Limits{MemoryBytes: mem, ScratchBytes: 14 * gib})
+		c := deriveCaps(podres.Limits{MemoryBytes: mem, ScratchBytes: 14 * gib}, 1)
 		threshold := int64(float64(4*mib) * c.memScale)
 		if threshold < minSpillThreshold {
 			threshold = minSpillThreshold
@@ -166,7 +166,7 @@ func TestDeriveCapsLeafFitsMemoryGate(t *testing.T) {
 // complete. A silent false clean is the worst failure this service has.
 func TestDeriveCapsNoOverflow(t *testing.T) {
 	for _, scratch := range []int64{math.MaxInt64, math.MaxInt64 / 2, 1 << 60} {
-		c := deriveCaps(podres.Limits{MemoryBytes: 2 * gib, ScratchBytes: scratch})
+		c := deriveCaps(podres.Limits{MemoryBytes: 2 * gib, ScratchBytes: scratch}, 1)
 		if c.expandBytes <= 0 {
 			t.Errorf("scratch=%d produced a non-positive budget %d, which the engine "+
 				"silently rewrites to a default", scratch, c.expandBytes)
@@ -240,7 +240,7 @@ func TestShippedManifestDerivesItsDocumentedCaps(t *testing.T) {
 	scratch := manifestScratchBytes(t, text)
 	memory := manifestMemoryLimitBytes(t, text)
 
-	c := deriveCaps(podres.Limits{MemoryBytes: memory, ScratchBytes: scratch, ScratchSource: "manifest"})
+	c := deriveCaps(podres.Limits{MemoryBytes: memory, ScratchBytes: scratch, ScratchSource: "manifest"}, 1)
 
 	t.Logf("manifest declares scratch=%d (%.0f Gi), memory=%d (%.0f Gi)",
 		scratch, float64(scratch)/gib, memory, float64(memory)/gib)

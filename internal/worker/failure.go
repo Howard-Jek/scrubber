@@ -120,3 +120,28 @@ func timeoutDetail(budget, elapsed time.Duration, at position, disposition strin
 		"bundle has to complete.")
 	return b.String()
 }
+
+// stallDetail explains an object abandoned for making no observable progress.
+//
+// Deliberately worded apart from a timeout, because the operator's next move is
+// different. A timeout says the bundle needed longer than it was given, and the
+// answer is usually more time or more CPU. This says the object stopped moving
+// entirely while other work was still draining around it, which is not a sizing
+// problem and will not be fixed by raising a budget.
+func stallDetail(budget, elapsed time.Duration, at position, disposition string) string {
+	var b strings.Builder
+	fmt.Fprintf(&b, "scrub abandoned after %s: the object published no observable progress "+
+		"for %s, its STALL_ABORT_AFTER budget. ", roundDur(elapsed), roundDur(budget))
+	fmt.Fprintf(&b, "It was last seen %s. ", at)
+	b.WriteString("This object was NOT scrubbed: no output and no report were written, " +
+		"so nothing partial has been published. ")
+	if disposition != "" {
+		fmt.Fprintf(&b, "%s ", disposition)
+	}
+	b.WriteString("Every long stretch of the walk publishes a heartbeat, so this is not " +
+		"a bundle that is merely large — something stopped. If it recurs on the same " +
+		"object the bundle is the suspect; if it recurs on different ones, look at the " +
+		"scratch volume and the object store, which are where the walk can block in a " +
+		"way it cannot interrupt.")
+	return b.String()
+}

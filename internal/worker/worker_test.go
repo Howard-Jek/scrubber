@@ -12,6 +12,7 @@ import (
 	"path/filepath"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -879,15 +880,106 @@ func countHistogram(t *testing.T, g prometheus.Gatherer, name string) uint64 {
 	return 0
 }
 
-// TestWorkerClampsConcurrency guards the config: honouring a larger WORKERS would
-// let one line reintroduce the concurrent scrubs this queue exists to remove.
-func TestWorkerClampsConcurrency(t *testing.T) {
+// TestWorkerBoundsConcurrency guards the config. WORKERS is a bound now rather
+// than a pin, but it is still a bound: each consumer holds its own leaf in heap
+// and its own expansion on scratch, and the caps in cmd/scrubberd are divided by
+// this number, so an unbounded value would derive caps too small to accept
+// anything while still promising the pod more than it has.
+func TestWorkerBoundsConcurrency(t *testing.T) {
+	for _, tc := range []struct{ set, want int }{
+		{0, 1},                        // unset means one, not none
+		{-3, 1},                       // nonsense means one
+		{1, 1},                        // the default, unchanged
+		{4, 4},                        // honoured
+		{maxWorkers, maxWorkers},      // exactly at the bound
+		{maxWorkers + 50, maxWorkers}, // clamped, with a warning
+	} {
+		ms := newMemStore("input", "output", "reports")
+		w := newTestWorker(t, ms)
+		w.cfg.Workers = tc.set
+		w2 := New(ms, testRegistry(t), w.metrics, w.jobs, w.cfg, w.log)
+		if w2.cfg.Workers != tc.want {
+			t.Errorf("WORKERS=%d resolved to %d, want %d", tc.set, w2.cfg.Workers, tc.want)
+		}
+	}
+}
+
+// TestConcurrentObjectsEachGetTheirOwnCancel is the reason the clamp could not
+// simply be deleted.
+//
+// The in-flight registry was a single *inflight pointer. With two objects running,
+// the second overwrote the first, after which a cancel aimed at A reached B — and
+// commit() marked whichever registered last as delivered, so a withdrawal could be
+// accepted for a bundle already sitting in the output bucket. That is precisely the
+// claim CancelTooLate exists to make impossible.
+func TestConcurrentObjectsEachGetTheirOwnCancel(t *testing.T) {
 	ms := newMemStore("input", "output", "reports")
-	w := newTestWorker(t, ms)
-	w.cfg.Workers = 8
-	w2 := New(ms, testRegistry(t), w.metrics, w.jobs, w.cfg, w.log)
-	if w2.cfg.Workers != 1 {
-		t.Errorf("Workers = %d, want 1", w2.cfg.Workers)
+	ms.Put(context.Background(), "input", "a.zip", []byte("x"), "")
+	ms.Put(context.Background(), "input", "b.zip", []byte("x"), "")
+	w, _ := cancelWorker(t, ms)
+
+	var flagA, stalledA, flagB, stalledB atomic.Bool
+	w.beginInflight("a.zip", func() {}, &flagA, &stalledA)
+	w.beginInflight("b.zip", func() {}, &flagB, &stalledB)
+
+	// B has published its output; A has not.
+	if !w.commit("b.zip") {
+		t.Fatal("commit refused an uncancelled object")
+	}
+
+	out, err := w.cancel(context.Background(), "a.zip")
+	if err != nil {
+		t.Fatalf("cancel a: %v", err)
+	}
+	if out != CancelAborting {
+		t.Errorf("cancelling the uncommitted object gave %q, want %q", out, CancelAborting)
+	}
+	if !flagA.Load() {
+		t.Error("the cancel did not reach object A")
+	}
+	if flagB.Load() {
+		t.Error("cancelling A also aborted B — the registry is not per-object")
+	}
+
+	out, err = w.cancel(context.Background(), "b.zip")
+	if err != nil {
+		t.Fatalf("cancel b: %v", err)
+	}
+	if out != CancelTooLate {
+		t.Errorf("cancelling the committed object gave %q, want %q; it would be telling an "+
+			"operator their data was withdrawn when it was already published", out, CancelTooLate)
+	}
+}
+
+// TestStallWatchdogAbortsOnlyTheStuckObject: the watchdog must take away the
+// object that stopped and leave the one that is working alone. Getting that wrong
+// turns a safety net into a way to lose healthy scrubs.
+func TestStallWatchdogAbortsOnlyTheStuckObject(t *testing.T) {
+	ms := newMemStore("input", "output", "reports")
+	w, _ := cancelWorker(t, ms)
+
+	var flagA, stalledA, flagB, stalledB atomic.Bool
+	w.beginInflight("stuck", func() {}, &flagA, &stalledA)
+	w.beginInflight("moving", func() {}, &flagB, &stalledB)
+
+	if !w.abortStalled("stuck") {
+		t.Fatal("the watchdog could not reach a running object")
+	}
+	if !stalledA.Load() {
+		t.Error("the stall flag did not reach the stuck object")
+	}
+	if stalledB.Load() {
+		t.Error("aborting the stuck object also aborted the one still working")
+	}
+	// It reports false the second time, so the watchdog's ticker logs once rather
+	// than on every tick until the walk unwinds.
+	if w.abortStalled("stuck") {
+		t.Error("abortStalled reported a fresh abort for an object already abandoned")
+	}
+	// A committed object is past the point where stopping it achieves anything.
+	w.commit("moving")
+	if w.abortStalled("moving") {
+		t.Error("the watchdog abandoned an object whose output was already published")
 	}
 }
 

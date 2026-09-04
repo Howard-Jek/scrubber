@@ -310,6 +310,11 @@ var ObjectStatuses = []string{
 	// extra byte is how "exactly at the limit" is told from "over it".
 	"too_large",
 	"panic", // a bug in the pipeline; the object is skipped, the service continues
+	// abandoned after publishing no progress for STALL_ABORT_AFTER. Distinct from
+	// "timeout", which means the budget was too small for a bundle that was still
+	// moving. This one stopped, and a rising rate here points at the scratch volume
+	// or the object store rather than at capacity.
+	"no_progress",
 	// delivered, but NOTHING in it was inspected: the top-level payload itself was
 	// the hole. A lone binary, or a container that could not be opened. Counted
 	// apart from "scrubbed" because an operator reading that series as "bundles
