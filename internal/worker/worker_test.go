@@ -367,9 +367,18 @@ func TestWorkerSkipsCorruptWithoutCrashing(t *testing.T) {
 	w := newTestWorker(t, ms)
 	w.runOnce(context.Background()) // must not panic
 
-	out, err := ms.Get(context.Background(), "output", "broken.zip")
+	// It is diverted, and that is the point. Nothing inside this object could be
+	// read, so nothing can vouch for it: a container the safety net cannot open
+	// scores a clean scan for the same reason a locked box does. It used to land
+	// in the normal output bucket beside genuinely scrubbed work, flagged only as
+	// "incomplete" -- the same word a bundle containing one PNG gets.
+	if ms.has("output", "broken.zip") {
+		t.Error("a corrupt container was delivered as ordinary output; it is unreadable, " +
+			"so it must not sit where a consumer looks for finished work")
+	}
+	out, err := ms.Get(context.Background(), "output", "review/broken.zip")
 	if err != nil {
-		t.Fatalf("corrupt object should still produce output: %v", err)
+		t.Fatalf("corrupt object should still be emitted, under review/: %v", err)
 	}
 	if string(out) != "PK\x03\x04nope" {
 		t.Errorf("corrupt object should pass through byte-identical, got %q", out)

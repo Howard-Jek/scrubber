@@ -1100,13 +1100,29 @@ func (w *Worker) processObject(ctx context.Context, o store.Object) {
 	// How many members the walk has found so far, so the card can say "file 7 of 10"
 	// rather than a count with no denominator. It rises when a nested archive opens,
 	// which is honest: what is inside a member is not known until the walk reaches it.
+	// One publisher for both callbacks, reading the live counters.
+	//
+	// They used to write different subsets of the record onto different copies:
+	// OnFile updated a local copy and left the outer job untouched, so the next
+	// OnMembers published FilesDone 0, an empty CurrentFile and a ProgressSince
+	// frozen at the first file. Opening a nested archive therefore reset the card
+	// to "unpacking", showed "no new file in 12m", and re-armed the stall warning
+	// on an object that was moving steadily through its members — the exact false
+	// alarm ProgressSince was added to remove.
+	publish := func() {
+		j := job
+		j.FilesDone, j.FilesTotal, j.CurrentFile = filesDone, membersTotal, currentFile
+		w.jobs.Upsert(j)
+	}
 	rep.OnMembers(func(n int) {
 		membersTotal = n
-		j := job
-		j.FilesTotal = n
-		w.jobs.Upsert(j)
+		// Finishing a container read IS observable movement, and it is often the
+		// end of a long silent stretch: noteMembers fires once the whole archive
+		// has been parsed.
+		job.ProgressSince = time.Now()
+		publish()
 	})
-	rep.OnFile(func(f report.FileEntry) {
+	rep.OnFile(func(f report.FileEntry, done int) {
 		// A scrubbed FILENAME files its own report entry, which is right for the audit
 		// record and wrong for a progress count: a 10-member tar with two renamed
 		// members reported "12 files", so the number the user watched disagreed with
@@ -1114,7 +1130,11 @@ func (w *Worker) processObject(ctx context.Context, o store.Object) {
 		if f.Detail == report.DetailFilenameScrubbed {
 			return
 		}
-		filesDone++
+		// Assigned from the report's own tally, not incremented locally. A
+		// rollback lowers that tally when a subtree is discarded, and a counter
+		// that only ever went up reported "file 4 of 3" after a failed repack —
+		// with the live view and the stored digest disagreeing threefold.
+		filesDone = done
 		if filesDone == 1 {
 			// First member out of the container: unpacking is demonstrably over.
 			job.Phase = "scrubbing"
@@ -1130,14 +1150,10 @@ func (w *Worker) processObject(ctx context.Context, o store.Object) {
 				"status", f.Status, "detail", f.Detail)
 		}
 		currentFile = displayPath(res.Matcher, f.Path)
-		j := job
-		j.FilesDone = filesDone
-		j.CurrentFile = currentFile
 		// Finishing a file IS progress, and stamping it here is what stops the stall
 		// warning firing on a healthy multi-file scrub.
-		j.ProgressSince = time.Now()
-		j.FilesTotal = membersTotal
-		w.jobs.Upsert(j)
+		job.ProgressSince = time.Now()
+		publish()
 	})
 
 	eng := &pipeline.Engine{
@@ -1150,13 +1166,37 @@ func (w *Worker) processObject(ctx context.Context, o store.Object) {
 		// identical either way -- stop, rebuild nothing, hand back the input. Which
 		// of them fired is read below, where it decides what the object BECAME.
 		Abort: func() bool { return aborted.Load() || timedOut.Load() },
+		// The rebuild is the one stretch of the walk that files no report entry,
+		// so it is the one stretch that used to look identical to a wedged
+		// process: the last member stayed on the record, the progress stamp went
+		// stale, and the stall warner announced that an object rebuilding a
+		// multi-gigabyte archive "may be stalled rather than slow" while naming a
+		// file it had in fact already finished.
+		Progress: func(stage string, n int64) {
+			if job.Phase != "repacking" {
+				job.Phase = "repacking"
+				job.PhaseSince = time.Now()
+			}
+			job.ProgressSince = time.Now()
+			currentFile = stage
+			publish()
+		},
 	}
 	// Release every blob the walk staged. This runs before the panic recovery
 	// above (defers unwind last-registered-first), so a bug anywhere in the
 	// pipeline costs one object rather than a temp file that outlives it.
 	defer eng.Release()
 	out, changed := eng.ProcessBlob(o.Key, input, 0)
-	if eng.Aborted() {
+	// WasAborted, not Aborted: ask whether the walk STOPPED, not whether the
+	// deadline has passed by the time we get here. Aborted re-polls the predicate,
+	// so a timer firing in the gap between the walk finishing and this line
+	// condemned a scrub that was already complete — the output was discarded, the
+	// input was moved aside, and it was never retried. The work was done and it
+	// was thrown away for being late.
+	//
+	// A withdrawal that lands in the same gap is still honoured: commit() below is
+	// the gate for that, and it closes the door under one lock.
+	if eng.WasAborted() {
 		// Stopped mid-walk. Everything staged is released by the defers above; no
 		// output, report or digest is written, and the verdict below is deliberately
 		// never computed — an object that did not finish has no coverage answer to
@@ -1175,6 +1215,16 @@ func (w *Worker) processObject(ctx context.Context, o store.Object) {
 		}
 		timedOutExit(p)
 		return
+	}
+	if timedOut.Load() {
+		// The budget expired, but the walk had already finished. Delivering is the
+		// only defensible answer: the work is complete, and discarding it would
+		// cost the user their scrub AND file the input away unretried. The overrun
+		// is still worth a line — it means the budget is too small for the bundles
+		// this pod is being sent, which is a capacity signal.
+		w.log.Warn("object finished after its scrub budget expired; delivering the completed "+
+			"result rather than discarding it. Raise requests.cpu or SCRUB_TIMEOUT",
+			"key", o.Key, "budget", w.cfg.ScrubTimeout, "elapsed", roundDur(time.Since(start)))
 	}
 	if changed {
 		// ProcessBlob returns the input itself when nothing changed, so only close

@@ -150,8 +150,19 @@ func Scan(b *spill.Blob, m *scrub.Matcher, budget int64) (Result, error) {
 		s.scanStream(rc, 0)
 	}
 
-	res.Hits, res.Labels, res.Decoded = s.hits, s.labels, s.read
-	res.Opaque = s.recognised && s.read == 0
+	// A recognised container that yielded nothing is still worth looking at as raw
+	// bytes: it costs one more bounded pass and it is how plaintext sitting beside
+	// an unusable header gets found. It does NOT clear Opaque — reading the outside
+	// of a box is not the same as opening it.
+	if s.recognised && s.decoded == 0 && !s.exhausted() {
+		if rc, err := b.Reader(); err == nil {
+			s.extract(rc)
+			rc.Close()
+		}
+	}
+
+	res.Hits, res.Labels, res.Decoded = s.hits, s.labels, s.decoded
+	res.Opaque = s.recognised && s.decoded == 0
 	return res, nil
 }
 
@@ -159,9 +170,13 @@ func Scan(b *spill.Blob, m *scrub.Matcher, budget int64) (Result, error) {
 type scanner struct {
 	m      *scrub.Matcher
 	budget int64
-	read   int64 // bytes handed to the extractor, across every layer
-	hits   int
-	labels map[string]int
+	read   int64 // bytes handed to the extractor, across every layer; bounds the budget
+	// decoded is the subset of read that came from INSIDE a container, i.e. after a
+	// decompressor or a zip entry. It is what Opaque is judged on: scanning the raw
+	// bytes of a container nobody could open proves nothing about its contents.
+	decoded int64
+	hits    int
+	labels  map[string]int
 	// recognised is set once any layer identified a container or compressed
 	// format. Together with read == 0 it means "there was something to look into
 	// and looking failed", which is what Opaque reports.
@@ -190,7 +205,9 @@ func (s *scanner) scanZip(ra io.ReaderAt, size int64, depth int) {
 		if err != nil {
 			continue
 		}
+		before := s.read
 		s.scanStream(rc, depth+1)
+		s.decoded += s.read - before
 		rc.Close()
 	}
 }
@@ -214,7 +231,9 @@ func (s *scanner) scanStream(r io.Reader, depth int) {
 			s.extract(br)
 			return
 		}
+		before := s.read
 		s.scanStream(dec, depth+1)
+		s.decoded += s.read - before
 		if cl != nil {
 			cl.Close()
 		}

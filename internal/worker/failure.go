@@ -65,6 +65,8 @@ func phaseDescription(phase string) string {
 		return "expanding the container, before any file could be scrubbed"
 	case "scrubbing":
 		return "scrubbing"
+	case "repacking":
+		return "rebuilding the container after scrubbing its members"
 	case "writing":
 		return "writing the result back to storage"
 	default:

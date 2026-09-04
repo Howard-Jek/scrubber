@@ -160,6 +160,27 @@ func (m *Matcher) Rules() []RuleInfo {
 // the same position, and failing that the scan advances one character into the
 // rejected span.
 func (m *Matcher) Scrub(text string) (string, []Match) {
+	out, matches, _ := m.ScrubAbortable(text, nil)
+	return out, matches
+}
+
+// abortCheckMatches is how often ScrubAbortable polls its predicate, in matches.
+// Frequent enough that a deadline is honoured within milliseconds of real work,
+// rare enough that the poll is lost in the noise of the replacement itself.
+const abortCheckMatches = 4096
+
+// ScrubAbortable is Scrub that can be stopped part-way through a file.
+//
+// It exists because one large member used to be uninterruptible: the walk polls
+// its abort predicate between members, so a single file big enough to outlast the
+// scrub budget ran to completion regardless, and the object was then failed for
+// exceeding a deadline it had spent forty minutes ignoring. When aborted is true
+// the returned text and matches are incomplete and must be discarded, not written.
+//
+// The predicate is polled per match rather than per byte. A file with no matches
+// at all is one uninterruptible regexp scan, which is linear and fast; the case
+// worth stopping is the one doing millions of replacements.
+func (m *Matcher) ScrubAbortable(text string, abort func() bool) (string, []Match, bool) {
 	var (
 		b        strings.Builder
 		matches  []Match
@@ -168,8 +189,23 @@ func (m *Matcher) Scrub(text string) (string, []Match) {
 		lineBase = 1 // line number of byte 0
 		lastNL   = 0 // byte index from which we've already counted newlines
 		grown    bool
+		since    int
+		// suppressed is a rule whose candidate a validator has just rejected, and
+		// suppressUntil is the end of the span it was rejected in. Together they
+		// stop that rule re-matching a sub-window of its own rejected span while
+		// still letting every other rule look inside it.
+		suppressed    *Rule
+		suppressUntil int
 	)
 	for pos <= len(text) {
+		if abort != nil {
+			if since++; since >= abortCheckMatches {
+				since = 0
+				if abort() {
+					return text, nil, true
+				}
+			}
+		}
 		loc := m.combined.FindStringSubmatchIndex(text[pos:])
 		if loc == nil {
 			break
@@ -183,6 +219,14 @@ func (m *Matcher) Scrub(text string) (string, []Match) {
 			continue
 		}
 		rule := m.ruleFor(loc)
+		if rule == suppressed && s < suppressUntil {
+			// Inside a span this rule already had rejected. Let the scan walk on
+			// so OTHER rules can match in here, but do not let this one come back
+			// with a shorter window: a thirteen-digit run that fails its checksum
+			// must not reappear as a twelve-digit one.
+			pos = s + runeWidth(text, s)
+			continue
+		}
 		if rule.valid != nil && !rule.valid(text[s:e]) {
 			// Another rule may legitimately match right here -- later in precedence,
 			// so the combined scan never got to it. Try them in order before giving
@@ -190,6 +234,7 @@ func (m *Matcher) Scrub(text string) (string, []Match) {
 			if alt, ae := m.retryAt(rule, text, s); alt != nil {
 				rule, e = alt, ae
 			} else {
+				suppressed, suppressUntil = rule, e
 				pos = s + runeWidth(text, s)
 				continue
 			}
@@ -218,10 +263,10 @@ func (m *Matcher) Scrub(text string) (string, []Match) {
 		pos = e
 	}
 	if len(matches) == 0 {
-		return text, nil
+		return text, nil, false
 	}
 	b.WriteString(text[last:])
-	return b.String(), matches
+	return b.String(), matches, false
 }
 
 // ruleFor names the rule whose group participated in a combined match. Exactly one
@@ -246,6 +291,15 @@ func (m *Matcher) ruleFor(loc []int) *Rule {
 // Rules before the rejected one need no retry: had any of them matched at this
 // position, the leftmost-first alternation would have chosen it instead.
 func (m *Matcher) retryAt(rejected *Rule, text string, s int) (*Rule, int) {
+	// One character of real context, so \b and ^ behave here exactly as they would
+	// in the whole document. Slicing at s alone manufactures a start-of-text
+	// boundary that may not exist, which would let \b-anchored rules match in the
+	// middle of a word.
+	base, off := s, 0
+	if s > 0 {
+		_, w := utf8.DecodeLastRuneInString(text[:s])
+		base, off = s-w, w
+	}
 	after := false
 	for i := range m.rules {
 		r := &m.rules[i]
@@ -256,11 +310,11 @@ func (m *Matcher) retryAt(rejected *Rule, text string, s int) (*Rule, int) {
 		if !after {
 			continue
 		}
-		loc := r.re.FindStringIndex(text[s:])
-		if loc == nil || loc[0] != 0 || loc[1] == 0 {
+		loc := r.re.FindStringIndex(text[base:])
+		if loc == nil || loc[0] != off || loc[1] <= off {
 			continue
 		}
-		e := s + loc[1]
+		e := base + loc[1]
 		if r.valid != nil && !r.valid(text[s:e]) {
 			continue
 		}

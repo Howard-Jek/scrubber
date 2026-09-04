@@ -46,7 +46,7 @@ func TestAbortedWalkNeverRepacks(t *testing.T) {
 			// dangerous case, since some members are rewritten and some are not.
 			rep := report.New("in", "out", report.AuditFull, false, "test")
 			files := 0
-			rep.OnFile(func(report.FileEntry) { files++ })
+			rep.OnFile(func(report.FileEntry, int) { files++ })
 
 			eng := &Engine{
 				Matcher: testMatcher(t),
