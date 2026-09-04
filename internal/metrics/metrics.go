@@ -310,6 +310,11 @@ var ObjectStatuses = []string{
 	// extra byte is how "exactly at the limit" is told from "over it".
 	"too_large",
 	"panic", // a bug in the pipeline; the object is skipped, the service continues
+	// delivered, but NOTHING in it was inspected: the top-level payload itself was
+	// the hole. A lone binary, or a container that could not be opened. Counted
+	// apart from "scrubbed" because an operator reading that series as "bundles
+	// sanitized" would be wrong about every one of these.
+	"unscrubbed",
 }
 
 // Done reports whether the job reached a terminal state.
@@ -318,8 +323,11 @@ var ObjectStatuses = []string{
 // and will be picked up again after its backoff, so a client must keep waiting on
 // it; treating a transient backend stall as terminal showed a permanent failure for
 // work that then completed a minute later, with nothing to tell the user it had.
+//
+// "cancelled" is terminal: nothing further will ever be recorded for the key, so
+// answering from storage would only ever cost two failed reads per poll.
 func (j Job) Done() bool {
-	return j.Status == "scrubbed" || j.Status == "error" || j.Status == "skipped"
+	return j.Status == "scrubbed" || j.Status == "error" || j.Status == "skipped" || j.Status == "cancelled"
 }
 
 // JobLog is a fixed-size ring of recent jobs, keyed by input object key so an

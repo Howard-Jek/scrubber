@@ -60,10 +60,21 @@ type Digest struct {
 	ByReason        map[Reason]int `json:"by_reason,omitempty"`
 	ResidualHits    int            `json:"residual_hits"`
 	ResidualSamples []string       `json:"residual_samples,omitempty"`
-	BytesIn         int            `json:"bytes_in"`
-	BytesOut        int            `json:"bytes_out"`
-	StartedAt       time.Time      `json:"started_at,omitempty"`
-	EndedAt         time.Time      `json:"ended_at,omitempty"`
+	// UnscannableHoles mirrors Summary.UnscannableHoles: holes the safety net could
+	// not see into, which is what made this run risky if ResidualHits is zero.
+	UnscannableHoles int       `json:"unscannable_holes,omitempty"`
+	BytesIn          int       `json:"bytes_in"`
+	BytesOut         int       `json:"bytes_out"`
+	StartedAt        time.Time `json:"started_at,omitempty"`
+	EndedAt          time.Time `json:"ended_at,omitempty"`
+	// Status and Error are set only on a digest written for an object that did NOT
+	// produce an output -- it timed out, was too large, or could not be processed.
+	// A run that finished leaves them empty. They exist because the in-memory job
+	// record was the only trace of such a failure, and a restart lost it: the user
+	// was then told "no result recorded" about an upload the service had refused
+	// and moved aside.
+	Status string `json:"status,omitempty"`
+	Error  string `json:"error,omitempty"`
 }
 
 // Digest renders the compact view of this report.
@@ -84,12 +95,13 @@ func (r *Report) Digest() Digest {
 		NotInspected:    r.Summary.FilesNotInspected,
 		NotInspectedSet: r.Summary.NotInspected,
 		ByReason:        r.Summary.ByReason,
-		ResidualHits:    r.Summary.ResidualHits,
-		ResidualSamples: r.Summary.ResidualSamples,
-		BytesIn:         r.BytesIn,
-		BytesOut:        r.BytesOut,
-		StartedAt:       r.StartedAt,
-		EndedAt:         r.EndedAt,
+		ResidualHits:     r.Summary.ResidualHits,
+		ResidualSamples:  r.Summary.ResidualSamples,
+		UnscannableHoles: r.Summary.UnscannableHoles,
+		BytesIn:          r.BytesIn,
+		BytesOut:         r.BytesOut,
+		StartedAt:        r.StartedAt,
+		EndedAt:          r.EndedAt,
 	}
 }
 
@@ -107,18 +119,27 @@ const (
 	// not worth blocking, and deliberately not treated as a failure so the alarm
 	// that does matter keeps its meaning.
 	VerdictIncomplete Verdict = "incomplete"
-	// VerdictIncompleteRisky: something was not inspected AND it contains matches
-	// for the policy. The tool skipped content that demonstrably holds the data it
-	// exists to remove. This is the one that diverts the output for review.
+	// VerdictIncompleteRisky: something was not inspected AND either it contains
+	// matches for the policy, or nobody could look. The tool skipped content that
+	// demonstrably holds the data it exists to remove -- or skipped content it could
+	// not read at all, which for a sanitizer is the same answer. This is the one
+	// that diverts the output for review.
 	VerdictIncompleteRisky Verdict = "incomplete-risky"
 )
 
 // Verdict computes the object-level answer from the coverage counts.
+//
+// An unscannable hole makes the run risky on its own. Before this, an encrypted zip
+// or a bundle refused by the expansion budget scored a clean residual scan -- over
+// compressed bytes, which contain no text at any stride -- and landed in the normal
+// output as merely "incomplete", indistinguishable from a bundle with one PNG in it.
+// A clean scan of something that could not be read is not reassurance; it is the
+// absence of a scan, and the verdict now says so.
 func (s Summary) Verdict() Verdict {
 	switch {
 	case s.FilesNotInspected == 0:
 		return VerdictComplete
-	case s.ResidualHits > 0:
+	case s.ResidualHits > 0, s.UnscannableHoles > 0:
 		return VerdictIncompleteRisky
 	default:
 		return VerdictIncomplete
@@ -215,6 +236,11 @@ const (
 	// mid-object, the kubelet restarts it, the object is picked up again and it dies
 	// again. Naming it turns a crash loop into one flagged file in a report.
 	ReasonLeafCap Reason = "leaf-cap" // single file too large to scrub in memory
+	// ReasonEncrypted marks a zip entry whose general-purpose flag says it is
+	// encrypted. It is its own code rather than a kind of "malformed" because the
+	// operator's next step is different: ask the sender for the password, not for
+	// a re-upload. Only that entry is affected; the rest of the archive is scrubbed.
+	ReasonEncrypted Reason = "encrypted"
 	// ReasonUnclassified is the tripwire. It is never written deliberately: it marks
 	// a hole recorded through Record instead of Skip, i.e. one whose author did not
 	// say why. The conformance corpus asserts zero of these, so the shortcut that
@@ -227,7 +253,8 @@ const (
 var AllReasons = []Reason{
 	ReasonBinary, ReasonEncoding, ReasonUnsupported, ReasonMalformed,
 	ReasonExpandBudget, ReasonMemberCap, ReasonDepthCap, ReasonScratch,
-	ReasonRepackFailed, ReasonResidualScrub, ReasonLeafCap, ReasonUnclassified,
+	ReasonRepackFailed, ReasonResidualScrub, ReasonLeafCap, ReasonEncrypted,
+	ReasonUnclassified,
 }
 
 // AuditLevel controls how much per-match detail the report retains.
@@ -370,6 +397,12 @@ type Summary struct {
 	// ResidualSamples shows a few of those hits, already replaced with their policy
 	// labels so the report never quotes the sensitive value back.
 	ResidualSamples []string `json:"residual_samples,omitempty"`
+	// UnscannableHoles counts the holes the residual scan could not see into: a
+	// recognised container or compressed stream that yielded nothing decodable --
+	// encrypted, an unsupported method, a stream cut off before its first byte of
+	// content. Each one makes the run risky regardless of ResidualHits, because the
+	// scan that found nothing there did not happen.
+	UnscannableHoles int `json:"unscannable_holes,omitempty"`
 }
 
 // Report is the full run record.
@@ -398,7 +431,11 @@ type Report struct {
 	audit       AuditLevel
 	redact      bool
 	salt        []byte
-	onFile      func(FileEntry)
+	// onFile receives each entry as it is recorded together with the running file
+	// tally (Summary.FilesTotal at that moment). The tally is passed rather than
+	// counted by the receiver because a rollback lowers it: a caller that kept its
+	// own increment-only counter reported "file 4 of 3" after a failed repack.
+	onFile func(FileEntry, int)
 	// onMembers reports the running count of archive members DISCOVERED, so a client
 	// can show "file 7 of 10" instead of a number with no denominator.
 	//
@@ -432,6 +469,9 @@ type summaryDelta struct {
 	// a rolled-back subtree leaves the total off by the number of renames in it.
 	detail       string
 	residualHits int
+	// opaque records that this entry was counted in UnscannableHoles, so a rollback
+	// can un-count it.
+	opaque bool
 	// retained is how much of the report-wide match budget this entry consumed, so
 	// undoing the entry gives the budget back rather than permanently spending it on
 	// a subtree that never reached the output.
@@ -518,15 +558,36 @@ func (r *Report) NoteResidual(path string, reason Reason, hits int, summary stri
 	}
 }
 
+// NoteOpaque marks the entry just recorded as a hole the residual scan could not
+// see into, and counts it towards the verdict. Same contract as NoteResidual: it
+// amends the most recent entry, so it is only meaningful straight after a Skip.
+func (r *Report) NoteOpaque() {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	r.Summary.UnscannableHoles++
+	if n := len(r.deltas); n > 0 {
+		r.deltas[n-1].opaque = true
+	}
+}
+
 // maxResidualSamples bounds the retained residual summaries the same way the note
 // lists are bounded; ResidualHits stays exact regardless.
 const maxResidualSamples = 20
 
+// Mark is a checkpoint a Rollback returns the report to. It captures the member
+// count as well as the entry count, because a container that opened, announced
+// its members and then failed to repack leaves that announcement behind otherwise
+// -- a denominator nothing will ever reach.
+type Mark struct {
+	files   int
+	members int
+}
+
 // Mark returns a checkpoint identifying the current end of the report.
-func (r *Report) Mark() int {
+func (r *Report) Mark() Mark {
 	r.mu.Lock()
 	defer r.mu.Unlock()
-	return len(r.Files)
+	return Mark{files: len(r.Files), members: r.membersSeen}
 }
 
 // Rollback discards everything recorded since mark and replaces it with a single
@@ -537,8 +598,9 @@ func (r *Report) Mark() int {
 // were never applied to the output, so leaving them counted would tell an
 // operator that more was redacted than actually was. That is the one direction a
 // transparency report must never be wrong in.
-func (r *Report) Rollback(mark int, path string, status Status, reason Reason, detail string, bytesIn, bytesOut int) {
+func (r *Report) Rollback(m Mark, path string, status Status, reason Reason, detail string, bytesIn, bytesOut int) {
 	r.mu.Lock()
+	mark := m.files
 	if mark < 0 || mark > len(r.Files) {
 		r.mu.Unlock()
 		return
@@ -556,6 +618,9 @@ func (r *Report) Rollback(mark int, path string, status Status, reason Reason, d
 		}
 		r.retained -= d.retained
 		r.Summary.ResidualHits -= d.residualHits
+		if d.opaque {
+			r.Summary.UnscannableHoles--
+		}
 		r.Summary.TotalMatches -= d.matches
 		for k, v := range d.byRule {
 			if r.Summary.MatchesByRule[k] -= v; r.Summary.MatchesByRule[k] <= 0 {
@@ -570,15 +635,24 @@ func (r *Report) Rollback(mark int, path string, status Status, reason Reason, d
 	}
 	r.Files = r.Files[:mark]
 	r.deltas = r.deltas[:mark]
+	// The members the discarded subtree announced are gone with it. The one entry
+	// about to replace them is the container's own, which its parent counted.
+	if r.membersSeen != m.members {
+		r.membersSeen = m.members
+		if r.onMembers != nil {
+			r.onMembers(r.membersSeen)
+		}
+	}
 	r.mu.Unlock()
 
 	r.record(path, status, reason, detail, bytesIn, bytesOut, nil)
 }
 
-// OnFile registers a callback invoked for each file as it is recorded, so a
-// caller can stream progress instead of waiting for the run to finish. It runs
-// while the report lock is held: keep it cheap and non-blocking.
-func (r *Report) OnFile(fn func(FileEntry)) {
+// OnFile registers a callback invoked for each file as it is recorded, with the
+// running count of files recorded so far, so a caller can stream progress instead
+// of waiting for the run to finish. It runs while the report lock is held: keep it
+// cheap and non-blocking, and do not call back in.
+func (r *Report) OnFile(fn func(FileEntry, int)) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	r.onFile = fn
@@ -750,7 +824,7 @@ func (r *Report) record(path string, status Status, reason Reason, detail string
 		r.onFile(FileEntry{
 			Path: entry.Path, Status: entry.Status, Detail: entry.Detail,
 			BytesIn: entry.BytesIn, BytesOut: entry.BytesOut,
-		})
+		}, r.Summary.FilesTotal)
 	}
 }
 
