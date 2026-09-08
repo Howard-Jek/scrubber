@@ -277,3 +277,139 @@ func TestPackResidualLandsOnThePacksOwnEntry(t *testing.T) {
 		t.Errorf("the residual annotation landed on %q instead of the pack", otherNote.Path)
 	}
 }
+
+// --- delta helpers, mirroring the encoders git uses ---
+
+func objHdr(typ byte, size int) []byte {
+	var out []byte
+	b := byte(typ<<4) | byte(size&0x0f)
+	size >>= 4
+	for size > 0 {
+		out = append(out, b|0x80)
+		b = byte(size & 0x7f)
+		size >>= 7
+	}
+	return append(out, b)
+}
+
+func ofsEnc(v int) []byte {
+	buf := make([]byte, 16)
+	i := len(buf) - 1
+	buf[i] = byte(v & 0x7f)
+	for {
+		v >>= 7
+		if v == 0 {
+			break
+		}
+		v--
+		i--
+		buf[i] = 0x80 | byte(v&0x7f)
+	}
+	return buf[i:]
+}
+
+func dv(v int) []byte {
+	var out []byte
+	for {
+		b := byte(v & 0x7f)
+		v >>= 7
+		if v == 0 {
+			return append(out, b)
+		}
+		out = append(out, b|0x80)
+	}
+}
+
+func zdef(t *testing.T, b []byte) []byte {
+	t.Helper()
+	var buf bytes.Buffer
+	zw := zlib.NewWriter(&buf)
+	if _, err := zw.Write(b); err != nil {
+		t.Fatal(err)
+	}
+	if err := zw.Close(); err != nil {
+		t.Fatal(err)
+	}
+	return buf.Bytes()
+}
+
+// packCopyingDelta builds a pack whose second object is a delta that COPIES the
+// whole of a secret-bearing base and appends an innocuous line. The secret appears
+// nowhere in the delta's own instruction stream.
+func packCopyingDelta(t *testing.T, secret, appended string) []byte {
+	t.Helper()
+	var b bytes.Buffer
+	b.WriteString("PACK")
+	binary.Write(&b, binary.BigEndian, uint32(2))
+	binary.Write(&b, binary.BigEndian, uint32(2))
+
+	baseOff := b.Len()
+	b.Write(objHdr(3, len(secret)))
+	b.Write(zdef(t, []byte(secret)))
+
+	deltaOff := b.Len()
+	var instr []byte
+	instr = append(instr, dv(len(secret))...)
+	instr = append(instr, dv(len(secret)+len(appended))...)
+	op := byte(0x80)
+	var sz []byte
+	if len(secret)&0xff != 0 {
+		op |= 0x10
+		sz = append(sz, byte(len(secret)&0xff))
+	}
+	if (len(secret)>>8)&0xff != 0 {
+		op |= 0x20
+		sz = append(sz, byte((len(secret)>>8)&0xff))
+	}
+	instr = append(instr, op)
+	instr = append(instr, sz...)
+	instr = append(instr, byte(len(appended)))
+	instr = append(instr, appended...)
+
+	b.Write(objHdr(6, len(instr)))
+	b.Write(ofsEnc(deltaOff - baseOff))
+	b.Write(zdef(t, instr))
+
+	sum := sha1.Sum(b.Bytes())
+	b.Write(sum[:])
+	return b.Bytes()
+}
+
+// TestPackDeltaCarryingCopiedSecretIsFound is the end-to-end version of the delta
+// case, through the real pipeline.
+//
+// Both objects here hold the credential, but only the first holds it literally. The
+// second is a delta that copies it, so before resolution the pipeline saw one hit and
+// reported one object; the later revision of the file -- the one actually checked out
+// at HEAD -- came back clean.
+func TestPackDeltaCarryingCopiedSecretIsFound(t *testing.T) {
+	const secret = "password = hunter2 for AcmeCorp contact bob@acme.test\n"
+	data := packCopyingDelta(t, secret, "# a later, unrelated edit\n")
+
+	_, rep := run(t, data, DefaultLimits())
+
+	if v := rep.Summary.Verdict(); v != report.VerdictIncompleteRisky {
+		t.Errorf("verdict = %q, want %q", v, report.VerdictIncompleteRisky)
+	}
+
+	// Both objects must be named: the one that introduced the secret and the one
+	// that carries it forward.
+	var hole *report.PassthroughNote
+	for i := range rep.Summary.Passthroughs {
+		if rep.Summary.Passthroughs[i].Code == report.ReasonGitPack {
+			hole = &rep.Summary.Passthroughs[i]
+		}
+	}
+	if hole == nil {
+		t.Fatalf("no git-pack hole; got %+v", rep.Summary.Passthroughs)
+	}
+	if !strings.Contains(hole.Detail, "2 object(s) carry") {
+		t.Errorf("expected BOTH the base and the delta to be reported as carrying the "+
+			"secret; the delta copies it, so a scan of its raw instructions finds "+
+			"nothing.\ndetail: %s", hole.Detail)
+	}
+	if strings.Contains(hole.Detail, "could not be resolved") {
+		t.Errorf("a resolvable ofs-delta was reported as unresolved: %s", hole.Detail)
+	}
+	t.Logf("detail: %s", hole.Detail)
+}

@@ -993,7 +993,7 @@ func (e *Engine) handlePack(path string, in *spill.Blob) (*spill.Blob, bool) {
 	}
 	objects, rerr := func() ([]archive.PackObject, error) {
 		defer rc.Close()
-		return archive.ReadPack(rc, e.budget, e.Limits.MaxMembers, e.Limits.Spill)
+		return archive.ReadPack(rc, e.budget, e.Limits.MaxMembers, e.Limits.Spill, e.Abort)
 	}()
 	defer archive.ClosePack(objects)
 
@@ -1039,9 +1039,14 @@ func (e *Engine) handlePack(path string, in *spill.Blob) (*spill.Blob, bool) {
 	// corrupt that entry's rollback ledger. So the loop collects, and the report is
 	// written once, in order, below.
 	var (
-		scanned, carrying, hits, deltas, opaque int
-		named                                   []string
+		scanned, carrying, hits, opaque, unresolved int
+		named                                       []string
 	)
+	for i := range objects {
+		if objects[i].Delta && !objects[i].Resolved {
+			unresolved++
+		}
+	}
 	for i := range objects {
 		if e.Matcher == nil || e.Limits.ResidualBudget < 0 || e.residualLeft <= 0 {
 			break
@@ -1070,9 +1075,6 @@ func (e *Engine) handlePack(path string, in *spill.Blob) (*spill.Blob, bool) {
 		}
 		carrying++
 		hits += res.Hits
-		if objects[i].Delta {
-			deltas++
-		}
 		if len(named) < maxNamedPackObjects {
 			named = append(named, objects[i].Ref()+": "+res.Summary())
 		}
@@ -1087,7 +1089,7 @@ func (e *Engine) handlePack(path string, in *spill.Blob) (*spill.Blob, bool) {
 
 	// The pack's own entry first, then the annotations that amend it.
 	e.Report.Skip(path, report.StatusUnsupported, report.ReasonGitPack,
-		packDetail(len(objects), scanned, carrying, hits, deltas, rerr, e.residualLeft <= 0, named),
+		packDetail(len(objects), scanned, carrying, hits, unresolved, rerr, e.residualLeft <= 0, named),
 		int(in.Size()), int(in.Size()))
 	if hits > 0 {
 		e.Report.NoteResidual(path, report.ReasonGitPack, hits, packResidualSummary(carrying, hits, named))
@@ -1123,7 +1125,7 @@ func packResidualSummary(carrying, hits int, named []string) string {
 	return s
 }
 
-func packDetail(total, scanned, carrying, hits, deltas int, readErr error, budgetSpent bool, named []string) string {
+func packDetail(total, scanned, carrying, hits, unresolved int, readErr error, budgetSpent bool, named []string) string {
 	var b strings.Builder
 	fmt.Fprintf(&b, "git packfile: %d objects decoded", total)
 	if scanned < total {
@@ -1136,6 +1138,11 @@ func packDetail(total, scanned, carrying, hits, deltas int, readErr error, budge
 		b.WriteString(" (RESIDUAL_BUDGET was exhausted before every object could be read)")
 	}
 	b.WriteString(". ")
+	if unresolved > 0 {
+		fmt.Fprintf(&b, "%d object(s) are deltas that could not be resolved against a base, "+
+			"so only the text those deltas INSERT was examined and text they copy from "+
+			"their base was not. ", unresolved)
+	}
 	if carrying == 0 {
 		b.WriteString("No object matched this policy. The pack is passed through unchanged " +
 			"and NOT scrubbed, which is a limitation of the format rather than a fault: " +
@@ -1149,10 +1156,7 @@ func packDetail(total, scanned, carrying, hits, deltas int, readErr error, budge
 			fmt.Fprintf(&b, "(%d further object(s) not named here.) ", carrying-len(named))
 		}
 	}
-	if deltas > 0 {
-		fmt.Fprintf(&b, "%d of those are delta objects, which cannot be addressed by "+
-			"object ID without resolving them against their base. ", deltas)
-	}
+
 	b.WriteString("The pack was passed through UNCHANGED and these matches are NOT " +
 		"redacted. They cannot be: an object's ID is the SHA-1 of its own content and " +
 		"the trailer is the SHA-1 of the whole file, so editing one byte breaks that " +

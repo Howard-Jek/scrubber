@@ -78,7 +78,7 @@ func TestReadPackSurvivesHostileInput(t *testing.T) {
 						t.Errorf("panic on hostile input: %v", r)
 					}
 				}()
-				objs, err := ReadPack(bytes.NewReader(tc.data), 1<<20, 1000, spill.DefaultPolicy)
+				objs, err := ReadPack(bytes.NewReader(tc.data), 1<<20, 1000, spill.DefaultPolicy, nil)
 				ClosePack(objs)
 				_ = err // an error is a fine outcome; hanging or panicking is not
 			}()
@@ -119,7 +119,7 @@ func TestReadPackRespectsBudget(t *testing.T) {
 
 	// Sanity: the same pack under a generous budget must read cleanly, or the
 	// refusal below would prove nothing.
-	objs, err := ReadPack(bytes.NewReader(buf.Bytes()), 1<<22, 1000, spill.DefaultPolicy)
+	objs, err := ReadPack(bytes.NewReader(buf.Bytes()), 1<<22, 1000, spill.DefaultPolicy, nil)
 	if err != nil {
 		t.Fatalf("well-formed pack rejected under a generous budget: %v", err)
 	}
@@ -129,7 +129,7 @@ func TestReadPackRespectsBudget(t *testing.T) {
 	}
 	ClosePack(objs)
 
-	objs, err = ReadPack(bytes.NewReader(buf.Bytes()), 1024, 1000, spill.DefaultPolicy)
+	objs, err = ReadPack(bytes.NewReader(buf.Bytes()), 1024, 1000, spill.DefaultPolicy, nil)
 	ClosePack(objs)
 	if err != ErrTooLarge {
 		t.Errorf("err = %v, want ErrTooLarge: a 1 MiB object was admitted under a "+
@@ -148,7 +148,7 @@ func TestReadPackRespectsObjectCap(t *testing.T) {
 		zw.Write([]byte("aaaa"))
 		zw.Close()
 	}
-	objs, err := ReadPack(bytes.NewReader(buf.Bytes()), 1<<20, 10, spill.DefaultPolicy)
+	objs, err := ReadPack(bytes.NewReader(buf.Bytes()), 1<<20, 10, spill.DefaultPolicy, nil)
 	ClosePack(objs)
 	if err != ErrTooManyMembers {
 		t.Errorf("err = %v, want ErrTooManyMembers once the cap is passed", err)

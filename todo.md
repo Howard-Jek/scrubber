@@ -163,11 +163,24 @@ through `probs`; make `envBool` case-insensitive and accept `on`/`off`/`y`/`n`.
   byte of a real pack gives `fatal: cannot read commit object`. A pack carrying
   matches makes the run `incomplete-risky` and diverts it to `review/`.
 
-  **Not covered:** delta objects (~45% of a packed repo) are scanned as raw
-  instruction streams, so text *inserted* by a delta is found but text carried
-  over unchanged from its base is attributed to the base. Resolving deltas
-  properly would close that. `.idx` files carry only hashes, CRCs and offsets —
-  no names, no content — so skipping them as binary is correct and costs nothing.
+  **Deltas are resolved too.** About 45% of a packed repository is stored as
+  differences against another object rather than in full, and scanning those raw
+  loses exactly the wrong half: text a delta *inserts* is literal and was found,
+  text it *copies* from its base was invisible. So a credential added in one
+  commit and merely carried forward in the next was reported in the object that
+  introduced it and missed in every later one — and a file edited *around* a
+  secret produced an object that looked completely clean.
+
+  `archive.ReadPack` now applies `ofs-delta` and `ref-delta` against their bases,
+  recursing through chains, and the resolved object gets its real git object ID.
+  Verified end to end: **864 of this repo's own object IDs match `git cat-file`,
+  395 of them resolved deltas, none unresolved** — the content has to be correct
+  to the byte or the SHA-1 would not match. A delta that still cannot be resolved
+  (a thin pack whose base is not in the file, or one above the 64 MiB resolve
+  ceiling) falls back to the raw-instruction scan and the report says how many.
+
+  `.idx` files carry only hashes, CRCs and offsets — no names, no content — so
+  skipping them as binary is correct and costs nothing.
 - **Documents.** PDF is opaque (its text lives in Flate streams). Office files
   are handled structurally as zips of XML and are untested; Word splits text
   runs, so an address is routinely `bob@acme` + `.com` in two elements and no

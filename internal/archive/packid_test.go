@@ -40,7 +40,7 @@ func TestPackObjectIDsMatchGit(t *testing.T) {
 	if err != nil {
 		t.Skipf("no pack directory: %v", err)
 	}
-	checked, deltas := 0, 0
+	checked, deltas, resolved := 0, 0, 0
 	for _, e := range entries {
 		if !strings.HasSuffix(e.Name(), ".pack") {
 			continue
@@ -49,16 +49,19 @@ func TestPackObjectIDsMatchGit(t *testing.T) {
 		if err != nil {
 			t.Fatal(err)
 		}
-		objs, rerr := ReadPack(f, 1<<30, 0, spill.DefaultPolicy)
+		objs, rerr := ReadPack(f, 1<<30, 0, spill.DefaultPolicy, nil)
 		f.Close()
 		if rerr != nil {
 			ClosePack(objs)
 			t.Fatalf("ReadPack(%s): %v", e.Name(), rerr)
 		}
 		for _, o := range objs {
-			if o.Delta {
+			if o.Delta && !o.Resolved {
 				deltas++
 				continue
+			}
+			if o.Delta {
+				resolved++
 			}
 			kind, ok := known[o.Name]
 			if !ok {
@@ -76,5 +79,6 @@ func TestPackObjectIDsMatchGit(t *testing.T) {
 	if checked == 0 {
 		t.Skip("no whole (non-delta) objects available to verify")
 	}
-	t.Logf("verified %d object IDs against git, %d deltas skipped", checked, deltas)
+	t.Logf("verified %d object IDs against git (%d of them resolved deltas), %d deltas unresolved",
+		checked, resolved, deltas)
 }

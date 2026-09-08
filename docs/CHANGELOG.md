@@ -103,12 +103,51 @@ was not. A pack carrying matches makes the run `incomplete-risky` and diverts it
 `review/`; a pack with nothing in it is still named as a hole, but does not trip the
 alarm that means an unredacted credential is present.
 
-Delta objects — about 45% of a packed repository — are scanned as raw instruction
-streams. Text a delta *inserts* is literal and is found; text carried over unchanged
-from a base object belongs to that base, which is scanned in its own right when it is
-a whole object. Resolving deltas properly would close the remainder. The sibling
-`.idx` needs nothing: it holds a fanout table, object IDs, CRCs and offsets, with no
-filenames and no content.
+Delta objects are resolved rather than skimmed. About 45% of a packed repository is
+stored as differences against another object, and scanning those raw loses precisely
+the wrong half: text a delta *inserts* appears literally and was found, text it
+*copies* from its base did not appear at all. So a credential added in one commit and
+carried forward unchanged in the next was reported in the object that introduced it
+and missed in every later one — and a file edited *around* a secret produced an
+object that scanned completely clean.
+
+`ofs-delta` and `ref-delta` are applied against their bases now, recursing through
+chains, and a resolved object is reported under its real object ID with its base's
+type — a delta inherits what it is from what it was built against, so a hit says
+"blob" or "commit" rather than "ofs-delta". Resolution is bounded: 64 MiB per object,
+a refused cycle rather than a stack overflow on a pack that names itself as its own
+base, and a checked bound on every copy instruction, since a copy is a pair of
+numbers indexing into a buffer supplied by whoever uploaded the file. What cannot be
+resolved — a thin pack whose base is absent, or an object over the ceiling — falls
+back to the raw-instruction scan, and the report says how many.
+
+Resolution is also the first stretch of the walk that could not be interrupted. A
+review of this change found that failed resolutions were not memoised, and since an
+ofs-delta's base is always *earlier* in the file, a pack of objects each deltaing
+against its predecessor made resolution quadratic: 29 seconds for 25,000 objects in a
+537 KB file, extrapolating to minutes of CPU at the default member cap from a couple
+of megabytes — and `SCRUB_TIMEOUT` could not stop it, because it is a cooperative
+latch and neither `ReadPack` nor the resolver polled anything. Failures are memoised
+now (the same 25,000 objects take 117 ms), both loops poll the abort predicate, and
+recursion carries an explicit depth ceiling: the visiting set refuses cycles, but a
+chain does not have to be circular to exhaust a goroutine stack, and that is a fatal
+error `recover()` cannot catch — it would take down every object in flight rather
+than the one bad bundle.
+
+The same review found the ref-delta pass loop resolved only two links of a chain
+whose bases appear later in the file, silently falling back to the raw scan for the
+rest; it runs to a fixpoint now. And the ofs-delta offset overflow check tested the
+sign bit *after* shifting rather than before, as git does — so an offset git rejects
+was accepted, wrapped to a small positive, and bound the delta to whatever sat there,
+which with a same-size base yields a fabricated object reported under a real-looking
+ID.
+
+The proof is the object IDs: 864 of this repository's own, 395 of them resolved
+deltas, all matching `git cat-file`. A delta applied wrongly by one byte gives a
+different SHA-1, so the IDs matching is the content being exactly right.
+
+The sibling `.idx` needs nothing: it holds a fanout table, object IDs, CRCs and
+offsets, with no filenames and no content.
 
 ### Verification
 
