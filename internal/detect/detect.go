@@ -22,6 +22,9 @@ const (
 	Zlib
 	SevenZip
 	Rar
+	// Pack is a git packfile: the object database of a git repository, which is
+	// how a repo's whole history arrives inside an ordinary .tar.gz.
+	Pack
 )
 
 func (f Format) String() string {
@@ -44,6 +47,8 @@ func (f Format) String() string {
 		return "7z"
 	case Rar:
 		return "rar"
+	case Pack:
+		return "git packfile"
 	default:
 		return "unknown"
 	}
@@ -60,6 +65,7 @@ var (
 	sig7z       = []byte{'7', 'z', 0xbc, 0xaf, 0x27, 0x1c}
 	sigRar4     = []byte{'R', 'a', 'r', '!', 0x1a, 0x07, 0x00}
 	sigRar5     = []byte{'R', 'a', 'r', '!', 0x1a, 0x07, 0x01, 0x00}
+	sigPack     = []byte{'P', 'A', 'C', 'K'}
 )
 
 // DetectFormat inspects a leading slice of a stream and returns the recognized
@@ -88,6 +94,8 @@ func DetectFormat(header []byte) Format {
 	// whose first entry was named "80..." or "home/..." could be sent to inflate,
 	// fail, be retried as a leaf, and be skipped as binary -- a tar of logs out
 	// unscrubbed on the strength of its first filename.
+	case isPack(header):
+		return Pack
 	case isTar(header):
 		return Tar
 	case isZlib(header):
@@ -95,6 +103,31 @@ func DetectFormat(header []byte) Format {
 	default:
 		return Unknown
 	}
+}
+
+// isPack recognizes a git packfile.
+//
+// "PACK" alone is four bytes of ordinary text -- it is a real English word and a
+// plausible start to a log line -- so the version and object count are part of the
+// signature. Only versions 2 and 3 exist, and a pack with no objects is not a thing
+// git writes, which together make a false positive on prose essentially impossible.
+//
+// This matters more than the other formats' signatures do. A packfile misread as a
+// leaf is sniffed as binary and skipped in silence, and a packfile is the single
+// richest source of secrets a bundle can contain: every blob, tree and commit in the
+// repository's history, including the ones deleted from the working tree. Whatever
+// this returns, the content is not scrubbable -- see archive.CanWrite -- but being
+// recognised is what separates "reported clean" from "reported as a hole".
+func isPack(header []byte) bool {
+	if len(header) < 12 || !bytes.HasPrefix(header, sigPack) {
+		return false
+	}
+	switch binary.BigEndian.Uint32(header[4:8]) {
+	case 2, 3:
+	default:
+		return false
+	}
+	return binary.BigEndian.Uint32(header[8:12]) > 0
 }
 
 // isBzip2 recognizes a bzip2 stream. "BZh" alone is three bytes of ordinary text,

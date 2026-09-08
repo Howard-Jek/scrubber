@@ -15,7 +15,9 @@ import (
 	"fmt"
 	"io"
 	"os"
+	"strings"
 	"syscall"
+	"time"
 
 	"github.com/howard/scrubber/internal/archive"
 	"github.com/howard/scrubber/internal/detect"
@@ -78,6 +80,24 @@ type Limits struct {
 	// rather than from its scratch volume. Above it the file is passed through and
 	// flagged ReasonLeafCap instead of being scrubbed.
 	MaxLeafBytes int64
+	// MaxFileTime is the longest the matcher will spend on a single file before
+	// abandoning that file and moving to the next. Zero disables the check, which is
+	// the behaviour that shipped.
+	//
+	// It is the time analogue of MaxLeafBytes, and it closes the same class of gap.
+	// Every other time budget here is scoped to the whole object: SCRUB_TIMEOUT is a
+	// total, and STALL_ABORT_AFTER fires only when nothing at all is moving. Neither
+	// can say "this one member is pathological, skip it and keep going" -- so a
+	// single dense file took a bundle of otherwise ordinary logs down with it, and
+	// published nothing, on a budget the other members would never have touched.
+	//
+	// Sized in time rather than in bytes because the cost of a file is not its size:
+	// a 10 MiB log where every line matches is far more expensive than a 200 MiB one
+	// where nothing does, and MaxLeafBytes cannot tell them apart.
+	//
+	// Above it the file is passed through unscrubbed and flagged ReasonFileTimeout,
+	// and the rest of the archive is scrubbed normally.
+	MaxFileTime time.Duration
 	// Spill decides which payloads stay on the heap. The zero value uses
 	// spill.DefaultPolicy.
 	Spill spill.Policy
@@ -521,6 +541,8 @@ func (e *Engine) ProcessBlob(path string, in *spill.Blob, depth int) (*spill.Blo
 		return e.handleTar(path, in, depth)
 	case detect.Gzip, detect.Zlib, detect.Bzip2, detect.Xz, detect.Zstd:
 		return e.handleCompressed(f, path, in, depth)
+	case detect.Pack:
+		return e.handlePack(path, in)
 	case detect.SevenZip, detect.Rar:
 		e.skip(path, report.StatusUnsupported, report.ReasonUnsupported,
 			"read-only archive format in this build; passed through unchanged", in)
@@ -565,6 +587,31 @@ func (e *Engine) containerFailure(path, kind string, in *spill.Blob, err error) 
 	default:
 		e.skip(path, report.StatusPassthrough, report.ReasonMalformed,
 			fmt.Sprintf("could not read %s: %v", kind, err), in)
+	}
+}
+
+// fileBudget builds the predicate the matcher polls while scrubbing one file.
+//
+// It folds two questions that must stay distinguishable into the single boolean
+// ScrubAbortable understands: "has the caller given up on this object?" and "has
+// this one file spent its allowance?". The matcher only needs to know that it
+// should stop; the caller re-asks e.Abort afterwards to find out which it was,
+// because the two answers cost very different things -- one collapses the walk and
+// publishes nothing, the other costs a single member.
+//
+// The clock starts when this is called, which is the moment the payload is handed
+// to the matcher, so the budget covers the scrub itself and not the decode and
+// spill-read that precede it. Those are bounded by size rather than by time.
+func (e *Engine) fileBudget() func() bool {
+	if e.Limits.MaxFileTime <= 0 {
+		return e.Abort
+	}
+	deadline := time.Now().Add(e.Limits.MaxFileTime)
+	return func() bool {
+		if e.Abort != nil && e.Abort() {
+			return true
+		}
+		return time.Now().After(deadline)
 	}
 }
 
@@ -628,9 +675,41 @@ func (e *Engine) handleLeaf(path string, in *spill.Blob) (*spill.Blob, bool) {
 	// file can be large enough to outlast the whole scrub budget on a throttled
 	// pod, and an uninterruptible member is how a walk came to run past its
 	// deadline and then have every byte of that work discarded for missing it.
-	scrubbed, matches, stopped := e.Matcher.ScrubAbortable(text, e.Abort)
+	scrubbed, matches, stopped := e.Matcher.ScrubAbortable(text, e.fileBudget())
 	if stopped {
-		e.aborted = true
+		// Which predicate tripped decides whether this costs one file or the whole
+		// object, so the order here is the whole point. A cancel or a scrub deadline
+		// is checked FIRST and collapses the walk: those mean the caller is no longer
+		// waiting for this bundle, and a container must then hand back its original
+		// bytes rather than repack a half-scrubbed archive.
+		//
+		// Only if neither of those is what stopped it was it this file's own budget,
+		// and that is deliberately NOT an abort: e.aborted stays false, the walk
+		// continues to the next member, and the hole is named in the report.
+		if e.Aborted() {
+			return in, false
+		}
+		// Report.Skip rather than e.skip, which is the one place this deviates from
+		// every other hole, and deliberately. e.skip runs the residual scan, and the
+		// residual scan runs THIS SAME MATCHER over THIS SAME payload with no abort
+		// predicate -- it is bounded in bytes only. But this file is here precisely
+		// because the matcher was too slow on it, and MaxFileTime exists because
+		// cost tracks match density rather than size, so a byte bound does not bound
+		// the time. Re-scanning here would hand the file that just outran its budget
+		// straight back to an uninterruptible pass that neither MaxFileTime nor
+		// SCRUB_TIMEOUT can stop, which is the deadline-cannot-reach-the-work bug
+		// this codebase already fixed once.
+		//
+		// So the safety net is skipped for this one reason code, and the detail says
+		// so rather than letting a reader assume the usual scan happened.
+		e.Report.Skip(path, report.StatusGuardTripped, report.ReasonFileTimeout,
+			fmt.Sprintf("file was still being scrubbed after %s, the single-file time "+
+				"limit; abandoned unscrubbed so the rest of the archive could be "+
+				"processed. The residual scan was NOT run over it: that scan uses the "+
+				"same matcher and is bounded in bytes rather than time, so on the one "+
+				"file already proven too slow it could outrun the budget again with "+
+				"nothing able to interrupt it.", e.Limits.MaxFileTime),
+			int(in.Size()), int(in.Size()))
 		return in, false
 	}
 	if len(matches) == 0 {
@@ -881,6 +960,209 @@ func (e *Engine) handleTar(path string, in *spill.Blob, depth int) (*spill.Blob,
 	return e.repack(mark, path, "tar", in, func(w io.Writer) error {
 		return archive.WriteTarTo(w, members, tail)
 	})
+}
+
+// handlePack inspects a git packfile and refuses to rewrite it.
+//
+// This is the one container the engine opens with no intention of changing. Every
+// other read path exists to scrub; descending into a format that cannot be
+// re-encoded is forbidden elsewhere (see handleCompressed and archive.CanWrite)
+// precisely because scrubbing and then discarding the result would leave the
+// matches counted as though they had been applied. Nothing is counted as applied
+// here: the findings go through NoteResidual, which is the report's channel for
+// matches found in content that was NOT scrubbed, and the pack itself is recorded
+// as a hole.
+//
+// The refusal is forced by the format. An object's ID is the SHA-1 of its own
+// content and the pack trailer is the SHA-1 of everything before it, so redacting a
+// single byte invalidates that object, every tree and commit that reaches it, the
+// .idx beside it and the trailer -- git stops being able to read the repository.
+// There is no version of "scrub this pack" that leaves a working repository behind,
+// so the useful thing to do is say exactly what is in it and to whom.
+//
+// Which is worth a great deal, because the alternative was silence. A pack is
+// high-entropy end to end, so it sniffs as binary, skips correctly, and scans clean
+// at every stride -- while holding every secret ever committed to the repository,
+// including the ones deleted from the working tree in the very next commit.
+func (e *Engine) handlePack(path string, in *spill.Blob) (*spill.Blob, bool) {
+	rc, err := in.Reader()
+	if err != nil {
+		e.skip(path, report.StatusPassthrough, report.ReasonMalformed,
+			fmt.Sprintf("could not read git packfile: %v", err), in)
+		return in, false
+	}
+	objects, rerr := func() ([]archive.PackObject, error) {
+		defer rc.Close()
+		return archive.ReadPack(rc, e.budget, e.Limits.MaxMembers, e.Limits.Spill)
+	}()
+	defer archive.ClosePack(objects)
+
+	if len(objects) == 0 {
+		// A guard trip or a full scratch volume is not a corrupt packfile, and
+		// collapsing them is exactly what containerFailure exists to prevent: it
+		// sends an operator hunting a bad upload when the real answer is that
+		// /work is full or MAX_MEMBERS is too low. Classify those the way every
+		// other container does.
+		if errors.Is(rerr, archive.ErrTooLarge) || errors.Is(rerr, archive.ErrTooManyMembers) ||
+			errors.Is(rerr, spill.ErrSpill) {
+			e.containerFailure(path, "git packfile", in, rerr)
+			return in, false
+		}
+		// Genuinely undecodable. Recognised as a pack and yielding nothing readable
+		// is an opaque hole rather than an ordinary one: a clean scan of something
+		// nobody could open is the absence of a scan, and it makes the run risky on
+		// its own.
+		e.Report.Skip(path, report.StatusUnsupported, report.ReasonGitPack,
+			fmt.Sprintf("git packfile could not be decoded (%v); passed through unchanged "+
+				"and NOT scrubbed, and nothing inside it could be examined", rerr),
+			int(in.Size()), int(in.Size()))
+		e.Report.NoteOpaque()
+		return in, false
+	}
+
+	for i := range objects {
+		e.stage(objects[i].Body)
+		e.take(objects[i].Body.Size())
+	}
+
+	// Every object is scanned through the residual reader rather than the leaf
+	// matcher, because a pack holds four shapes at once: commits and tags are plain
+	// text, trees interleave filenames with raw 20-byte IDs, blobs are anything at
+	// all, and a delta is an instruction stream whose inserted text is literal.
+	// Residual extraction reads text runs out of all four; the leaf path would
+	// dismiss three of them as binary.
+	//
+	// Nothing is recorded on the report inside this loop. NoteResidual and NoteOpaque
+	// both amend the MOST RECENT entry, so they are only meaningful straight after a
+	// Skip -- calling them per object, before the pack's own Skip, would write each
+	// object's hits onto whatever unrelated file happened to be recorded last and
+	// corrupt that entry's rollback ledger. So the loop collects, and the report is
+	// written once, in order, below.
+	var (
+		scanned, carrying, hits, deltas, opaque int
+		named                                   []string
+	)
+	for i := range objects {
+		if e.Matcher == nil || e.Limits.ResidualBudget < 0 || e.residualLeft <= 0 {
+			break
+		}
+		res, err := residual.Scan(objects[i].Body, e.Matcher, e.residualLeft)
+		if err != nil {
+			// Charge nothing for a scan that did not happen, matching residualScan.
+			// Charging here let a run of unreadable objects exhaust RESIDUAL_BUDGET
+			// without a byte being examined, and then report the budget as spent.
+			continue
+		}
+		if n := objects[i].Body.Size(); n < e.residualLeft {
+			e.residualLeft -= n
+		} else {
+			e.residualLeft = 0
+		}
+		scanned++
+		if res.Opaque {
+			// A committed encrypted zip, or an archive in a method Go cannot read.
+			// Its content is real and nobody could look at it, which is the case
+			// UnscannableHoles exists to count.
+			opaque++
+		}
+		if res.Hits == 0 {
+			continue
+		}
+		carrying++
+		hits += res.Hits
+		if objects[i].Delta {
+			deltas++
+		}
+		if len(named) < maxNamedPackObjects {
+			named = append(named, objects[i].Ref()+": "+res.Summary())
+		}
+		e.residualHits += res.Hits
+		if e.residualLabels == nil {
+			e.residualLabels = map[string]int{}
+		}
+		for k, v := range res.Labels {
+			e.residualLabels[k] += v
+		}
+	}
+
+	// The pack's own entry first, then the annotations that amend it.
+	e.Report.Skip(path, report.StatusUnsupported, report.ReasonGitPack,
+		packDetail(len(objects), scanned, carrying, hits, deltas, rerr, e.residualLeft <= 0, named),
+		int(in.Size()), int(in.Size()))
+	if hits > 0 {
+		e.Report.NoteResidual(path, report.ReasonGitPack, hits, packResidualSummary(carrying, hits, named))
+	}
+	if opaque > 0 {
+		e.Report.NoteOpaque()
+	}
+	return in, false
+}
+
+// packDetail writes the sentence an operator acts on.
+//
+// Long, because a pack is the one finding where the obvious next step is the wrong
+// one. Every other hole in this report is answered by changing a setting and running
+// it again; this one cannot be, and saying so plainly is the difference between an
+// operator fixing their bundle and an operator filing a bug asking why the scrubber
+// skipped a file.
+// maxNamedPackObjects bounds how many object IDs a single pack contributes to the
+// report. The count stays exact; this only bounds the naming, the same way the note
+// lists everywhere else are bounded.
+const maxNamedPackObjects = 20
+
+// packResidualSummary is the one-line form, carrying the object IDs so they survive
+// into ResidualSamples where a person reading the summary will see them.
+func packResidualSummary(carrying, hits int, named []string) string {
+	s := fmt.Sprintf("%d match(es) in %d git object(s), none redacted", hits, carrying)
+	if len(named) > 0 {
+		s += " — " + strings.Join(named, "; ")
+	}
+	if carrying > len(named) {
+		s += fmt.Sprintf("; and %d more", carrying-len(named))
+	}
+	return s
+}
+
+func packDetail(total, scanned, carrying, hits, deltas int, readErr error, budgetSpent bool, named []string) string {
+	var b strings.Builder
+	fmt.Fprintf(&b, "git packfile: %d objects decoded", total)
+	if scanned < total {
+		fmt.Fprintf(&b, ", %d of them examined", scanned)
+	}
+	if readErr != nil {
+		fmt.Fprintf(&b, " (the pack stopped parsing partway: %v, so the remainder was not examined)", readErr)
+	}
+	if budgetSpent {
+		b.WriteString(" (RESIDUAL_BUDGET was exhausted before every object could be read)")
+	}
+	b.WriteString(". ")
+	if carrying == 0 {
+		b.WriteString("No object matched this policy. The pack is passed through unchanged " +
+			"and NOT scrubbed, which is a limitation of the format rather than a fault: " +
+			"a packfile cannot be rewritten without breaking the repository.")
+		return b.String()
+	}
+	fmt.Fprintf(&b, "%d object(s) carry %d match(es) for this policy. ", carrying, hits)
+	if len(named) > 0 {
+		fmt.Fprintf(&b, "By object ID: %s. ", strings.Join(named, "; "))
+		if carrying > len(named) {
+			fmt.Fprintf(&b, "(%d further object(s) not named here.) ", carrying-len(named))
+		}
+	}
+	if deltas > 0 {
+		fmt.Fprintf(&b, "%d of those are delta objects, which cannot be addressed by "+
+			"object ID without resolving them against their base. ", deltas)
+	}
+	b.WriteString("The pack was passed through UNCHANGED and these matches are NOT " +
+		"redacted. They cannot be: an object's ID is the SHA-1 of its own content and " +
+		"the trailer is the SHA-1 of the whole file, so editing one byte breaks that " +
+		"object, every commit that reaches it, the .idx beside it and the trailer at " +
+		"once -- the result would be a repository git cannot open. Inspect an object " +
+		"with `git cat-file -p <id>` and find the commits carrying it with " +
+		"`git log --all --find-object=<id>`. To ship this bundle safely, remove the " +
+		".git directory from it, or rewrite the history with `git filter-repo` and " +
+		"repack before uploading again.")
+	return b.String()
 }
 
 func (e *Engine) handleZip(path string, in *spill.Blob, depth int) (*spill.Blob, bool) {

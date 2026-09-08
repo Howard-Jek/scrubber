@@ -309,6 +309,10 @@ var ObjectStatuses = []string{
 	// the object to scratch up to the cap plus one byte before refusing it — the
 	// extra byte is how "exactly at the limit" is told from "over it".
 	"too_large",
+	// the object names a policy or carries a sidecar that cannot be resolved. Its
+	// own fault rather than the deployment's, and no retry changes it, so the
+	// input is set aside. A rising rate points at what is being uploaded.
+	"unresolvable",
 	"panic", // a bug in the pipeline; the object is skipped, the service continues
 	// abandoned after publishing no progress for STALL_ABORT_AFTER. Distinct from
 	// "timeout", which means the budget was too small for a bundle that was still

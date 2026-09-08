@@ -91,10 +91,19 @@ func roundDur(d time.Duration) string {
 	}
 }
 
-// failureDetail states what failed, where it failed, and how long it had been
-// running, in that order.
-func failureDetail(err error, at position, elapsed time.Duration) string {
-	return fmt.Sprintf("%v — failed after %s, %s", err, roundDur(elapsed), at)
+// failureDetail states what failed, where it failed, how long it had been running,
+// and what became of the input, in that order.
+//
+// The disposition is the half an operator acts on, and it used to be missing. The
+// error says what broke; whether the object is waiting on a backoff, or sitting in
+// processed/ needing a re-upload, says what to do about it, and was left to be
+// inferred from a log line somewhere else.
+func failureDetail(err error, at position, elapsed time.Duration, disposition string) string {
+	s := fmt.Sprintf("%v — failed after %s, %s", err, roundDur(elapsed), at)
+	if disposition != "" {
+		s += ". " + disposition
+	}
+	return s
 }
 
 // timeoutDetail explains an object abandoned on its own deadline.
@@ -138,8 +147,11 @@ func stallDetail(budget, elapsed time.Duration, at position, disposition string)
 	if disposition != "" {
 		fmt.Fprintf(&b, "%s ", disposition)
 	}
-	b.WriteString("Every long stretch of the walk publishes a heartbeat, so this is not " +
-		"a bundle that is merely large — something stopped. If it recurs on the same " +
+	b.WriteString("Most long stretches of the walk publish a heartbeat, so this is " +
+		"usually something that stopped rather than a bundle that is merely large. The " +
+		"exception is expanding a container, which reports nothing until its first " +
+		"member is scrubbed: a verdict reached in that phase can be wrong, which is why " +
+		"a stalled input is always kept rather than destroyed. If it recurs on the same " +
 		"object the bundle is the suspect; if it recurs on different ones, look at the " +
 		"scratch volume and the object store, which are where the walk can block in a " +
 		"way it cannot interrupt.")

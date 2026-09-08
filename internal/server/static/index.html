@@ -512,7 +512,13 @@
         // work that then completed a minute later, with nothing to say it had.
         if(s.status==='retrying'){
           var wait=s.retry_in_seconds||0;
-          st.textContent='Storage stalled — retrying'+(wait?' in '+wait+'s':'')+'…';
+          // Deliberately does NOT name a cause. "retrying" once meant only a
+          // stalled object-storage transfer, so this said so; it now covers every
+          // retryable failure — a scratch volume that filled, an output bucket
+          // refusing writes, a policy directory being fixed. Naming storage for
+          // all of them sent people to look at the wrong thing. The specifics are
+          // in the tooltip below, which carries the failure's own words.
+          st.textContent='Retrying'+(wait?' in '+wait+'s':'')+'…';
           st.title=s.error||'';
           setp(creep);
           setTimeout(function(){poll(key,creep);},1200);
