@@ -432,11 +432,13 @@ func (w *Worker) watchStalls(ctx context.Context) {
 				// Nothing has moved for the whole abort budget. Take it away from its
 				// consumer so the queue behind it drains.
 				//
-				// This is only trustworthy because every long stretch of the walk now
-				// publishes a heartbeat: expanding a container, scrubbing one large
-				// file and rebuilding the archive all report. Before that, a rebuild
-				// was silent for its entire duration and this check would have
-				// destroyed healthy work.
+				// This is only trustworthy because the stretches that CAN report now do:
+				// both transfers, scrubbing one large file, and recompressing or
+				// rebuilding an archive. Before that, a rebuild was silent for its
+				// entire duration and this check would have destroyed healthy work.
+				// One stretch still cannot report — a container is expanded in full
+				// before its first member is scrubbed — so the verdict remains an
+				// inference, which is why stalledExit never deletes what it abandons.
 				if abortAfter > 0 && secs >= abortAfter.Seconds() {
 					if w.abortStalled(key) {
 						w.log.Error("object has published no progress for its stall budget and is "+
@@ -1111,21 +1113,30 @@ func (w *Worker) processObject(ctx context.Context, o store.Object) {
 		w.metrics.Errors.Inc()
 		w.metrics.Objects.WithLabelValues("no_progress").Inc()
 		disposition := "The input was left in the bucket."
-		if err := w.finish(ctx, o.Key); err != nil {
+		movedTo := ""
+		if err := w.setAside(ctx, o.Key); err != nil {
+			// It really is still at its own key, so it WILL come back — and it must
+			// come back backed off. Without the deferral attempts stays 0, orderKey
+			// falls back to the object's LastModified (by definition the oldest key
+			// in the bucket), and the object retakes the head of the very next poll
+			// to wedge another consumer for another whole stall budget. This branch
+			// is not hypothetical under ActionDelete: such a deployment may hold no
+			// write rights on the input bucket at all, so every set-aside fails.
+			d := w.deferRetry(o.Key)
 			w.log.Warn("could not move a stalled input aside; it stays in the input bucket "+
-				"and will be picked up again", "key", o.Key, "err", err)
+				"and is retried after a backoff", "key", o.Key, "err", err, "retry_in", d)
 			disposition = "The input could NOT be moved aside (" + err.Error() +
-				"), so it stays in the input bucket and will be attempted again."
+				"), so it stays in the input bucket and is attempted again in " +
+				roundDur(d) + "."
 		} else {
 			w.clearDeferral(o.Key)
-			switch w.cfg.Action {
-			case ActionDelete:
-				disposition = "The input was moved aside rather than deleted: this deployment " +
-					"deletes finished inputs, but an object the service refused to process is " +
-					"not a finished one, and it may be the only copy."
-			default:
-				disposition = "The input was moved to " + w.cfg.ProcessedPrefix + o.Key +
-					" and will NOT be retried automatically; re-upload it to try again."
+			movedTo = w.cfg.ProcessedPrefix + o.Key
+			disposition = "The input was moved to " + movedTo +
+				" and will NOT be retried automatically; re-upload it to try again."
+			if w.cfg.Action == ActionDelete {
+				disposition += " It was moved rather than deleted: this deployment deletes " +
+					"finished inputs, but an object the service refused to process is not a " +
+					"finished one, and it may be the only copy."
 			}
 		}
 		job.Status = "error"
@@ -1134,7 +1145,7 @@ func (w *Worker) processObject(ctx context.Context, o store.Object) {
 		job.Error = stallDetail(w.cfg.StallAbortAfter, time.Since(start), p, disposition)
 		record(job)
 		w.log.Error("object abandoned after publishing no progress; the queue continues",
-			"key", o.Key, "stall_abort_after", w.cfg.StallAbortAfter,
+			"key", o.Key, "input_moved_to", movedTo, "stall_abort_after", w.cfg.StallAbortAfter,
 			"elapsed", roundDur(time.Since(start)),
 			"phase", p.phase, "files_done", p.filesDone, "files_total", p.filesTotal,
 			"current_file", p.currentFile, "no_progress", roundDur(p.noProgress))
@@ -1580,8 +1591,20 @@ func (w *Worker) finish(ctx context.Context, key string) error {
 	case ActionDelete:
 		return w.store.Delete(ctx, w.cfg.InputBucket, key)
 	default: // move
-		return w.store.Move(ctx, w.cfg.InputBucket, key, w.cfg.ProcessedPrefix+key)
+		return w.setAside(ctx, key)
 	}
+}
+
+// setAside moves an input out of the way without destroying it, whatever Action
+// says. Kept apart from finish because Action answers the narrower question of what
+// should happen to an input the service is FINISHED with, which a caller that never
+// finished with the object has no business consulting — see stalledExit.
+//
+// Safe under every Action: ProcessedPrefix is defaulted in New so it is never
+// empty, and eligible() rejects that prefix without consulting Action, so an object
+// set aside here does not return on the next poll.
+func (w *Worker) setAside(ctx context.Context, key string) error {
+	return w.store.Move(ctx, w.cfg.InputBucket, key, w.cfg.ProcessedPrefix+key)
 }
 
 // Audit detail is configured through report.ParseAuditLevel (shared with the CLI's
