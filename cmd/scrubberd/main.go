@@ -271,7 +271,7 @@ func realMain(log *slog.Logger) error {
 		// The one bound on the walk itself. See worker.Config.ScrubTimeout for why
 		// nothing else is one, and the sizing check below for how this default was
 		// picked against MAX_EXPAND_BYTES.
-		ScrubTimeout:  envDuration("SCRUB_TIMEOUT", defaultScrubTimeout),
+		ScrubTimeout: envDuration("SCRUB_TIMEOUT", defaultScrubTimeout),
 		Audit:         audit,
 		RedactReports: envBool("REDACT_REPORTS", false),
 		ScrubNames:    envBool("SCRUB_FILENAMES", true),
@@ -313,6 +313,15 @@ func realMain(log *slog.Logger) error {
 			// on what the bundles look like. Set it once you have seen how long a
 			// normal member takes on your own hardware.
 			MaxFileTime: envDurationChecked(probs, "FILE_SCRUB_TIMEOUT", 0),
+			// Reading a git packfile is not free: resolving its deltas rebuilds every
+			// historical version of every file, so a pack charges the expansion budget
+			// around five to eight times its size on disk and spills the same to
+			// scratch. Set SCRUB_GIT_PACKS=false to go back to skipping them if a
+			// bundle of repositories is exhausting MAX_EXPAND_BYTES faster than the
+			// volume can be raised. The pack is still reported as an uninspected hole
+			// either way -- this changes whether it is READ, never whether it is
+			// MENTIONED.
+			SkipGitPacks: !envBool("SCRUB_GIT_PACKS", true),
 			// Bytes the residual scan may read across one object. Negative disables
 			// it, which removes the only check that does not depend on the pipeline's
 			// own classification being correct — the check that would have caught
@@ -595,7 +604,7 @@ func realMain(log *slog.Logger) error {
 			// with no auth this turns a two-line loop into a durable, restart-
 			// surviving evacuation of every user's work.
 			AllowCancelAny: envBool("ALLOW_CANCEL_ANY", false),
-			CancelBudget:   envDuration("CANCEL_BUDGET", 60*time.Second),
+			CancelBudget:        envDuration("CANCEL_BUDGET", 60*time.Second),
 			// Total object-storage time one HTTP request may spend. The store
 			// bounds each call; this bounds their sum, which is what a browser
 			// polling every second actually experiences. Negative disables it.

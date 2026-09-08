@@ -413,3 +413,44 @@ func TestPackDeltaCarryingCopiedSecretIsFound(t *testing.T) {
 	}
 	t.Logf("detail: %s", hole.Detail)
 }
+
+// TestSkipGitPacksStillReportsTheHole is the safety property of the kill switch.
+//
+// The switch exists for capacity: reading a pack charges the expansion budget several
+// times the pack's size on disk, and an operator may need to stop that faster than an
+// image rollback allows. What it must never become is a quiet way to make a bundle
+// full of credentials look clean, so turning it on changes whether the pack is READ,
+// never whether it is MENTIONED.
+func TestSkipGitPacksStillReportsTheHole(t *testing.T) {
+	secret := "password = hunter2\ncontact bob@acme.test at AcmeCorp\n"
+	data := packOf(t, []packObj{{typ: 3, content: secret}})
+
+	lim := DefaultLimits()
+	lim.SkipGitPacks = true
+
+	out, rep := run(t, data, lim)
+
+	if !bytes.Equal(out, data) {
+		t.Error("the packfile was modified")
+	}
+	var hole *report.PassthroughNote
+	for i := range rep.Summary.Passthroughs {
+		if rep.Summary.Passthroughs[i].Code == report.ReasonGitPack {
+			hole = &rep.Summary.Passthroughs[i]
+		}
+	}
+	if hole == nil {
+		t.Fatalf("disabling pack scanning also hid the pack from the report; got %+v",
+			rep.Summary.Passthroughs)
+	}
+	if !strings.Contains(hole.Detail, "disabled by configuration") {
+		t.Errorf("the detail does not say nobody looked: %q", hole.Detail)
+	}
+	// Nobody looked, so the run cannot be cleared. An unread pack is an unscannable
+	// hole, not an absence of findings.
+	if v := rep.Summary.Verdict(); v != report.VerdictIncompleteRisky {
+		t.Errorf("verdict = %q, want %q — a pack nobody examined must not pass as "+
+			"ordinary incomplete, or disabling the scan becomes a way to launder a "+
+			"bundle through the normal output bucket", v, report.VerdictIncompleteRisky)
+	}
+}

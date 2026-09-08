@@ -98,6 +98,24 @@ type Limits struct {
 	// Above it the file is passed through unscrubbed and flagged ReasonFileTimeout,
 	// and the rest of the archive is scrubbed normally.
 	MaxFileTime time.Duration
+	// SkipGitPacks turns off reading git packfiles, restoring the behaviour that
+	// shipped before they were recognised: the pack is sniffed as binary and passed
+	// through. Off by default -- packs are read.
+	//
+	// It exists because reading one is not free. A pack is a compressed object
+	// database, and resolving its deltas reconstructs every historical version of
+	// every file, so it charges the expansion budget roughly five to eight times its
+	// own size on disk and spills the same to scratch. Where a pack cost nothing
+	// before, a bundle carrying a large repository can now exhaust MAX_EXPAND_BYTES
+	// and leave later members of the same archive guard-tripped. That is safe --
+	// they are flagged, not silently skipped -- but it is a capacity change an
+	// operator may need to undo faster than an image rollback allows.
+	//
+	// Turning it on does NOT make the pack invisible again. Every affected report
+	// still records the pack as a hole and says the scan was disabled by
+	// configuration, because the one thing this must never become is a quiet way to
+	// make a bundle full of credentials look clean.
+	SkipGitPacks bool
 	// Spill decides which payloads stay on the heap. The zero value uses
 	// spill.DefaultPolicy.
 	Spill spill.Policy
@@ -542,6 +560,21 @@ func (e *Engine) ProcessBlob(path string, in *spill.Blob, depth int) (*spill.Blo
 	case detect.Gzip, detect.Zlib, detect.Bzip2, detect.Xz, detect.Zstd:
 		return e.handleCompressed(f, path, in, depth)
 	case detect.Pack:
+		if e.Limits.SkipGitPacks {
+			// Recorded, not ignored. Same status and reason code as a pack that was
+			// read, so an operator filtering on git-pack sees both, and the detail
+			// is explicit that nobody looked rather than that nothing was found.
+			e.Report.Skip(path, report.StatusUnsupported, report.ReasonGitPack,
+				"git packfile: scanning is disabled by configuration (SCRUB_GIT_PACKS=false), "+
+					"so this file was NOT examined and nothing here says whether it contains "+
+					"credentials. It holds the repository's whole history, including content "+
+					"deleted from the working tree. Re-enable pack scanning, or strip the .git "+
+					"directory before uploading.", int(in.Size()), int(in.Size()))
+			// Nobody could look, which is not the same as looking and finding
+			// nothing: the verdict has to treat it as a hole that cannot be cleared.
+			e.Report.NoteOpaque()
+			return in, false
+		}
 		return e.handlePack(path, in)
 	case detect.SevenZip, detect.Rar:
 		e.skip(path, report.StatusUnsupported, report.ReasonUnsupported,
@@ -710,6 +743,14 @@ func (e *Engine) handleLeaf(path string, in *spill.Blob) (*spill.Blob, bool) {
 				"file already proven too slow it could outrun the budget again with "+
 				"nothing able to interrupt it.", e.Limits.MaxFileTime),
 			int(in.Size()), int(in.Size()))
+		// And because the safety net did not run, nobody looked at this file at all.
+		// That is the definition of an unscannable hole, and this codebase's rule for
+		// one is not negotiable: a clean scan of something that could not be read is
+		// the ABSENCE of a scan, not a reassurance. Without this the run comes out
+		// merely "incomplete" and publishes to the NORMAL output bucket carrying a
+		// member that was abandoned mid-scrub and never examined -- which is exactly
+		// the shape the review/ diversion exists to catch.
+		e.Report.NoteOpaque()
 		return in, false
 	}
 	if len(matches) == 0 {

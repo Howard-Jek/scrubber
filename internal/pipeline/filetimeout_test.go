@@ -63,6 +63,14 @@ func TestFileTimeoutCostsOneFileNotTheArchive(t *testing.T) {
 	}
 	t.Logf("recorded: %s — %s", hole.Path, hole.Detail)
 
+	// Nobody looked at that file: it was abandoned mid-scrub and deliberately not
+	// handed to the residual scan. An unexamined member must not ride out through
+	// the normal output bucket on a merely-"incomplete" verdict.
+	if v := rep.Summary.Verdict(); v != report.VerdictIncompleteRisky {
+		t.Errorf("verdict = %q, want %q — a file that was abandoned and never scanned "+
+			"is an unscannable hole, not an ordinary one", v, report.VerdictIncompleteRisky)
+	}
+
 	// The timed-out member keeps its original bytes...
 	if !bytes.Contains(out, []byte("bob@acme.test")) {
 		t.Error("the abandoned file should be present unscrubbed; it was not passed through")
