@@ -139,11 +139,37 @@ through `probs`; make `envBool` case-insensitive and accept `on`/`off`/`y`/`n`.
   random prefix), but any external producer writing stable key names hits it.
   Fix: capture the ETag at list time and pass it as a precondition to `Move`;
   `minio.CopyObject` supports `MatchETag`.
-- **S9 · encodings the matcher cannot see.** base64
-  ([#15](https://github.com/Howard-Jek/scrubber/issues/15)), percent-encoding,
-  HTML entities, JSON `\uXXXX`, quoted-printable. All of these are plain ASCII,
-  so the file is not flagged binary either — **the run reports clean**. That is
-  the dangerous quadrant: the binaries at least get named.
+- **S9 · encodings the matcher cannot see.** All of these are plain ASCII, so
+  the file is not flagged binary either — **the run reports clean**. That is the
+  dangerous quadrant: the binaries at least get named.
+
+  Partly closed by [#24](https://github.com/Howard-Jek/scrubber/pull/24), which
+  decodes single-line base64, follows nesting three levels, and reports anything
+  deeper as an unexamined region instead of passing it over. Measured state of
+  the rest:
+
+  | Shape | Covered | Verdict when it hides a secret |
+  |---|---|---|
+  | base64, single line | yes | correct |
+  | base64 nested ≤3 | yes | correct |
+  | base64 nested 4+ | named, not decoded | `incomplete-risky` — honest |
+  | **base64 wrapped across lines** | **no** | **`complete`** |
+  | base64 wrapping compressed/binary | no | `complete` |
+  | percent-encoding | no | `complete` |
+  | HTML entities | no | `complete` |
+  | JSON `\uXXXX` | no | `complete` |
+
+  **Line-wrapped base64 is now the worst of these and should be next.** PEM and
+  MIME wrap at 64 and 76 columns, so it is the commonest shape in the wild.
+  Each line is decoded on its own, so a secret straddling a boundary is never
+  seen whole — and the lines that *do* decode produce matches, so the report
+  shows a match and the verdict reads `complete` over a live credential. Partial
+  coverage that reads as total is worse than a gap that reads as a gap. Fix:
+  join a run of consecutive base64-only lines before decoding.
+
+  Also worth knowing: percent-encoding defeats the `aws_key` rule even when the
+  key itself is left in plaintext, because `%20` puts a digit immediately before
+  `AKIA` and kills the word boundary the pattern anchors on.
 - **Formats not detected at all**: lz4, brotli, lzma, `.Z`, cpio. They fall
   through to a binary skip, which is safe but silent about *why*.
 - ~~**Git packfiles**~~ — DONE. Was the worst case in this section and was not
@@ -223,12 +249,30 @@ so this is the only lever left after `requests.cpu: 1`.
 
 ## 7. Dead code
 
-All grep-verified, zero non-test references: `Engine.ResidualFindings` and its
-write-only `residualHits`/`residualLabels` (the live count is
-`Summary.ResidualHits`) · `JobLog.Add` · `queue.truncated` (assigned, never
-read; the caller uses the return value) · `store.Client.GetLimited` (interface
-and impl, superseded by `GetLimitedTo`) · `verChip` in `index.html` ·
-`case "queued"` in `failure.go` (never a phase value).
+~~`Engine.ResidualFindings` and its write-only `residualHits`/`residualLabels`
+(the live count is `Summary.ResidualHits`) · `JobLog.Add` · `queue.truncated`
+(assigned, never read; the caller uses the return value) ·
+`store.Client.GetLimited` (interface and impl, superseded by
+`GetLimitedTo`)~~ — **DONE**, removed 2026-09-16.
+
+**Two entries on this list were wrong, and removing them would have been a
+regression.** Both were listed as grep-verified, which is why this note exists:
+the greps were right when written and the code moved underneath them.
+
+- **`verChip` in `index.html` is NOT dead.** The `id` attribute is unreferenced,
+  but the div it names wraps `<span id="verText">`, which the page fills from
+  `/api/version`. Deleting the div removes the build-version chip from the UI.
+  At most the `id` attribute is removable, and that is not worth a commit.
+- **`case "queued"` in `failure.go` is NOT dead.** `server.go` emits
+  `"phase": "queued"` in the status payload for a job that has not started, so
+  `phaseDescription` reaches it. It was never a *worker* phase value, which is
+  probably what the original note meant, but it is reachable from the API.
+
+Lesson for the next sweep: `grep -c` on a bare identifier is not proof. A field
+can share a name with a live one in another struct — `residualHits` exists in
+both `pipeline.Engine` (dead) and `report.Report` (live, read during rollback) —
+and an id in markup can be unreferenced while the element it labels is load
+-bearing.
 
 Keep: `runOnce`, `AllStatuses`, `Resident`, `Spilled`, `isCancelled`,
 `RuleCount` are test seams; `--max-ratio` is a deprecation shim; `Resolve`'s
