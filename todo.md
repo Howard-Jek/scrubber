@@ -145,15 +145,16 @@ through `probs`; make `envBool` case-insensitive and accept `on`/`off`/`y`/`n`.
 
   Partly closed by [#24](https://github.com/Howard-Jek/scrubber/pull/24), which
   decodes single-line base64, follows nesting three levels, and reports anything
-  deeper as an unexamined region instead of passing it over. Measured state of
-  the rest:
+  deeper as an unexamined region instead of passing it over; and by
+  [#27](https://github.com/Howard-Jek/scrubber/pull/27), which joins uniformly
+  wrapped lines before decoding. Measured state of the rest:
 
   | Shape | Covered | Verdict when it hides a secret |
   |---|---|---|
   | base64, single line | yes | correct |
   | base64 nested ≤3 | yes | correct |
   | base64 nested 4+ | named, not decoded | `incomplete-risky` — honest |
-  | **base64 wrapped across lines** | **no** | **`complete`** |
+  | base64 wrapped across lines (PEM, MIME) | yes, since #27 | correct |
   | base64 wrapping compressed/binary | no | `complete` |
   | percent-encoding | no | `complete` |
   | HTML entities | no | `complete` |
