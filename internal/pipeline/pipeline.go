@@ -753,6 +753,38 @@ func (e *Engine) handleLeaf(path string, in *spill.Blob) (*spill.Blob, bool) {
 		e.Report.NoteOpaque()
 		return in, false
 	}
+	// Encoded regions, todo.md S9: the one hole in the coverage contract that is
+	// silent rather than named. A base64 blob is plain ASCII, so this file was not
+	// flagged binary, was inspected, and -- until this pass existed -- fell through
+	// the len(matches) == 0 branch below as StatusUnchanged with a live credential
+	// inside it. No status, no reason code and no exit code betrayed it.
+	//
+	// This runs on the already-scrubbed text so the two passes compose: plaintext
+	// first, then whatever the plaintext pass could not see.
+	if encoded, findings := e.Matcher.ScrubEncoded(scrubbed); len(findings) > 0 {
+		for i := range findings {
+			if findings[i].Rewritten {
+				continue
+			}
+			// Found, and cannot be removed without corrupting the file. The rule for
+			// content this tool cannot clean is the same as everywhere else: emit the
+			// original, name it, and do not let the run be mistaken for a clean one.
+			e.Report.Skip(path, report.StatusPassthrough, report.ReasonEncoded,
+				fmt.Sprintf("a %s region at offset %d carries %d policy match(es) and its "+
+					"decoded content is not text, so rewriting it would replace a value "+
+					"some consumer depends on with garbage. Emitted unchanged and NOT "+
+					"scrubbed: the match is real and still present in this file.",
+					findings[i].Encoding, findings[i].Offset, len(findings[i].Matches)),
+				int(in.Size()), int(in.Size()))
+			e.Report.NoteOpaque()
+			return in, false
+		}
+		for i := range findings {
+			matches = append(matches, findings[i].Matches...)
+		}
+		scrubbed = encoded
+	}
+
 	if len(matches) == 0 {
 		e.Report.Record(path, report.StatusUnchanged, enc.String(), int(in.Size()), int(in.Size()), nil)
 		return in, false

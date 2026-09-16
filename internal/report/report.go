@@ -82,19 +82,19 @@ func (r *Report) Digest() Digest {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	return Digest{
-		InputKey:        r.InputKey,
-		OutputKey:       r.OutputKey,
-		Matches:         r.Summary.TotalMatches,
-		ByLabel:         r.Summary.MatchesByLabel,
-		FilesTotal:      r.Summary.FilesTotal,
-		Passthrough:     r.Summary.FilesPassthrough,
-		Passthroughs:    r.Summary.Passthroughs,
-		BinarySkip:      r.Summary.FilesBinarySkip,
-		BinarySkips:     r.Summary.BinarySkips,
-		Verdict:         r.Summary.Verdict(),
-		NotInspected:    r.Summary.FilesNotInspected,
-		NotInspectedSet: r.Summary.NotInspected,
-		ByReason:        r.Summary.ByReason,
+		InputKey:         r.InputKey,
+		OutputKey:        r.OutputKey,
+		Matches:          r.Summary.TotalMatches,
+		ByLabel:          r.Summary.MatchesByLabel,
+		FilesTotal:       r.Summary.FilesTotal,
+		Passthrough:      r.Summary.FilesPassthrough,
+		Passthroughs:     r.Summary.Passthroughs,
+		BinarySkip:       r.Summary.FilesBinarySkip,
+		BinarySkips:      r.Summary.BinarySkips,
+		Verdict:          r.Summary.Verdict(),
+		NotInspected:     r.Summary.FilesNotInspected,
+		NotInspectedSet:  r.Summary.NotInspected,
+		ByReason:         r.Summary.ByReason,
 		ResidualHits:     r.Summary.ResidualHits,
 		ResidualSamples:  r.Summary.ResidualSamples,
 		UnscannableHoles: r.Summary.UnscannableHoles,
@@ -275,6 +275,17 @@ const (
 	// git filter-repo before re-uploading -- not to ask for a better scrub, because
 	// there is not one.
 	ReasonGitPack Reason = "git-pack"
+	// ReasonEncoded marks a text file carrying a policy match inside an encoded
+	// region that could not be safely rewritten -- base64 wrapping a payload that
+	// is not itself text, so re-encoding it would substitute garbage for a value
+	// some consumer depends on.
+	//
+	// It is the loud half of todo.md S9. The quiet half is worse and is handled
+	// without a reason code at all: an encoded region whose decoded content IS
+	// text gets scrubbed in place, because a file that can be cleaned should be
+	// cleaned rather than named. This code marks only the residue -- the cases
+	// where the secret is real, was found, and still travels in the output.
+	ReasonEncoded Reason = "encoded-content"
 	// ReasonUnclassified is the tripwire. It is never written deliberately: it marks
 	// a hole recorded through Record instead of Skip, i.e. one whose author did not
 	// say why. The conformance corpus asserts zero of these, so the shortcut that
@@ -288,7 +299,7 @@ var AllReasons = []Reason{
 	ReasonBinary, ReasonEncoding, ReasonUnsupported, ReasonMalformed,
 	ReasonExpandBudget, ReasonMemberCap, ReasonDepthCap, ReasonScratch,
 	ReasonRepackFailed, ReasonResidualScrub, ReasonLeafCap, ReasonEncrypted,
-	ReasonFileTimeout, ReasonGitPack, ReasonUnclassified,
+	ReasonFileTimeout, ReasonGitPack, ReasonEncoded, ReasonUnclassified,
 }
 
 // AuditLevel controls how much per-match detail the report retains.
