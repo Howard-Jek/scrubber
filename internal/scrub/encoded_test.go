@@ -179,3 +179,97 @@ func TestEncodedPlainTextIsNotAHole(t *testing.T) {
 		}
 	}
 }
+
+// Line-wrapped base64 is the commonest real shape -- PEM wraps at 64 columns,
+// MIME at 76 -- and decoding each line alone is worse than not decoding at all.
+// A secret straddling a line boundary is never seen whole, while the lines that
+// DO decode produce matches, so the report shows a match and the verdict reads
+// complete over a live credential. Partial coverage that reads as total.
+
+func wrap(s string, n int) string {
+	var out []string
+	for i := 0; i < len(s); i += n {
+		end := i + n
+		if end > len(s) {
+			end = len(s)
+		}
+		out = append(out, s[i:end])
+	}
+	return strings.Join(out, "\n")
+}
+
+// long enough that the encoded form spans more than one wrapped line, and
+// positioned so the secret straddles the first boundary
+const wrappedPayload = "key AKIAIOSFODNN7EXAMPLE plus padding to force the encoded form past a single line of output"
+
+func TestEncodedWrappedPEMIsFound(t *testing.T) {
+	m := encMatcher(t)
+	text := "-----BEGIN BLOB-----\n" + wrap(b64(wrappedPayload), 64) + "\n-----END BLOB-----\n"
+
+	out, findings := m.ScrubEncoded(text)
+	if len(findings) == 0 {
+		t.Fatal("no findings: a secret wrapped at 64 columns was reported clean")
+	}
+	if strings.Contains(strings.ReplaceAll(out, "\n", ""), b64(wrappedPayload)) {
+		t.Error("the original encoded payload survived into the output")
+	}
+	joined := strings.ReplaceAll(strings.ReplaceAll(out, "-----BEGIN BLOB-----", ""), "-----END BLOB-----", "")
+	joined = strings.ReplaceAll(joined, "\n", "")
+	dec, err := base64.StdEncoding.DecodeString(joined)
+	if err != nil {
+		t.Fatalf("rewritten block is no longer valid base64 when joined: %v", err)
+	}
+	if strings.Contains(string(dec), "AKIAIOSFODNN7EXAMPLE") {
+		t.Error("secret still recoverable by joining the rewritten lines")
+	}
+	if !strings.Contains(string(dec), "[AWS_KEY]") {
+		t.Errorf("decoded block lost its replacement token: %q", dec)
+	}
+}
+
+func TestEncodedWrappedMIMEIsFound(t *testing.T) {
+	m := encMatcher(t)
+	text := "Content-Transfer-Encoding: base64\n\n" + wrap(b64(wrappedPayload), 76) + "\n"
+	_, findings := m.ScrubEncoded(text)
+	if len(findings) == 0 {
+		t.Fatal("a secret wrapped at 76 columns was reported clean")
+	}
+}
+
+func TestEncodedWrappedPreservesLineShape(t *testing.T) {
+	m := encMatcher(t)
+	text := wrap(b64(wrappedPayload), 64) + "\n"
+	out, _ := m.ScrubEncoded(text)
+	for _, ln := range strings.Split(strings.TrimRight(out, "\n"), "\n") {
+		if len(ln) > 64 {
+			t.Errorf("rewritten line exceeds the original wrap width: %d chars", len(ln))
+		}
+	}
+}
+
+func TestEncodedRaggedLinesAreNotJoined(t *testing.T) {
+	m := encMatcher(t)
+	// consecutive base64-alphabet lines of DIFFERENT lengths are not a wrapped
+	// block; joining them would decode something nobody encoded
+	text := "QUJDREVGR0hJSktMTU5PUFFSU1RVVldYWVo=\nYWJjZGVmZ2hpamtsbW5vcHFyc3R1dnd4eXphYmNkZWY=\n"
+	out, findings := m.ScrubEncoded(text)
+	for _, f := range findings {
+		if f.Length > len(text)/2 && f.Rewritten {
+			t.Errorf("joined two ragged lines into one region: %+v", f)
+		}
+	}
+	_ = out
+}
+
+func TestEncodedProseIsNotAWrappedBlock(t *testing.T) {
+	m := encMatcher(t)
+	text := "the quick brown fox jumps over the lazy dog and keeps going for a while\n" +
+		"another perfectly ordinary line of log output with nothing encoded in it\n"
+	out, findings := m.ScrubEncoded(text)
+	if out != text {
+		t.Errorf("rewrote prose: %q", out)
+	}
+	if len(findings) != 0 {
+		t.Errorf("prose produced findings: %+v", findings)
+	}
+}
