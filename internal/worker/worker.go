@@ -116,6 +116,9 @@ type Config struct {
 	// patience. Too low and every large bundle fails; the object is not retried, so
 	// that failure is permanent until someone re-uploads.
 	ScrubTimeout time.Duration
+	// UploadOptions bounds what the person who uploaded a bundle may ask for it.
+	// Zero value means the mechanism is off and sidecars are ignored.
+	UploadOptions OptionLimits
 	// Audit is how much per-match detail the stored report retains. See
 	// ParseAuditLevel: this is a memory setting as much as a disclosure one.
 	Audit         report.AuditLevel
@@ -710,7 +713,7 @@ func (w *Worker) runOnce(ctx context.Context) {
 
 // eligible filters out override sidecar files and already-processed keys.
 func (w *Worker) eligible(o store.Object, now time.Time) bool {
-	if strings.HasSuffix(o.Key, termsSuffix) {
+	if strings.HasSuffix(o.Key, termsSuffix) || strings.HasSuffix(o.Key, optsSuffix) {
 		return false // sidecar, consumed alongside its bundle
 	}
 	if strings.HasPrefix(o.Key, w.cfg.ProcessedPrefix) {
@@ -1048,11 +1051,48 @@ func (w *Worker) processObject(ctx context.Context, o store.Object) {
 		w.jobs.Upsert(job)
 	}
 
+	// Per-upload settings, if the uploader sent any. Read next to the terms sidecar
+	// and treated far more leniently: a storage error here is not worth failing an
+	// object over, because the worst case is that the object runs on the server
+	// defaults, which is exactly what it would have done anyway.
+	var optNotes []string
+	hadOpts := false
+	scrubBudget := w.cfg.ScrubTimeout
+	objLimits := w.cfg.Limits
+	if _, optBytes, oerr := w.store.Exists(ctx, w.cfg.InputBucket, o.Key+optsSuffix); oerr != nil {
+		w.log.Warn("could not read per-upload settings; using the server defaults",
+			"key", o.Key, "err", oerr)
+		optNotes = append(optNotes, "the per-upload settings could not be read from storage ("+
+			oerr.Error()+"); the server defaults were used")
+	} else if len(optBytes) > 0 {
+		hadOpts = true
+		opts, perr := parseUploadOptions(optBytes)
+		if perr != "" {
+			optNotes = append(optNotes, perr)
+		}
+		wantScrub, wantFile, notes := opts.clamp(w.cfg.UploadOptions)
+		optNotes = append(optNotes, notes...)
+		if wantScrub > 0 {
+			scrubBudget = wantScrub
+			optNotes = append(optNotes, "this object was given a scrub budget of "+
+				roundDur(wantScrub)+" at upload time")
+		}
+		if wantFile > 0 {
+			objLimits.MaxFileTime = wantFile
+			optNotes = append(optNotes, "this object was given a per-file budget of "+
+				roundDur(wantFile)+" at upload time")
+		}
+	}
+	if len(optNotes) > 0 {
+		job.Notes = optNotes
+		record(job)
+	}
+
 	// The object's deadline. Nothing else bounds the walk, so without this a single
 	// bundle holds the one consumer for as long as it takes -- measured at over
 	// three hours on a CPU-throttled pod, with every upload behind it queued.
-	if w.cfg.ScrubTimeout > 0 {
-		deadline := time.AfterFunc(w.cfg.ScrubTimeout, func() {
+	if scrubBudget > 0 {
+		deadline := time.AfterFunc(scrubBudget, func() {
 			// Snapshot BEFORE the flag, so anyone who sees the flag sees the
 			// position that goes with it.
 			if j, ok := w.jobs.Get(o.Key); ok {
@@ -1488,7 +1528,7 @@ func (w *Worker) processObject(ctx context.Context, o store.Object) {
 	})
 
 	eng := &pipeline.Engine{
-		Matcher: res.Matcher, Report: rep, Limits: w.cfg.Limits, ScrubNames: w.cfg.ScrubNames,
+		Matcher: res.Matcher, Report: rep, Limits: objLimits, ScrubNames: w.cfg.ScrubNames,
 		// The only thing that can stop the walk. It polls this between members; an
 		// aborted walk returns every container unchanged rather than a partial
 		// rebuild, so `changed` collapses to false and there is nothing to deliver.
@@ -1669,9 +1709,15 @@ func (w *Worker) processObject(ctx context.Context, o store.Object) {
 	} else {
 		w.clearDeferral(o.Key)
 	}
-	// Consume the override sidecar if it existed.
+	// Consume the sidecars if they existed. Tracked separately because they arrive
+	// separately: a bundle may carry settings without an override policy, and
+	// deleting the settings only when a terms file happened to exist left them to
+	// accumulate in the input bucket for the life of the deployment.
 	if len(overrideTerms) > 0 {
 		_ = w.store.Delete(ctx, w.cfg.InputBucket, o.Key+termsSuffix)
+	}
+	if hadOpts {
+		_ = w.store.Delete(ctx, w.cfg.InputBucket, o.Key+optsSuffix)
 	}
 
 	// Metrics + job record.

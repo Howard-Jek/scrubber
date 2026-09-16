@@ -272,6 +272,21 @@ func realMain(log *slog.Logger) error {
 		// nothing else is one, and the sizing check below for how this default was
 		// picked against MAX_EXPAND_BYTES.
 		ScrubTimeout: envDuration("SCRUB_TIMEOUT", defaultScrubTimeout),
+		// What the person uploading a bundle may ask for it. Only budgets, and only
+		// upwards to a ceiling, because the API this arrives through has no
+		// authentication: every value here is one an anonymous caller can set.
+		//
+		// A ceiling is not optional. The queue is one consumer in strict arrival
+		// order with no per-tenant fairness, so "give my bundle longer" is also
+		// "hold everyone else up for longer", and unbounded that is a denial of
+		// service written in a form field. Two hours is generous against the
+		// one-hour default and still finite; lower it on a busy deployment, or set
+		// ALLOW_UPLOAD_OPTIONS=false to ignore the sidecars entirely.
+		UploadOptions: worker.OptionLimits{
+			Enabled:  envBool("ALLOW_UPLOAD_OPTIONS", true),
+			MaxScrub: envDurationChecked(probs, "MAX_UPLOAD_SCRUB_TIMEOUT", 2*time.Hour),
+			MaxFile:  envDurationChecked(probs, "MAX_UPLOAD_FILE_TIMEOUT", 30*time.Minute),
+		},
 		Audit:         audit,
 		RedactReports: envBool("REDACT_REPORTS", false),
 		ScrubNames:    envBool("SCRUB_FILENAMES", true),
@@ -604,6 +619,15 @@ func realMain(log *slog.Logger) error {
 			// with no auth this turns a two-line loop into a durable, restart-
 			// surviving evacuation of every user's work.
 			AllowCancelAny: envBool("ALLOW_CANCEL_ANY", false),
+			// Advertised to the form so it offers exactly what the worker will
+			// honour, rather than a control whose value is silently reduced later.
+			UploadOptions: server.UploadOptionsView{
+				Enabled:  wcfg.UploadOptions.Enabled,
+				MaxScrub: wcfg.UploadOptions.MaxScrub,
+				MaxFile:  wcfg.UploadOptions.MaxFile,
+			},
+			DefaultScrubTimeout: wcfg.ScrubTimeout,
+			DefaultFileTimeout:  wcfg.Limits.MaxFileTime,
 			CancelBudget:        envDuration("CANCEL_BUDGET", 60*time.Second),
 			// Total object-storage time one HTTP request may spend. The store
 			// bounds each call; this bounds their sum, which is what a browser

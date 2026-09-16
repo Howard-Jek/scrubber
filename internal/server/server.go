@@ -42,6 +42,20 @@ type Archive interface {
 	Stat(ctx context.Context, bucket, key string) (store.Object, bool, error)
 }
 
+// UploadOptionsView mirrors the worker's ceilings without importing it, the same
+// way QueueView mirrors the queue: the server describes what is allowed, the worker
+// enforces it.
+type UploadOptionsView struct {
+	Enabled  bool
+	MaxScrub time.Duration
+	MaxFile  time.Duration
+}
+
+// optsSuffix must match the worker's. Declared here rather than imported for the
+// same reason the interfaces above are: the server keeps no dependency on the
+// worker package.
+const optsSuffix = ".opts.json"
+
 // QueueView is the read-only view of the scrub queue the API needs. It is declared
 // here rather than imported so the server keeps no dependency on the worker.
 type QueueView interface {
@@ -99,6 +113,15 @@ type Deps struct {
 	Canceller Canceller
 	// AllowCancel enables POST /api/cancel at all.
 	AllowCancel bool
+	// UploadOptions describes what an uploader may ask for, so the form can offer
+	// exactly that and no more. Advertised rather than assumed: a slider whose
+	// maximum the browser invented would let a caller request something the worker
+	// then silently reduces, which is a worse experience than not offering it.
+	UploadOptions UploadOptionsView
+	// DefaultScrubTimeout and DefaultFileTimeout are what an object gets when the
+	// uploader asks for nothing, so the form can show the real starting point.
+	DefaultScrubTimeout time.Duration
+	DefaultFileTimeout  time.Duration
 	// AllowCancelAny drops the requirement that the caller present the cancel
 	// token this server minted for that key at upload time.
 	//
@@ -280,6 +303,14 @@ func (s *Server) apiPolicy(w http.ResponseWriter, r *http.Request) {
 
 // apiUpload mints a presigned PUT URL for a new input object.
 func (s *Server) apiUpload(w http.ResponseWriter, r *http.Request) {
+	// GET describes what an upload may ask for; POST creates one. The form needs
+	// the ceilings BEFORE there is an upload to attach them to -- a control whose
+	// maximum the browser invented would let someone request a budget the worker
+	// then silently reduces, which is worse than not offering the control.
+	if r.Method == http.MethodGet {
+		writeJSON(w, map[string]any{"opts": s.uploadOptsPayload()})
+		return
+	}
 	if r.Method != http.MethodPost {
 		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
 		return
@@ -297,11 +328,42 @@ func (s *Server) apiUpload(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "could not mint upload URL", http.StatusBadGateway)
 		return
 	}
+	// A second URL, for the per-upload settings sidecar. The browser writes it
+	// itself rather than the server writing it on the browser's behalf, because
+	// Archive is deliberately read-only -- the API can answer questions about
+	// storage but cannot put things in it, and widening that for a convenience
+	// feature would be the wrong trade.
+	//
+	// That the browser controls the bytes is not a gap: the WORKER clamps them
+	// against the operator's ceilings when it reads the sidecar. Validating here
+	// as well would be defence in the wrong place, since a sidecar can also be
+	// written straight to the bucket by any other producer.
+	optsURL, oerr := s.d.Presigner.PresignPut(r.Context(), s.d.InputBucket, key+optsSuffix, s.d.UploadExpiry)
+	if oerr != nil {
+		// Not fatal. The bundle can still be uploaded and scrubbed on the server
+		// defaults, which is what happens today; losing the settings is a smaller
+		// harm than refusing the upload.
+		optsURL = ""
+	}
+
 	// The cancel token goes out with the key that it authorises, and only here.
 	// This is the one moment the server knows the caller is the originator of this
 	// upload, so it is the only moment a capability for it can honestly be issued.
 	writeJSON(w, map[string]any{
-		"key": key, "url": url, "method": "PUT", "cancel_token": cancelToken(key)})
+		"key": key, "url": url, "method": "PUT", "cancel_token": cancelToken(key),
+		"opts_url": optsURL, "opts": s.uploadOptsPayload()})
+}
+
+// uploadOptsPayload describes what an uploader may ask for. Advertised in one shape
+// from both methods so the form and the upload it produces cannot disagree.
+func (s *Server) uploadOptsPayload() map[string]any {
+	return map[string]any{
+		"enabled":        s.d.UploadOptions.Enabled,
+		"max_scrub_secs": int(s.d.UploadOptions.MaxScrub.Seconds()),
+		"max_file_secs":  int(s.d.UploadOptions.MaxFile.Seconds()),
+		"default_scrub":  int(s.d.DefaultScrubTimeout.Seconds()),
+		"default_file":   int(s.d.DefaultFileTimeout.Seconds()),
+	}
 }
 
 // apiStatus reports the outcome of a previously uploaded key (browser-safe fields).
@@ -664,11 +726,15 @@ func jobStatusPayload(j metrics.Job) map[string]any {
 		"not_inspected":     j.NotInspected,
 		"not_inspected_set": j.NotInspectedSet,
 		"residual_hits":     j.ResidualHits,
-		"residual_samples":  j.ResidualSamples,
-		"files_done":        j.FilesDone,
-		"files_total":       j.FilesTotal,
-		"current_file":      j.CurrentFile,
-		"phase":             j.Phase,
+		// What the upload asked for and what the deployment allowed. Shown so a
+		// caller who requested two hours and received twenty minutes learns it here
+		// rather than inferring it from a timeout.
+		"notes":            j.Notes,
+		"residual_samples": j.ResidualSamples,
+		"files_done":       j.FilesDone,
+		"files_total":      j.FilesTotal,
+		"current_file":     j.CurrentFile,
+		"phase":            j.Phase,
 		// How long this phase has lasted. During "unpacking" it is the only
 		// movement there is to report — FilesDone cannot advance until the
 		// container is fully expanded — so the client shows this instead of

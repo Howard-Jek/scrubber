@@ -213,7 +213,16 @@ type Job struct {
 	NotInspected    int            `json:"files_not_inspected"`
 	NotInspectedSet []report.Note  `json:"not_inspected,omitempty"`
 	ResidualHits    int            `json:"residual_hits"`
-	ResidualSamples []string       `json:"residual_samples,omitempty"`
+	// Notes carries per-object remarks that are neither an error nor part of the
+	// scrub result: which settings arrived with the upload, and which of them the
+	// deployment's ceilings refused. A caller who asked for two hours and got twenty
+	// minutes has to be told here, or the timeout that follows reads as the service
+	// ignoring its own configuration.
+	//
+	// Browser-safe by construction: every string is composed from durations and
+	// fixed text, never from an object's contents or member paths.
+	Notes           []string `json:"notes,omitempty"`
+	ResidualSamples []string `json:"residual_samples,omitempty"`
 
 	// FilesDone and CurrentFile give live progress while Status is "processing",
 	// so the UI can report what is actually happening instead of animating a bar

@@ -61,7 +61,19 @@
              out of the box
      min-width:0 is the load-bearing part of all three: without it the browser
      refuses to shrink a flex item below its content and the overflow reappears. */
+  /* Keyboard focus was invisible everywhere on this page: no :focus rule existed,
+     so a keyboard user tabbing through the drop zone, the policy editor and the
+     withdraw buttons had no idea where they were. :focus-visible rather than :focus
+     so a mouse click does not leave a ring behind on a button that was just pressed.
+     Uses the info border token, which is the one colour here that reads as "the
+     system is pointing at something" rather than as a status. */
+  :focus-visible{outline:2px solid var(--color-border-info); outline-offset:2px;}
   .row{display:flex; align-items:center; gap:10px; flex-wrap:wrap; min-width:0;}
+  /* Coarse pointers get a real target on the panel's primary control. Padding the
+     hit area rather than growing the glyph, so the row keeps its density on a
+     desktop where the pointer is precise. */
+  @media (max-width:480px){ .actctl{margin-left:0 !important; width:100%;} }
+  @media (pointer:coarse){ .actx{min-height:44px !important; padding-left:14px !important; padding-right:14px !important;} }
   .ell{min-width:0; overflow:hidden; text-overflow:ellipsis; white-space:nowrap;}
   .brk{min-width:0; overflow-wrap:anywhere;}
   pre{margin:0; white-space:pre-wrap; overflow-wrap:anywhere;}
@@ -151,6 +163,53 @@
         </div>
         <button id="demo">Load a sample bundle</button>
       </div>
+      <!-- Per-upload time budgets. Hidden until /api/uploads says the deployment
+           allows them, because a control that is silently ignored is worse than
+           no control: the value would be reduced by the worker and the person who
+           set it would learn that only from a timeout.
+
+           Minutes, not seconds. The server speaks seconds and the ceilings are
+           hours, so a seconds field would be five digits wide and read as a
+           precision nobody has. -->
+      <div id="budgets" style="display:none; margin-top:12px;">
+        <button id="budgetToggle" type="button" aria-expanded="false" aria-controls="budgetFields"
+          style="width:100%; font-size:12px; display:flex; align-items:center; gap:7px;">
+          <svg class="icn" style="font-size:14px;" aria-hidden="true"><use href="#i-history"/></svg>
+          <span id="budgetSummary" style="min-width:0; overflow:hidden; text-overflow:ellipsis; white-space:nowrap;">Time budget — using the defaults</span>
+          <svg class="icn" id="budgetChev" style="font-size:14px; margin-left:auto; transition:transform .15s;" aria-hidden="true"><use href="#i-chevron"/></svg>
+        </button>
+        <div id="budgetFields" style="display:none; margin-top:8px; background:var(--color-background-primary); border:0.5px solid var(--color-border-tertiary); border-radius:var(--border-radius-md); padding:12px;">
+          <div class="row" style="gap:12px; align-items:flex-start;">
+            <label style="flex:1 1 150px; min-width:0; font-size:12px; color:var(--color-text-secondary);">
+              Whole bundle
+              <span style="display:flex; align-items:baseline; gap:6px; margin-top:4px;">
+                <input id="budScrub" type="number" min="1" step="1" inputmode="numeric"
+                  style="width:76px; font-family:inherit; font-size:13px; padding:6px 8px; border-radius:var(--border-radius-md); border:0.5px solid var(--color-border-secondary); background:var(--color-background-tertiary); color:var(--color-text-primary);" />
+                <span style="font-size:12px; color:var(--color-text-tertiary);">min</span>
+              </span>
+              <span id="budScrubMax" class="brk" style="display:block; margin-top:4px; font-size:12px; color:var(--color-text-secondary);"></span>
+            </label>
+            <label style="flex:1 1 150px; min-width:0; font-size:12px; color:var(--color-text-secondary);">
+              Any single file
+              <span style="display:flex; align-items:baseline; gap:6px; margin-top:4px;">
+                <input id="budFile" type="number" min="1" step="1" inputmode="numeric"
+                  style="width:76px; font-family:inherit; font-size:13px; padding:6px 8px; border-radius:var(--border-radius-md); border:0.5px solid var(--color-border-secondary); background:var(--color-background-tertiary); color:var(--color-text-primary);" />
+                <span style="font-size:12px; color:var(--color-text-tertiary);">min</span>
+              </span>
+              <span id="budFileMax" class="brk" style="display:block; margin-top:4px; font-size:12px; color:var(--color-text-secondary);"></span>
+            </label>
+          </div>
+          <div id="budNote" class="brk" style="display:none; margin-top:10px; font-size:12px; color:var(--color-text-warning); background:var(--color-background-warning); border:0.5px solid var(--color-border-warning); border-radius:var(--border-radius-md); padding:7px 9px;"></div>
+          <div class="brk" style="margin-top:10px; font-size:12px; color:var(--color-text-secondary);">
+            Applies to files you add from now on. A bundle that runs out of time is
+            reported as a timeout rather than as a clean scrub, so raising this is how
+            a large or dense bundle finishes — it never makes a result look better than it is.
+            A file that runs out of its own budget is left unscrubbed and flagged, and the
+            result is sent for review rather than delivered as finished.
+          </div>
+          <button id="budReset" type="button" style="margin-top:10px; font-size:12px;">Back to the defaults</button>
+        </div>
+      </div>
       <div id="list" style="margin-top:1.25rem; display:flex; flex-direction:column; gap:12px;"></div>
     </div>
 
@@ -206,6 +265,28 @@
   </div>
   <div id="history" style="margin-top:12px;"></div>
 </div>
+
+<!-- Live activity. Distinct from "Recent scrubs" above, which reads finished runs
+     back from storage: this is the in-memory job log, so it shows what is happening
+     NOW and why something failed -- the two questions that otherwise mean opening
+     the cluster's logs. Everything rendered here is already redacted server-side;
+     member paths reach this page through displayPath and nothing else is exposed. -->
+<div class="frame" style="margin-top:16px;">
+  <div style="display:flex; align-items:center; gap:10px; flex-wrap:wrap;">
+    <svg class="icn" style="font-size:18px; color:var(--color-text-secondary);" aria-hidden="true"><use href="#i-alert-triangle"/></svg>
+    <div style="min-width:0;">
+      <div style="font-size:14px; font-weight:500;">Activity</div>
+      <div style="font-size:12px; color:var(--color-text-tertiary);">What the service is doing, and what went wrong</div>
+    </div>
+    <div class="actctl" style="margin-left:auto; display:flex; align-items:center; gap:8px; flex-wrap:wrap;">
+      <label style="display:flex; align-items:center; gap:8px; min-height:44px; font-size:12px; color:var(--color-text-secondary); cursor:pointer;">
+        <input id="actProblems" type="checkbox" style="accent-color:var(--accent); width:24px; height:24px; flex:none; margin:0;" /> Problems only
+      </label>
+      <button id="actRefresh" title="Refresh"><svg class="icn" style="font-size:15px; vertical-align:-2px;" aria-hidden="true"><use href="#i-refresh"/></svg></button>
+    </div>
+  </div>
+  <div id="activity" style="margin-top:12px;"></div>
+</div>
 </div>
 
 <script>
@@ -215,7 +296,7 @@
       demo=document.getElementById('demo');
   var totals={}, labelRows={}, ruleData=[];
 
-  function esc(s){return String(s).replace(/[&<>]/g,function(c){return{'&':'&amp;','<':'&lt;','>':'&gt;'}[c];});}
+  function esc(s){return String(s).replace(/[&<>"]/g,function(c){return{'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c];});}
 
   // Turn the engine's internal path into something a person reads.
   //
@@ -360,6 +441,118 @@
     });
   }
 
+  // ---- per-upload time budgets -------------------------------------------
+  //
+  // The server advertises what it will honour (GET /api/uploads) and the worker
+  // enforces it. The form only ever offers what was advertised, so a value it
+  // accepts is a value that will actually be used -- the alternative is a control
+  // whose number the worker quietly reduces, which teaches people the setting does
+  // not work.
+  var budOpts=null;
+  var budWrap=document.getElementById('budgets'), budToggle=document.getElementById('budgetToggle'),
+      budFields=document.getElementById('budgetFields'), budChev=document.getElementById('budgetChev'),
+      budSummary=document.getElementById('budgetSummary'), budReset=document.getElementById('budReset'),
+      budScrub=document.getElementById('budScrub'), budFile=document.getElementById('budFile'),
+      budScrubMax=document.getElementById('budScrubMax'), budFileMax=document.getElementById('budFileMax'),
+      budNote=document.getElementById('budNote');
+
+  function mins(sec){ return Math.max(0, Math.round(sec/60)); }
+  // Ceilings FLOOR: rounding a 90s maximum up to 2 minutes advertises a value the
+  // server will refuse.
+  function minsFloor(sec){ return Math.max(0, Math.floor(sec/60)); }
+
+  // Clamps the fields to what the server advertised, then describes exactly what
+  // will be sent.
+  //
+  // The clamp happens HERE, in the control, rather than only in budPayload. A field
+  // that displays 45 while the payload quietly carries 30 is the same dishonesty as
+  // a server that reduces a value without saying so -- it just moves it one layer
+  // further from the person who typed the number.
+  function budClamp(el, maxSecs){
+    if(!(maxSecs>0)) return;
+    var v=parseInt(el.value,10);
+    if(!(v>0)) return;
+    var max=minsFloor(maxSecs);
+    if(v>max){
+      el.value=max;
+      el.setAttribute('aria-invalid','true');
+      budNote.textContent='This deployment allows at most '+max+' min, so that is what will be used.';
+      budNote.style.display='';
+      return;
+    }
+    el.removeAttribute('aria-invalid');
+    budNote.style.display='none';
+  }
+
+  function budSync(){
+    if(!budOpts) return;
+    budClamp(budScrub, budOpts.max_scrub_secs);
+    budClamp(budFile, budOpts.max_file_secs);
+    var p=budPayload();
+    if(!p){ budSummary.textContent='Time budget — using the defaults'; return; }
+    var bits=[];
+    if(p.scrub_seconds) bits.push(mins(p.scrub_seconds)+' min per bundle');
+    if(p.file_seconds) bits.push(mins(p.file_seconds)+' min per file');
+    budSummary.textContent='Time budget — '+bits.join(', ');
+  }
+
+  function budLoad(){
+    fetch('/api/uploads').then(function(r){ return r.ok?r.json():null; }).then(function(d){
+      if(!d||!d.opts||!d.opts.enabled) return;      // disabled: the controls stay gone
+      var o=d.opts;
+      if(o.max_scrub_secs<=0 && o.max_file_secs<=0) return;  // nothing can be raised
+      budOpts=o;
+      budScrub.value=mins(o.default_scrub)||'';
+      budFile.value=mins(o.default_file);
+      // The maximum is stated rather than only enforced: a field that silently
+      // refuses what you typed is the same failure as one that silently reduces it.
+      // Stated in MINUTES, the unit of the field beside them. "up to 2h 00m 00s"
+      // under a box labelled min asks the reader to convert, which is the readability
+      // the minutes were chosen for, spent again.
+      if(o.max_scrub_secs>0){ budScrub.max=minsFloor(o.max_scrub_secs);
+        budScrubMax.textContent='up to '+minsFloor(o.max_scrub_secs)+' min'
+          +(o.default_scrub>0?' · default '+mins(o.default_scrub)+' min':''); }
+      else { budScrub.disabled=true; budScrubMax.textContent='fixed by the deployment'; }
+      if(o.max_file_secs>0){ budFile.max=minsFloor(o.max_file_secs);
+        budFileMax.textContent='up to '+minsFloor(o.max_file_secs)+' min'
+          +(o.default_file>0?' · default '+mins(o.default_file)+' min':' · no limit by default'); }
+      else { budFile.disabled=true; budFileMax.textContent='fixed by the deployment'; }
+      budWrap.style.display='';
+      budSync();
+    }).catch(function(){ /* the form still works without them */ });
+  }
+
+  budToggle.onclick=function(){
+    var open=budFields.style.display!=='none';
+    budFields.style.display=open?'none':'';
+    budToggle.setAttribute('aria-expanded', open?'false':'true');
+    budChev.style.transform=open?'':'rotate(180deg)';
+  };
+  budReset.onclick=function(){
+    if(!budOpts) return;
+    budScrub.value=mins(budOpts.default_scrub)||'';
+    budFile.value=mins(budOpts.default_file);
+    budSync();
+  };
+  budScrub.oninput=budSync; budFile.oninput=budSync;
+
+  // What this upload should carry, or null when it is asking for the defaults.
+  // Clamped here as well as on the server so the number shown is the number sent;
+  // the worker clamps again, because a sidecar can reach the bucket without ever
+  // passing through this page.
+  function budPayload(){
+    if(!budOpts) return null;
+    var out={}, any=false;
+    var vs=parseInt(budScrub.value,10), vf=parseInt(budFile.value,10);
+    if(vs>0 && budOpts.max_scrub_secs>0 && vs*60!==budOpts.default_scrub){
+      out.scrub_seconds=Math.min(vs*60, budOpts.max_scrub_secs); any=true;
+    }
+    if(vf>0 && budOpts.max_file_secs>0 && vf*60!==budOpts.default_file){
+      out.file_seconds=Math.min(vf*60, budOpts.max_file_secs); any=true;
+    }
+    return any?out:null;
+  }
+
   function addJob(file){
     var isArch=/\.(zip|tar|gz|tgz|bz2|xz|7z|rar)$/i.test(file.name), start=Date.now();
     var card=document.createElement('div');
@@ -443,6 +636,19 @@
 
     fetch('/api/uploads',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({name:file.name})})
       .then(function(r){ if(!r.ok) throw 0; return r.json(); })
+      .then(function(u){
+        // The settings sidecar goes FIRST. The worker discovers objects by listing
+        // the bucket, so the bundle landing is what starts the scrub -- a sidecar
+        // written after it is a race the sidecar loses.
+        //
+        // Never fatal. If it cannot be written the bundle is still scrubbed, on the
+        // server defaults, which is exactly what would have happened without the
+        // feature.
+        var opts=budPayload();
+        if(!opts || !u.opts_url) return u;
+        return fetch(u.opts_url,{method:'PUT',headers:{'Content-Type':'application/json'},
+          body:JSON.stringify(opts)}).then(function(){ return u; }, function(){ return u; });
+      })
       .then(function(u){
         var xhr=new XMLHttpRequest(); xhr.open('PUT',u.url);
         xhr.upload.onprogress=function(e){ if(e.lengthComputable) setp(e.loaded/e.total*55); };
@@ -840,6 +1046,212 @@
     });
   }
 
+  // ---- activity / troubleshooting ----------------------------------------
+  //
+  // The in-memory job log, which is where "what is it doing" and "why did that
+  // fail" actually live. Recent scrubs above reads finished digests back from
+  // storage and cannot answer either question: a run that is still going has no
+  // digest, and one that failed before publishing has none either.
+  var actEl=document.getElementById('activity'), actProblems=document.getElementById('actProblems'),
+      actRefresh=document.getElementById('actRefresh');
+  var actOpen={};          // key -> detail expanded
+  var actJobs=null;        // last SUCCESSFUL payload; expanding must not need the network
+  var actAt=0;             // when that payload arrived
+  var actErr='';           // why the last fetch failed, '' when healthy
+  var actTimer=null;
+
+  // Status is not the whole answer. A run can finish, be recorded "scrubbed", and
+  // still have carried unredacted credentials out the other side -- that is what
+  // verdict incomplete-risky means, and "Recent scrubs" above already paints it red.
+  // Deriving the chip from status alone put a GREEN success badge on exactly that
+  // row, four rows below the red one describing the same object.
+  function actChip(j){
+    if(j.verdict==='incomplete-risky')
+      return {label:'Review — '+(j.not_inspected||0)+' not inspected', fg:'--color-text-danger', bg:'--color-background-danger'};
+    if(j.status==='scrubbed'&&(j.not_inspected||0)>0)
+      return {label:(j.not_inspected)+' not inspected', fg:'--color-text-warning', bg:'--color-background-warning'};
+    switch(j.status){
+      case 'scrubbed':   return {label:'Scrubbed',  fg:'--color-text-success',  bg:'--color-background-success'};
+      case 'processing': return {label:'Working',   fg:'--color-text-info',     bg:'--color-background-info'};
+      case 'retrying':   return {label:'Retrying',  fg:'--color-text-warning',  bg:'--color-background-warning'};
+      case 'error':      return {label:'Failed',    fg:'--color-text-danger',   bg:'--color-background-danger'};
+      // Withdrawn was tertiary-on-tertiary: 2.99:1, below AA, and the only chip on
+      // the page that was hard to read. Skipped had the same swatch as Retrying,
+      // which is the opposite meaning -- one runs again, one never ran.
+      case 'cancelled':  return {label:'Withdrawn', fg:'--color-text-secondary',bg:'--color-background-tertiary'};
+      case 'skipped':    return {label:'Skipped',   fg:'--color-text-danger',   bg:'--color-background-tertiary'};
+      case '': case undefined: case null: return {label:'Queued', fg:'--color-text-secondary', bg:'--color-background-tertiary'};
+    }
+    // An unrecognised status is a failure state this page has not been taught yet.
+    // Treated as a problem so a future one cannot hide behind the filter operators
+    // are told to use.
+    return {label:String(j.status).charAt(0).toUpperCase()+String(j.status).slice(1),
+            fg:'--color-text-warning', bg:'--color-background-warning'};
+  }
+  var ACT_KNOWN={scrubbed:1,processing:1,retrying:1,error:1,cancelled:1,skipped:1};
+  function actIsProblem(j){
+    if(!j.status || !ACT_KNOWN[j.status]) return true;
+    return j.status==='error'||j.status==='retrying'||j.status==='skipped'
+      ||j.verdict==='incomplete-risky'||(j.not_inspected||0)>0;
+  }
+
+  function actAgo(iso){
+    if(!iso) return '';
+    var t=Date.parse(iso); if(isNaN(t)) return '';
+    var d=Math.max(0,(Date.now()-t)/1000);
+    return d<60?'just now':fmtDur(d)+' ago';
+  }
+
+  // The one line that has to answer "what is this doing / why should I care" without
+  // a click. A failed row used to render nothing here, so the two rows that most
+  // needed a reason were the emptiest on the panel.
+  function actCtx(j){
+    if(j.status==='processing'){
+      var bits=[];
+      if(j.phase) bits.push(esc(j.phase));
+      if(j.files_total>0) bits.push('file '+(j.files_done||0)+' of '+j.files_total);
+      if(j.phase_seconds>0) bits.push(fmtDur(j.phase_seconds));
+      // WHICH file it is sitting on: the difference between slow and wedged, and the
+      // server has always sent it.
+      if(j.current_file) bits.push(esc(prettyPath(j.current_file)));
+      return bits.join(' · ');
+    }
+    if(j.status==='retrying'&&j.retry_in_seconds>0) return 'next attempt in '+fmtDur(j.retry_in_seconds);
+    if((j.status==='error'||j.status==='skipped')&&j.error){
+      var first=String(j.error).split(/[.:]\s/)[0];
+      return esc(first.length>90?first.slice(0,90)+'…':first);
+    }
+    var out=[];
+    if(j.matches>0) out.push(j.matches+' redacted');
+    if((j.not_inspected||0)>0) out.push(j.not_inspected+' not inspected');
+    if((j.residual_hits||0)>0) out.push(j.residual_hits+' match(es) left in the output');
+    return out.join(' · ');
+  }
+
+  function actStatusLine(){
+    if(actErr){
+      return '<div class="brk" style="font-size:12px; color:var(--color-text-danger); background:var(--color-background-danger); border:0.5px solid var(--color-border-danger); border-radius:var(--border-radius-md); padding:7px 9px; margin-bottom:10px;">'
+        +esc(actErr)+' — retrying every 3s.'
+        +(actAt?' Showing the last good read from '+esc(new Date(actAt).toLocaleTimeString())+'.':'')
+        +'</div>';
+    }
+    if(!actAt) return '';
+    return '<div style="font-size:11px; color:var(--color-text-secondary); margin-bottom:8px;">updated '
+      +esc(new Date(actAt).toLocaleTimeString())+'</div>';
+  }
+
+  function renderActivity(){
+    // First paint, before any answer has arrived. Rendering "No activity yet" here
+    // told an operator the pipeline was idle while the request was still in flight.
+    if(actJobs===null && !actErr){
+      actEl.innerHTML='<div style="font-size:12px; color:var(--color-text-secondary); padding:8px 0;">Loading…</div>';
+      return;
+    }
+    var all=actJobs||[];
+    var rows=actProblems.checked?all.filter(actIsProblem):all;
+    if(!rows.length){
+      actEl.innerHTML=actStatusLine()
+        +'<div style="font-size:12px; color:var(--color-text-secondary); padding:8px 0;">'
+        +(all.length?'Nothing to troubleshoot — every recent object came through cleanly.'
+                    :'No activity yet.')+'</div>';
+      return;
+    }
+    actEl.innerHTML=actStatusLine()+rows.map(function(j,i){
+      var m=actChip(j), key=String(j.key||''), open=!!actOpen[key];
+      var ctx=actCtx(j), ago=actAgo(j.timestamp);
+      var hasDetail=!!(j.error||(j.notes&&j.notes.length)||(j.not_inspected_set&&j.not_inspected_set.length));
+      var did='actd'+i;
+      // Notes that record a REFUSAL are the message that closes the honesty loop on
+      // per-upload budgets. Neutral chrome three interactions deep was the wrong
+      // place for "we gave you less than you asked for".
+      var clamped=(j.notes||[]).some(function(n){ return /reduced|exceeds|disabled|could not/i.test(n); });
+
+      var detail='';
+      if(hasDetail&&open){
+        var parts=[];
+        if(j.error) parts.push('<div class="brk" style="font-size:12px; line-height:1.5; color:var(--color-text-danger); background:var(--color-background-danger); border:0.5px solid var(--color-border-danger); border-radius:var(--border-radius-md); padding:8px 10px;">'+esc(j.error)+'</div>');
+        if(j.notes&&j.notes.length){
+          var warn=clamped;
+          parts.push('<div class="brk" style="font-size:12px; line-height:1.5; color:var('+(warn?'--color-text-warning':'--color-text-secondary')+'); background:var('+(warn?'--color-background-warning':'--color-background-tertiary')+'); border:0.5px solid var('+(warn?'--color-border-warning':'--color-border-tertiary')+'); border-radius:var(--border-radius-md); padding:8px 10px;">'
+            +j.notes.map(function(n){ return esc(n); }).join('<br>')+'</div>');
+        }
+        if(j.not_inspected_set&&j.not_inspected_set.length){
+          var show=j.not_inspected_set;
+          parts.push('<div style="font-size:11px; color:var(--color-text-secondary);">Not inspected</div>'
+            +'<div style="display:flex; flex-direction:column; gap:4px; max-height:40vh; overflow:auto;">'
+            +show.map(function(n){
+              return '<div class="brk" style="font-size:11px; font-family:var(--font-mono); color:var(--color-text-secondary);">'
+                +esc(prettyPath(n.path||''))+' — <span style="color:var(--color-text-warning);">'+esc(n.code||'')+'</span>'
+                +(n.detail?' <span style="font-family:var(--font-sans);">'+esc(n.detail)+'</span>':'')+'</div>';
+            }).join('')+'</div>');
+        }
+        detail='<div id="'+did+'" style="display:flex; flex-direction:column; gap:8px; margin-top:8px;">'+parts.join('')+'</div>';
+      }
+
+      // Layout copied from renderHistory: chip and button pinned, ONE middle block
+      // that shrinks and truncates. The previous row let the key itself flex, so a
+      // 100-character key wrapped the row at 1280px and the action column scattered.
+      return '<div style="display:flex; align-items:flex-start; gap:10px; padding:9px 0; border-top:0.5px solid var(--color-border-tertiary);">'
+        +'<span style="flex:none; font-size:11px; color:var('+m.fg+'); background:var('+m.bg+'); padding:2px 8px; border-radius:999px; white-space:nowrap; margin-top:1px;">'+esc(m.label)+'</span>'
+        +'<div style="flex:1 1 auto; min-width:0;">'
+        +'<div class="ell" style="font-family:var(--font-mono); font-size:12px;" title="'+esc(key)+'">'+esc(prettyPath(key))+'</div>'
+        +(ctx||ago?'<div class="brk" style="font-size:12px; color:var(--color-text-secondary); margin-top:2px;">'+ctx+(ctx&&ago?' · ':'')+esc(ago)+'</div>':'')
+        +(clamped?'<div style="font-size:11px; color:var(--color-text-warning); margin-top:2px;">budget reduced by the deployment</div>':'')
+        +'</div>'
+        +(hasDetail?'<button class="actx" data-key="'+esc(key)+'" aria-expanded="'+(open?'true':'false')+'" aria-controls="'+did+'" '
+          +'aria-label="'+(open?'Hide':'Show')+' details for '+esc(prettyPath(key))+'" '
+          +'style="flex:none; padding:5px 11px; font-size:11px; min-height:32px;">'
+          +(open?'Hide':(actIsProblem(j)?'Why':'Details'))+'</button>':'')
+        +'</div>'+detail;
+    }).join('');
+    actEl.querySelectorAll('.actx').forEach(function(b){
+      b.onclick=function(){
+        var k=b.getAttribute('data-key');
+        actOpen[k]=!actOpen[k];
+        renderActivity();          // local; never the network
+        var again=actEl.querySelector('.actx[data-key="'+k.replace(/"/g,'\\"')+'"]');
+        if(again) again.focus();   // the poll rebuilt the node the click came from
+      };
+    });
+  }
+
+  function loadActivity(){
+    fetch('/jobs').then(function(r){
+      if(!r.ok) throw new Error('Can\'t reach the job log (HTTP '+r.status+')');
+      return r.json();
+    }).then(function(d){
+      actJobs=d.jobs||[]; actAt=Date.now(); actErr='';
+      // Keys that are gone are not coming back; without this actOpen grows for the
+      // lifetime of the tab.
+      var live={}; actJobs.forEach(function(j){ live[j.key]=1; });
+      Object.keys(actOpen).forEach(function(k){ if(!live[k]) delete actOpen[k]; });
+      renderActivity();
+    }).catch(function(e){
+      // Keep whatever was last known on screen and SAY it is stale. Rendering an
+      // empty list here read as "the pipeline is idle", which is the opposite of
+      // what a failing fetch means.
+      actErr=(e&&e.message)?e.message:'Can\'t reach the job log';
+      renderActivity();
+    });
+  }
+
+  // A poll that replaces innerHTML steals keyboard focus and destroys a selection.
+  // Someone reading a 700-character failure, or selecting it to paste into a ticket,
+  // had a three-second window. Someone tabbed onto a button was thrown to the top of
+  // the document and could never tab past the panel.
+  function actBusy(){
+    if(actEl.contains(document.activeElement)) return true;
+    var sel=window.getSelection();
+    return !!(sel && !sel.isCollapsed && sel.anchorNode && actEl.contains(sel.anchorNode));
+  }
+  function actPoll(){
+    if(actTimer) clearInterval(actTimer);
+    actTimer=setInterval(function(){ if(!document.hidden && !actBusy()) loadActivity(); }, 3000);
+  }
+  actProblems.onchange=renderActivity;
+  actRefresh.onclick=loadActivity;
+  document.addEventListener('visibilitychange',function(){ if(!document.hidden) loadActivity(); });
+
   function loadHistory(){
     var n=parseInt(histN.value,10);
     if(!(n>0)){ n=10; histN.value=10; }
@@ -862,6 +1274,9 @@
 
   loadPolicy();
   loadHistory();
+  budLoad();
+  loadActivity();
+  actPoll();
 })();
 </script>
 </body>

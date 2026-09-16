@@ -190,6 +190,23 @@ data:
   # READ, never whether it is MENTIONED.
   # SCRUB_GIT_PACKS: "false"
   #
+  # Let whoever uploads a bundle set its time budgets, from the upload form, without
+  # a redeploy. On by default; the two ceilings below bound what may be asked for.
+  #
+  # Only budgets are exposed, and only upward to a ceiling. The browser API has no
+  # authentication of any kind, so every value here is one an anonymous caller can
+  # set -- a field that could turn detection DOWN would be a way to launder a bundle
+  # through the normal output bucket rather than a convenience. A longer budget only
+  # means more of the bundle is inspected; a shorter one abandons the caller's own
+  # object and is reported as a timeout.
+  #
+  # The ceilings are not optional. The queue is one consumer in strict arrival order
+  # with no per-tenant fairness, so "give my bundle longer" is also "hold everyone
+  # else up for longer", and unbounded that is a denial of service written in a form
+  # field. Lower them on a busy deployment.
+  # ALLOW_UPLOAD_OPTIONS: "true"
+  # MAX_UPLOAD_SCRUB_TIMEOUT: "2h"
+  # MAX_UPLOAD_FILE_TIMEOUT: "30m"
   # Abandon an object-storage transfer that has moved NO bytes for this long, and
   # bound the metadata calls (10x this for listings, which paginate). This is not
   # a deadline on the transfer: a large object over a congested link legitimately
