@@ -10,6 +10,151 @@ For what to verify on your own cluster after taking a new image, see
 
 ---
 
+## Unreleased — the queue lets go, a slow file costs one file, and a git pack stops being invisible
+
+### One bad object no longer holds the queue
+
+An ordinary error was recorded, logged, and nothing else. Nothing else was the bug.
+`attempts` stayed 0, and `orderKey` falls back to the object's `LastModified` for an
+object with no attempts — by definition the oldest key still in the bucket — so a
+failing object sorted to position 1 on the very next poll, ahead of every upload that
+had arrived while it was failing. It re-downloaded and re-walked the same bytes
+forever, flapping `error → processing → error`. The panic path was worse: a panic is
+deterministic in the bytes that caused it, so it was a guaranteed loop with a fresh
+stack trace every cycle.
+
+The fix is a disposition on every exit, and the rule for choosing one is *whose fault
+is it* rather than *will it repeat*. That distinction is the whole design, and the
+obvious version of it is dangerous: retiring an input because the error looks
+permanent would have emptied the input bucket into `processed/` **unscrubbed** during
+a storage outage that was going to clear, or during a `DEFAULT_POLICY` typo that
+`watchPolicies` hot-reloads away without a restart. A stuck queue is visible and
+recoverable; a drained backlog is neither.
+
+So only a fault that belongs to the object retires it: a `.terms.json` sidecar that
+arrived malformed with the upload, and a panic (after five attempts, since transient
+memory pressure presents the same way). Everything deployment-wide — a denied
+`PutStream`, a full `/work`, a registry that resolves nothing — backs off and stays,
+with no attempt ceiling. The backoff alone is what fixes the reported bug, because a
+non-zero attempt count is what stops `orderKey` sorting the object to the head.
+
+`failureDetail` carries the disposition now, so a failure says whether the object is
+coming back rather than leaving it to be inferred from a log line somewhere else.
+
+One correction to the finding that prompted this: `PREFIX_POLICY_MAP` naming a policy
+that is not loaded is **not reachable**. `policy.New` fails fast at startup, and
+`Resolve`'s prefix loop falls through to the default when a rule's policy is missing.
+
+### A slow file costs one file
+
+Every time budget was scoped to the whole object. `SCRUB_TIMEOUT` is a total and
+condemns the bundle, publishing nothing; `STALL_ABORT_AFTER` fires only when nothing
+is moving at all. Neither could say *this one member is pathological*, so a single
+dense file took a bundle of otherwise ordinary logs down with it.
+
+`FILE_SCRUB_TIMEOUT` (off by default) abandons that file, flags it `guard-tripped` /
+`file-timeout`, and scrubs the rest of the archive. It is sized in time rather than
+in bytes because cost follows match *density*: a 10 MiB log where every line matches
+is far more expensive than a 200 MiB one where nothing does, and `MAX_LEAF_BYTES`
+cannot tell them apart.
+
+The predicate the matcher already polls carries both questions now, and which one
+tripped decides what it costs — a cancel or a scrub deadline still collapses the
+walk, a spent file budget does not set `aborted` at all.
+
+Wired through a new `envDurationChecked`, so `FILE_SCRUB_TIMEOUT: "300"` is refused
+at startup rather than silently becoming the default. The other ten `envDuration`
+call sites still default in silence; that is recorded in todo.md.
+
+### A git packfile stops being invisible
+
+The worst case this service had, and it was not on any list. A `.tar.gz` of a
+directory with a `.git` in it carries `pack-*.pack`: the repository's entire object
+database — every blob, tree, commit and tag in the history, including the credential
+somebody committed once and deleted in the next commit.
+
+Every defence here saw nothing wrong. Each object in a pack is independently
+deflated, so the file is high-entropy end to end: `textenc.Sniff` reads binary and is
+right, the residual scan finds no text at one-, two- or four-byte stride and is
+right, and `strings` returns compression noise. Grepping a real pack for an author
+address that git reads out of it instantly returns **zero hits**. It was skipped, and
+skipped correctly, and it was the most sensitive file in the bundle.
+
+`detect.Pack` recognises it now — the version and object count are part of the
+signature, because "PACK" alone is a real English word — and `archive.ReadPack`
+walks the object headers and inflates every one. Findings are reported per object
+under the **real git object ID**, computed as the SHA-1 over `<type> <size>\0<content>`
+and cross-checked against `git cat-file` for 469 objects, so the report is something
+an operator can act on: `git cat-file -p <id>` shows the object and
+`git log --all --find-object=<id>` finds the commits carrying it.
+
+It is inspected and never scrubbed, and that is a property of the format rather than
+a gap to fill later. An object ID is the SHA-1 of its own content and the trailer is
+the SHA-1 of everything before it, so redacting one byte invalidates that object,
+every tree and commit that reaches it, the `.idx` beside it and the trailer at once.
+Flipping a single byte of a real pack produces `fatal: cannot read commit object`.
+There is no version of "scrub this pack" that leaves a working repository behind, so
+the pack travels unchanged and the report says exactly what is in it and what to do:
+strip `.git`, or rewrite the history with `git filter-repo`.
+
+Matches found this way go through `NoteResidual`, the report's existing channel for
+matches in content that was **not** scrubbed, so nothing is counted as redacted that
+was not. A pack carrying matches makes the run `incomplete-risky` and diverts it to
+`review/`; a pack with nothing in it is still named as a hole, but does not trip the
+alarm that means an unredacted credential is present.
+
+Delta objects are resolved rather than skimmed. About 45% of a packed repository is
+stored as differences against another object, and scanning those raw loses precisely
+the wrong half: text a delta *inserts* appears literally and was found, text it
+*copies* from its base did not appear at all. So a credential added in one commit and
+carried forward unchanged in the next was reported in the object that introduced it
+and missed in every later one — and a file edited *around* a secret produced an
+object that scanned completely clean.
+
+`ofs-delta` and `ref-delta` are applied against their bases now, recursing through
+chains, and a resolved object is reported under its real object ID with its base's
+type — a delta inherits what it is from what it was built against, so a hit says
+"blob" or "commit" rather than "ofs-delta". Resolution is bounded: 64 MiB per object,
+a refused cycle rather than a stack overflow on a pack that names itself as its own
+base, and a checked bound on every copy instruction, since a copy is a pair of
+numbers indexing into a buffer supplied by whoever uploaded the file. What cannot be
+resolved — a thin pack whose base is absent, or an object over the ceiling — falls
+back to the raw-instruction scan, and the report says how many.
+
+Resolution is also the first stretch of the walk that could not be interrupted. A
+review of this change found that failed resolutions were not memoised, and since an
+ofs-delta's base is always *earlier* in the file, a pack of objects each deltaing
+against its predecessor made resolution quadratic: 29 seconds for 25,000 objects in a
+537 KB file, extrapolating to minutes of CPU at the default member cap from a couple
+of megabytes — and `SCRUB_TIMEOUT` could not stop it, because it is a cooperative
+latch and neither `ReadPack` nor the resolver polled anything. Failures are memoised
+now (the same 25,000 objects take 117 ms), both loops poll the abort predicate, and
+recursion carries an explicit depth ceiling: the visiting set refuses cycles, but a
+chain does not have to be circular to exhaust a goroutine stack, and that is a fatal
+error `recover()` cannot catch — it would take down every object in flight rather
+than the one bad bundle.
+
+The same review found the ref-delta pass loop resolved only two links of a chain
+whose bases appear later in the file, silently falling back to the raw scan for the
+rest; it runs to a fixpoint now. And the ofs-delta offset overflow check tested the
+sign bit *after* shifting rather than before, as git does — so an offset git rejects
+was accepted, wrapped to a small positive, and bound the delta to whatever sat there,
+which with a same-size base yields a fabricated object reported under a real-looking
+ID.
+
+The proof is the object IDs: 864 of this repository's own, 395 of them resolved
+deltas, all matching `git cat-file`. A delta applied wrongly by one byte gives a
+different SHA-1, so the IDs matching is the content being exactly right.
+
+The sibling `.idx` needs nothing: it holds a fanout table, object IDs, CRCs and
+offsets, with no filenames and no content.
+
+### Verification
+
+`go build`, `go vet`, `go test ./... -count=1` and `go test -race ./...` green.
+The five worker disposition tests were each run against the pre-fix code and fail
+there with the diagnosis they describe.
+
 ## 0.8.4 — the unit of failure is the member, not the bundle
 
 The rule on the front page is that a file which was not inspected is never

@@ -82,19 +82,19 @@ func (r *Report) Digest() Digest {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	return Digest{
-		InputKey:        r.InputKey,
-		OutputKey:       r.OutputKey,
-		Matches:         r.Summary.TotalMatches,
-		ByLabel:         r.Summary.MatchesByLabel,
-		FilesTotal:      r.Summary.FilesTotal,
-		Passthrough:     r.Summary.FilesPassthrough,
-		Passthroughs:    r.Summary.Passthroughs,
-		BinarySkip:      r.Summary.FilesBinarySkip,
-		BinarySkips:     r.Summary.BinarySkips,
-		Verdict:         r.Summary.Verdict(),
-		NotInspected:    r.Summary.FilesNotInspected,
-		NotInspectedSet: r.Summary.NotInspected,
-		ByReason:        r.Summary.ByReason,
+		InputKey:         r.InputKey,
+		OutputKey:        r.OutputKey,
+		Matches:          r.Summary.TotalMatches,
+		ByLabel:          r.Summary.MatchesByLabel,
+		FilesTotal:       r.Summary.FilesTotal,
+		Passthrough:      r.Summary.FilesPassthrough,
+		Passthroughs:     r.Summary.Passthroughs,
+		BinarySkip:       r.Summary.FilesBinarySkip,
+		BinarySkips:      r.Summary.BinarySkips,
+		Verdict:          r.Summary.Verdict(),
+		NotInspected:     r.Summary.FilesNotInspected,
+		NotInspectedSet:  r.Summary.NotInspected,
+		ByReason:         r.Summary.ByReason,
 		ResidualHits:     r.Summary.ResidualHits,
 		ResidualSamples:  r.Summary.ResidualSamples,
 		UnscannableHoles: r.Summary.UnscannableHoles,
@@ -241,6 +241,51 @@ const (
 	// operator's next step is different: ask the sender for the password, not for
 	// a re-upload. Only that entry is affected; the rest of the archive is scrubbed.
 	ReasonEncrypted Reason = "encrypted"
+	// ReasonFileTimeout marks one file that used up its own time budget and was
+	// abandoned so the rest of the archive could be scrubbed.
+	//
+	// It is the time analogue of ReasonLeafCap, and it exists for the same reason
+	// that one does: every other time budget in the service is scoped to the whole
+	// object, so a single pathological member -- a hundred megabytes of dense
+	// matches on a throttled pod -- took the entire bundle down with it. SCRUB_TIMEOUT
+	// condemns the object and publishes nothing; this costs one file and lets the
+	// other ninety-nine through.
+	//
+	// A file flagged with this was NOT scrubbed, and the run is not clean. The
+	// operator's move is different from a leaf-cap's, which is why it is its own
+	// code: leaf-cap says the pod needs more memory, this says the file needs more
+	// time than the deployment is willing to spend on any single one, and the
+	// answer is usually to raise FILE_SCRUB_TIMEOUT or to look at why that one
+	// member is so much slower than its neighbours.
+	ReasonFileTimeout Reason = "file-timeout"
+	// ReasonGitPack marks a git packfile: read in full, reported in detail, and
+	// deliberately NOT scrubbed.
+	//
+	// It is the only hole in this list that is a refusal rather than a failure. A
+	// pack can be inspected -- every object is inflated and scanned, and the report
+	// names the object IDs that carry matches -- but it cannot be rewritten. Object
+	// IDs are the SHA-1 of their own content and the trailer is the SHA-1 of the
+	// whole file, so redacting one byte breaks that object, every tree and commit
+	// referencing it, the .idx beside it and the trailer at once. A "scrubbed" pack
+	// is a repository git can no longer open, which is a worse outcome than an
+	// honest refusal.
+	//
+	// So the pack travels unchanged and the report says exactly what is in it. The
+	// operator's move is to strip the .git directory or rewrite the history with
+	// git filter-repo before re-uploading -- not to ask for a better scrub, because
+	// there is not one.
+	ReasonGitPack Reason = "git-pack"
+	// ReasonEncoded marks a text file carrying a policy match inside an encoded
+	// region that could not be safely rewritten -- base64 wrapping a payload that
+	// is not itself text, so re-encoding it would substitute garbage for a value
+	// some consumer depends on.
+	//
+	// It is the loud half of todo.md S9. The quiet half is worse and is handled
+	// without a reason code at all: an encoded region whose decoded content IS
+	// text gets scrubbed in place, because a file that can be cleaned should be
+	// cleaned rather than named. This code marks only the residue -- the cases
+	// where the secret is real, was found, and still travels in the output.
+	ReasonEncoded Reason = "encoded-content"
 	// ReasonUnclassified is the tripwire. It is never written deliberately: it marks
 	// a hole recorded through Record instead of Skip, i.e. one whose author did not
 	// say why. The conformance corpus asserts zero of these, so the shortcut that
@@ -254,7 +299,7 @@ var AllReasons = []Reason{
 	ReasonBinary, ReasonEncoding, ReasonUnsupported, ReasonMalformed,
 	ReasonExpandBudget, ReasonMemberCap, ReasonDepthCap, ReasonScratch,
 	ReasonRepackFailed, ReasonResidualScrub, ReasonLeafCap, ReasonEncrypted,
-	ReasonUnclassified,
+	ReasonFileTimeout, ReasonGitPack, ReasonEncoded, ReasonUnclassified,
 }
 
 // AuditLevel controls how much per-match detail the report retains.

@@ -151,6 +151,62 @@ data:
   #
   # "0" removes the bound entirely, which is what shipped before this existed.
   SCRUB_TIMEOUT: "1h"
+  # The longest to spend on ONE FILE before abandoning that file and moving to the
+  # next. Off by default.
+  #
+  # The time analogue of MAX_LEAF_BYTES, and the only budget here scoped to a member:
+  # SCRUB_TIMEOUT above is a total and condemns the whole object, STALL_ABORT_AFTER
+  # below fires only when nothing is moving at all. Neither can say "this ONE member
+  # is pathological", so a single dense file took a bundle of ordinary logs down with
+  # it and published nothing.
+  #
+  # Sized in time rather than bytes because cost follows match DENSITY: a 10 MiB log
+  # where every line matches is dearer than a 200 MiB one where nothing does, and
+  # MAX_LEAF_BYTES cannot tell them apart. The abandoned file is flagged
+  # guard-tripped / file-timeout, is NOT residual-scanned (that scan is bounded in
+  # bytes, not time, so on the one file already proven too slow it could overrun
+  # again), and therefore makes the run incomplete-risky and diverts it to review/.
+  #
+  # Needs a unit. Unlike its neighbours, a bare number here is REFUSED at startup
+  # rather than silently defaulted -- FILE_SCRUB_TIMEOUT: "300" will not start.
+  # FILE_SCRUB_TIMEOUT: "5m"
+  #
+  # Read git packfiles inside uploaded bundles. On by default.
+  #
+  # A .tar.gz of a directory containing .git carries pack-*.pack: the repository's
+  # entire object database, including credentials committed once and deleted in the
+  # next commit. It is high-entropy end to end, so it sniffs as binary and scans
+  # clean at every stride -- it was skipped in silence.
+  #
+  # Reading one is not free. Resolving its deltas reconstructs every historical
+  # version of every file, so a pack charges MAX_EXPAND_BYTES roughly FIVE TO EIGHT
+  # TIMES its size on disk and spills the same to /work. Where a pack cost nothing
+  # before, a bundle carrying a large repository can now exhaust the expansion budget
+  # and leave later members of the same archive guard-tripped. Set this to "false" if
+  # that happens and you cannot raise the volume as quickly as you need to.
+  #
+  # Turning it off does NOT hide the pack: it is still reported as an uninspected
+  # hole and still makes the run incomplete-risky. This changes whether a pack is
+  # READ, never whether it is MENTIONED.
+  # SCRUB_GIT_PACKS: "false"
+  #
+  # Let whoever uploads a bundle set its time budgets, from the upload form, without
+  # a redeploy. On by default; the two ceilings below bound what may be asked for.
+  #
+  # Only budgets are exposed, and only upward to a ceiling. The browser API has no
+  # authentication of any kind, so every value here is one an anonymous caller can
+  # set -- a field that could turn detection DOWN would be a way to launder a bundle
+  # through the normal output bucket rather than a convenience. A longer budget only
+  # means more of the bundle is inspected; a shorter one abandons the caller's own
+  # object and is reported as a timeout.
+  #
+  # The ceilings are not optional. The queue is one consumer in strict arrival order
+  # with no per-tenant fairness, so "give my bundle longer" is also "hold everyone
+  # else up for longer", and unbounded that is a denial of service written in a form
+  # field. Lower them on a busy deployment.
+  # ALLOW_UPLOAD_OPTIONS: "true"
+  # MAX_UPLOAD_SCRUB_TIMEOUT: "2h"
+  # MAX_UPLOAD_FILE_TIMEOUT: "30m"
   # Abandon an object-storage transfer that has moved NO bytes for this long, and
   # bound the metadata calls (10x this for listings, which paginate). This is not
   # a deadline on the transfer: a large object over a congested link legitimately

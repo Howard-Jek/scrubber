@@ -241,3 +241,28 @@ func TestProcessLeavesNoTempFiles(t *testing.T) {
 		t.Fatalf("scratch not empty after Process: %v", names)
 	}
 }
+
+// TestPackLeavesNoTempFiles covers the pack reader, which spills more aggressively
+// than any other container: every object in the file gets a blob, and every resolved
+// delta gets a SECOND one for its applied content while its instruction stream
+// becomes garbage the caller can no longer reach. A pack of a few hundred objects
+// therefore creates and abandons a few hundred temp files in the course of being
+// read correctly, and none of them may survive the walk.
+func TestPackLeavesNoTempFiles(t *testing.T) {
+	dir := leakEnv(t)
+	// Force everything to disk so the test is actually exercising spilled blobs.
+	lim := DefaultLimits()
+	lim.Spill = spill.Policy{Threshold: 1, ResidentMax: 1}
+
+	secret := "password = hunter2 for AcmeCorp bob@acme.test\n"
+	data := packCopyingDelta(t, secret, "# later edit\n")
+
+	rep := report.New("in", "out", report.AuditFull, false, "test")
+	eng := &Engine{Matcher: testMatcher(t), Report: rep, Limits: lim}
+	eng.Process("bundle", data, 0)
+	eng.Release()
+
+	if got := leftovers(t, dir); len(got) > 0 {
+		t.Errorf("pack walk left %d temp file(s) behind: %v", len(got), got)
+	}
+}

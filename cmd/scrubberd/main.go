@@ -271,7 +271,22 @@ func realMain(log *slog.Logger) error {
 		// The one bound on the walk itself. See worker.Config.ScrubTimeout for why
 		// nothing else is one, and the sizing check below for how this default was
 		// picked against MAX_EXPAND_BYTES.
-		ScrubTimeout:  envDuration("SCRUB_TIMEOUT", defaultScrubTimeout),
+		ScrubTimeout: envDuration("SCRUB_TIMEOUT", defaultScrubTimeout),
+		// What the person uploading a bundle may ask for it. Only budgets, and only
+		// upwards to a ceiling, because the API this arrives through has no
+		// authentication: every value here is one an anonymous caller can set.
+		//
+		// A ceiling is not optional. The queue is one consumer in strict arrival
+		// order with no per-tenant fairness, so "give my bundle longer" is also
+		// "hold everyone else up for longer", and unbounded that is a denial of
+		// service written in a form field. Two hours is generous against the
+		// one-hour default and still finite; lower it on a busy deployment, or set
+		// ALLOW_UPLOAD_OPTIONS=false to ignore the sidecars entirely.
+		UploadOptions: worker.OptionLimits{
+			Enabled:  envBool("ALLOW_UPLOAD_OPTIONS", true),
+			MaxScrub: envDurationChecked(probs, "MAX_UPLOAD_SCRUB_TIMEOUT", 2*time.Hour),
+			MaxFile:  envDurationChecked(probs, "MAX_UPLOAD_FILE_TIMEOUT", 30*time.Minute),
+		},
 		Audit:         audit,
 		RedactReports: envBool("REDACT_REPORTS", false),
 		ScrubNames:    envBool("SCRUB_FILENAMES", true),
@@ -296,6 +311,32 @@ func realMain(log *slog.Logger) error {
 			// Without it, raising the expansion budget converts a clean guard trip
 			// into an OOM crash-loop on the first oversized log. Set 0 to disable.
 			MaxLeafBytes: envInt64(probs, "MAX_LEAF_BYTES", c.leafBytes),
+			// The longest this pod will spend on any ONE file before abandoning that
+			// file and moving to the next. Off by default.
+			//
+			// The time analogue of MAX_LEAF_BYTES, and it closes the same gap from the
+			// other side. MAX_LEAF_BYTES can only judge a file by its size, but cost
+			// follows match density, not bytes: a 10 MiB log where every line matches
+			// is far more expensive than a 200 MiB one where nothing does. SCRUB_TIMEOUT
+			// does bound the expensive case, but it bounds it by condemning the whole
+			// object and publishing nothing -- so one pathological member cost a bundle
+			// of otherwise ordinary logs their scrub. This costs that member alone; the
+			// rest of the archive is scrubbed and the hole is flagged `file-timeout`.
+			//
+			// Left off by default because a value too low is itself a way to silently
+			// stop scrubbing things, and the right value depends on the pod's CPU and
+			// on what the bundles look like. Set it once you have seen how long a
+			// normal member takes on your own hardware.
+			MaxFileTime: envDurationChecked(probs, "FILE_SCRUB_TIMEOUT", 0),
+			// Reading a git packfile is not free: resolving its deltas rebuilds every
+			// historical version of every file, so a pack charges the expansion budget
+			// around five to eight times its size on disk and spills the same to
+			// scratch. Set SCRUB_GIT_PACKS=false to go back to skipping them if a
+			// bundle of repositories is exhausting MAX_EXPAND_BYTES faster than the
+			// volume can be raised. The pack is still reported as an uninspected hole
+			// either way -- this changes whether it is READ, never whether it is
+			// MENTIONED.
+			SkipGitPacks: !envBool("SCRUB_GIT_PACKS", true),
 			// Bytes the residual scan may read across one object. Negative disables
 			// it, which removes the only check that does not depend on the pipeline's
 			// own classification being correct — the check that would have caught
@@ -578,7 +619,16 @@ func realMain(log *slog.Logger) error {
 			// with no auth this turns a two-line loop into a durable, restart-
 			// surviving evacuation of every user's work.
 			AllowCancelAny: envBool("ALLOW_CANCEL_ANY", false),
-			CancelBudget:   envDuration("CANCEL_BUDGET", 60*time.Second),
+			// Advertised to the form so it offers exactly what the worker will
+			// honour, rather than a control whose value is silently reduced later.
+			UploadOptions: server.UploadOptionsView{
+				Enabled:  wcfg.UploadOptions.Enabled,
+				MaxScrub: wcfg.UploadOptions.MaxScrub,
+				MaxFile:  wcfg.UploadOptions.MaxFile,
+			},
+			DefaultScrubTimeout: wcfg.ScrubTimeout,
+			DefaultFileTimeout:  wcfg.Limits.MaxFileTime,
+			CancelBudget:        envDuration("CANCEL_BUDGET", 60*time.Second),
 			// Total object-storage time one HTTP request may spend. The store
 			// bounds each call; this bounds their sum, which is what a browser
 			// polling every second actually experiences. Negative disables it.
@@ -1123,6 +1173,30 @@ func isZeroQuantity(v string) bool {
 		return strings.ContainsAny(v, "0")
 	}
 	return false
+}
+
+// envDurationChecked reads a duration and SAYS SO when it cannot read one.
+//
+// envDuration below returns the default on an unparseable value in silence, which is
+// how "SCRUB_TIMEOUT: 3600" -- the natural thing to write next to a POLL_INTERVAL in
+// seconds -- becomes a one-hour budget nobody chose. A setting the operator wrote and
+// the service ignored is worse than one it refused, so new duration settings come
+// through here. Converting the existing ten is recorded in todo.md section 3.
+func envDurationChecked(probs *startupProblems, k string, def time.Duration) time.Duration {
+	v := strings.TrimSpace(os.Getenv(k))
+	if v == "" {
+		return def
+	}
+	d, err := time.ParseDuration(v)
+	if err != nil {
+		probs.addf("%s is set to a value that cannot be read as a duration."+NL+
+			"      Value: %q"+NL+
+			"      Fix:   durations need a unit -- 90s, 5m, 1h30m. A bare number is "+
+			"not seconds, it is an error. Use 0 to disable a budget that supports it.",
+			k, v)
+		return def
+	}
+	return d
 }
 
 func envDuration(k string, def time.Duration) time.Duration {

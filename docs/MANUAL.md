@@ -75,6 +75,7 @@ or half-scrubbed bundle.
 | `--max-depth` | `16` | Maximum container nesting depth. |
 | `--max-expand-bytes` | `2147483648` | Expanded content accepted per input, enforced while reading (bounds `TMPDIR`, not memory). Payloads above the spill threshold are held on disk, so this is a scratch-space bound. "Content" is literal: a nested container is charged once, not once for itself and again for its members. |
 | `--max-leaf-bytes` | `0` (off) | Largest single file to scrub. The matcher needs the payload contiguous in memory, so one file costs 3–4× its size in heap whatever the spill settings are; a file above the cap is passed through and flagged `guard-tripped` / `leaf-cap`, and **the rest of the archive is still scrubbed**. Off by default because a workstation has the memory for one large log and no kubelet to answer to; the service derives a value (see [Sizing the pod](#sizing-the-pod)). |
+| `--file-timeout` | `0` (off) | Longest to spend on a single file before abandoning it and moving to the next. The time analogue of `--max-leaf-bytes`, and it catches what that cannot: cost follows match *density*, so a small dense file can outlast a large sparse one. The abandoned file is passed through and flagged `guard-tripped` / `file-timeout`, and **the rest of the archive is still scrubbed**. Takes a Go duration (`90s`, `5m`). |
 | `--max-ratio` | — | **Deprecated and ignored** (warns if set). See [Safety guarantees](#safety-guarantees). |
 | `--fail-on-unscrubbed` | `false` | Exit `3` if **any** file was emitted without being inspected — binary, guard-tripped, unreadable or an unsupported container. |
 | `--fail-on-risky` | `false` | Exit `3` only when content that was *not* inspected is found to contain policy matches. The narrower gate for pipelines that legitimately carry images. |
@@ -241,6 +242,9 @@ alongside a larger batch, and none of them compete for the pod's single CPU.
   `/api/status` as soon as its upload lands, and that first poll nudges a listing. Note
   that listing covers the whole input bucket including `processed/`, so prune that prefix
   (a lifecycle rule, or `PROCESSED_ACTION=delete`) rather than shortening the interval.
+  `PROCESSED_ACTION=delete` does not empty the prefix on its own: stalled inputs are
+  moved there under either action, so a deployment using `STALL_ABORT_AFTER` still wants
+  the lifecycle rule.
 - **The queue is per-pod**, which is the other reason `replicas: 1` is load-bearing. The
   Deployment uses `strategy: Recreate` on purpose: with `replicas: 1` the default
   RollingUpdate starts the new pod before stopping the old one, and two scrubberds polling
@@ -635,6 +639,8 @@ two do not reject; they emit and flag, and they differ in how much:
 | `MAX_OBJECT_BYTES` | upload **rejected**, `scrubber_objects_total{status="too_large"}` | nothing is produced |
 | `MAX_EXPAND_BYTES` | emitted unscrubbed, `guard-tripped` / `expansion-budget` | the **whole container** — every member of it is uninspected |
 | `MAX_LEAF_BYTES` | emitted unscrubbed, `guard-tripped` / `leaf-cap` | **that one file**; the rest of the archive is scrubbed normally |
+| `FILE_SCRUB_TIMEOUT` | emitted unscrubbed, `guard-tripped` / `file-timeout` | **that one file**; the rest of the archive is scrubbed normally |
+| *(a git packfile)* | emitted unchanged, `unsupported-format` / `git-pack` | **the pack**; every object in it is inspected and named, but none can be redacted |
 
 Do not blur the three.
 
@@ -680,8 +686,8 @@ Supplied as environment variables, in practice via a ConfigMap plus a Secret.
 | `PROCESSED_ACTION` | `move` | `move` (to `processed/`) or `delete`. |
 | `POLL_INTERVAL` | `15s` | Discovery interval. Does **not** govern drain rate. |
 | `WORKERS` | `1` | Objects scrubbed concurrently, bounded at 8. `MAX_EXPAND_BYTES` and `MAX_LEAF_BYTES` are **divided** by it, so raising it trades bundle size for parallelism. `replicas: 1` remains a correctness requirement regardless. |
-| `STALL_ABORT_AFTER` | `0` (off) | Abandon an object that publishes **no** progress for this long, so one wedged bundle cannot hold a consumer forever. Not `SCRUB_TIMEOUT`: that is a total budget and fires on healthy work that is merely large, while this fires only when nothing has moved, so it can be set far tighter. Cooperative — an object blocked in a syscall never reaches a poll site. |
-| `PROCESSED_PREFIX` | `processed/` | Where a finished input is moved under `PROCESSED_ACTION=move`. |
+| `STALL_ABORT_AFTER` | `0` (off) | Abandon an object that publishes **no** progress for this long, so one wedged bundle cannot hold a consumer forever. Not `SCRUB_TIMEOUT`: that is a total budget and fires on healthy work that is merely large, while this fires only when nothing has moved, so it can be set far tighter. Cooperative — an object blocked in a syscall never reaches a poll site. The input is **moved** to `PROCESSED_PREFIX` even under `PROCESSED_ACTION=delete`: this verdict is inferred from an absence of heartbeats rather than measured, and expanding a container publishes none, so it can land on healthy work — and nothing was written for the object, making the input possibly the only copy. |
+| `PROCESSED_PREFIX` | `processed/` | Where a finished input is moved under `PROCESSED_ACTION=move`. Also where a **stalled** input is moved under *either* action — see `STALL_ABORT_AFTER`. |
 | `JOBS_HISTORY` | `200` | In-memory job records kept. A cache, not the record of truth — status falls back to object storage. |
 | `SCRATCH_RECLAIM` | `true` | Sweep temp files orphaned by a previous process at startup. Safe only at `replicas: 1`, which is required anyway. |
 | `ENSURE_BUCKETS` | `false` | Create the buckets at startup if absent. Wants bucket-creation rights the service does not otherwise need. |
@@ -693,6 +699,7 @@ Supplied as environment variables, in practice via a ConfigMap plus a Secret.
 | `SCRATCH_BYTES` | `POD_EPHEMERAL_LIMIT`, else 4Gi | Ephemeral-storage ceiling one object may fill, and the input every other size cap is derived from. **Keep it equal to the `/work` emptyDir `sizeLimit` and to BOTH `ephemeral-storage` values.** Accepts Kubernetes quantities as well as plain byte counts; an unreadable value is warned about at startup and ignored. Shipped: `14Gi`. Undeclared, `scratch_source` reads `default (undeclared)`. |
 | `MAX_EXPAND_BYTES` | *derived* | Expanded **content** one object may hold, enforced while reading. Derived as `SCRATCH_BYTES / 3.5`; 4.00 GiB as shipped. A **disk** bound: the disk actually touched is that multiple again. Set it only to go *below* the derivation — above it is how a pod gets evicted, and startup warns either way. Clamped to 1 PiB with a warning — the guards evaluate `budget+1`, which wraps negative near `MaxInt64`, and a wrapped budget makes every payload read as *empty*: the object ships unscrubbed while the report calls it complete. |
 | `MAX_LEAF_BYTES` | *derived* | Largest single file the matcher will scrub, derived as 96Mi × (`limits.memory` / 2Gi); 192Mi as shipped. The one cap that follows **memory**, because the payload must be contiguous and each of `Bytes`/`Decode`/`Scrub`/`Encode` holds a copy outside the spill accounting. A larger file is passed through and flagged `leaf-cap`; the rest of the archive is still scrubbed. `0` disables it, which leaves the whole expansion budget as the only bound. |
+| `FILE_SCRUB_TIMEOUT` | `0` (off) | Longest the matcher will spend on **one file** before abandoning that file and moving to the next. The time analogue of `MAX_LEAF_BYTES`, and the only budget scoped to a member: `SCRUB_TIMEOUT` is a total that condemns the whole object, and `STALL_ABORT_AFTER` fires only when nothing is moving at all. Neither can say *this one member is pathological*. A file over it is passed through and flagged `guard-tripped` / `file-timeout`, and **the rest of the archive is still scrubbed**. Needs a unit (`90s`, `5m`); a bare number is refused at startup rather than defaulted. |
 | `MAX_OBJECT_BYTES` | *derived* | Ceiling on the uploaded (compressed) object — the only cap that turns an upload away. Derived as 41.7% of `MAX_EXPAND_BYTES`; 1707Mi as shipped. |
 | `SPILL_THRESHOLD` | *derived* | Payloads above this go to `/work` individually. Scaled from the pod's memory (4Mi at 2Gi, 8Mi as shipped), floored at 512Ki. |
 | `SPILL_RESIDENT_MAX` | *derived* | Aggregate in-memory budget. **This is what bounds RSS**, together with `MAX_LEAF_BYTES` — on its own it does not, because the leaf being scrubbed is read back off disk outside this accounting. Scaled from the pod's memory (64Mi at 2Gi, 128Mi as shipped). |

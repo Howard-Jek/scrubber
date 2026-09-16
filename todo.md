@@ -9,24 +9,64 @@ The audit deliberately skipped security. That sweep has not been done.
 
 ---
 
-## 1. The queue can still be held by one bad object
+## 1. ~~The queue can still be held by one bad object~~ — DONE
 
-**F1 · `internal/worker/worker.go`, the generic branch of `fail` and the panic
-recovery.** Neither calls `deferRetry` nor disposes of the input. `attempts`
-stays 0, so `orderKey` returns the object's `LastModified` — by definition the
-oldest key in the bucket — and it sorts to **position 1** on the next poll. A
-permanent error therefore re-downloads and re-walks the same object ahead of
-every newer upload, forever, flapping `error → processing → error`. The panic
-path is worse: the panic is deterministic for the same object, so it is a
-guaranteed loop with a stack trace on every cycle.
+**F1 · `internal/worker/worker.go`.** Fixed. The generic branch of `fail` and the
+panic recovery both record a disposition now instead of recording and returning.
 
-Reachable through: `PutStream` denied, a non-404 error on the `.terms.json`
-sidecar, `PREFIX_POLICY_MAP` naming a policy that is not loaded, `spill.Create`
-on a full `/work`.
+What actually shipped differs from the prescription above in one important way, and
+the reason is worth keeping. The original note said to `finish` the input aside for
+"policy resolution, unknown override policy". Retiring on those would have been
+wrong: `watchPolicies` (`cmd/scrubberd/main.go:907`) hot-reloads the policy directory
+when the ConfigMap changes, so a missing `DEFAULT_POLICY` heals **without a restart**
+— and it fails every object in the bucket at once. Setting them all aside would have
+emptied the input bucket into `processed/` unscrubbed during a fault that was about
+to fix itself, which is far worse than the stuck queue being repaired.
 
-The `stalled` and `timeout` branches beside it document exactly why they do the
-opposite. Fix: `deferRetry` on both, and `finish` the input aside for errors
-that cannot succeed on a retry (policy resolution, unknown override policy).
+So the rule that shipped is *whose fault is it*, not *will it repeat*:
+
+- `policy.ErrTermsInvalid` — a malformed `.terms.json` that arrived with the upload.
+  One object, unfixable by anything but a re-upload. **Retired.**
+- `policy.ErrNoPolicy` — registry cannot resolve. Deployment-wide and self-healing.
+  **Deferred forever**, never retired.
+- Everything else (denied `PutStream`, full `/work`, storage 5xx) — deployment-wide
+  and usually transient. **Deferred forever**, no attempt ceiling, for the same
+  reason: a three-minute outage must not drain the backlog into `processed/`.
+- A panic — object-specific by construction. Deferred, then retired after
+  `maxAttempts` (5), which is the one place a ceiling is safe.
+
+The deferral alone is what fixes the reported bug: a non-zero `attempts` is what
+stops `orderKey` falling back to `LastModified` and sorting the object to the head.
+
+**Correction to the original finding:** `PREFIX_POLICY_MAP` naming a policy that is
+not loaded is **not reachable**. `policy.New` fails fast at startup
+(`registry.go:54-58`), and `Resolve`'s prefix loop falls through to the default
+policy when a rule's policy is missing (`registry.go:171-183`). The reachable
+resolution failures are an invalid sidecar and an empty/missing `DEFAULT_POLICY`.
+
+Tests: `internal/worker/disposition_test.go` — all five fail against the old code.
+
+### Also done, though it was not on this list
+
+**A per-file time budget.** `FILE_SCRUB_TIMEOUT` (off by default) abandons a single
+file that outruns it, flags it `guard-tripped` / `file-timeout`, and scrubs the rest
+of the archive. Every other time budget here is scoped to the whole object, so one
+pathological member used to cost a bundle of ordinary logs their scrub and publish
+nothing. Cost follows match *density* rather than size, which is the case
+`MAX_LEAF_BYTES` cannot see. `internal/pipeline/filetimeout_test.go`.
+
+Wired through a new `envDurationChecked`, so `FILE_SCRUB_TIMEOUT: "300"` is refused
+at startup rather than silently becoming the default. The other ten `envDuration`
+call sites still default in silence — see section 3.
+
+**Spotted while in there, now fixed:** `stalledExit`'s `ActionDelete` disposition
+string claimed *"The input was moved aside rather than deleted"*, but the `w.finish`
+it just called **deleted** under `ActionDelete`. Resolved the way the text promised —
+a new `setAside` moves the input under either action, because a stall verdict is
+inferred rather than measured and nothing was published for the object. The refused
+move now defers the retry too, which that branch never did.
+`TestStalledInputIsMovedAsideUnderEveryAction`,
+`TestStalledInputThatCannotBeMovedAsideIsBackedOff`.
 
 ## 2. A successful scrub can be reported as lost
 
@@ -106,6 +146,41 @@ through `probs`; make `envBool` case-insensitive and accept `on`/`off`/`y`/`n`.
   the dangerous quadrant: the binaries at least get named.
 - **Formats not detected at all**: lz4, brotli, lzma, `.Z`, cpio. They fall
   through to a binary skip, which is safe but silent about *why*.
+- ~~**Git packfiles**~~ — DONE. Was the worst case in this section and was not
+  listed here: a `.pack` is high-entropy end to end, so it sniffed as binary,
+  skipped correctly, and scanned clean at every stride — while holding every
+  blob, tree and commit in the repository's history, including secrets deleted
+  from the working tree. `detect.Pack` recognises it now, `archive.ReadPack`
+  inflates every object, and each one is scanned through the residual reader.
+  Findings are reported per object under the **real git object ID** (verified
+  against `git cat-file` for 469 objects), so a report is actionable with
+  `git cat-file -p <id>` and `git log --all --find-object=<id>`.
+
+  It is inspected, never scrubbed, and that is permanent rather than pending:
+  an object ID is the SHA-1 of its own content and the trailer is the SHA-1 of
+  the whole file, so a single redacted byte breaks the object, every commit
+  reaching it, the `.idx` and the trailer at once. Demonstrated: flipping one
+  byte of a real pack gives `fatal: cannot read commit object`. A pack carrying
+  matches makes the run `incomplete-risky` and diverts it to `review/`.
+
+  **Deltas are resolved too.** About 45% of a packed repository is stored as
+  differences against another object rather than in full, and scanning those raw
+  loses exactly the wrong half: text a delta *inserts* is literal and was found,
+  text it *copies* from its base was invisible. So a credential added in one
+  commit and merely carried forward in the next was reported in the object that
+  introduced it and missed in every later one — and a file edited *around* a
+  secret produced an object that looked completely clean.
+
+  `archive.ReadPack` now applies `ofs-delta` and `ref-delta` against their bases,
+  recursing through chains, and the resolved object gets its real git object ID.
+  Verified end to end: **864 of this repo's own object IDs match `git cat-file`,
+  395 of them resolved deltas, none unresolved** — the content has to be correct
+  to the byte or the SHA-1 would not match. A delta that still cannot be resolved
+  (a thin pack whose base is not in the file, or one above the 64 MiB resolve
+  ceiling) falls back to the raw-instruction scan and the report says how many.
+
+  `.idx` files carry only hashes, CRCs and offsets — no names, no content — so
+  skipping them as binary is correct and costs nothing.
 - **Documents.** PDF is opaque (its text lives in Flate streams). Office files
   are handled structurally as zips of XML and are untested; Word splits text
   runs, so an address is routinely `bob@acme` + `.com` in two elements and no

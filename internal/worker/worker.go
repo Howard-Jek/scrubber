@@ -116,6 +116,9 @@ type Config struct {
 	// patience. Too low and every large bundle fails; the object is not retried, so
 	// that failure is permanent until someone re-uploads.
 	ScrubTimeout time.Duration
+	// UploadOptions bounds what the person who uploaded a bundle may ask for it.
+	// Zero value means the mechanism is off and sidecars are ignored.
+	UploadOptions OptionLimits
 	// Audit is how much per-match detail the stored report retains. See
 	// ParseAuditLevel: this is a memory setting as much as a disclosure one.
 	Audit         report.AuditLevel
@@ -432,11 +435,13 @@ func (w *Worker) watchStalls(ctx context.Context) {
 				// Nothing has moved for the whole abort budget. Take it away from its
 				// consumer so the queue behind it drains.
 				//
-				// This is only trustworthy because every long stretch of the walk now
-				// publishes a heartbeat: expanding a container, scrubbing one large
-				// file and rebuilding the archive all report. Before that, a rebuild
-				// was silent for its entire duration and this check would have
-				// destroyed healthy work.
+				// This is only trustworthy because the stretches that CAN report now do:
+				// both transfers, scrubbing one large file, and recompressing or
+				// rebuilding an archive. Before that, a rebuild was silent for its
+				// entire duration and this check would have destroyed healthy work.
+				// One stretch still cannot report — a container is expanded in full
+				// before its first member is scrubbed — so the verdict remains an
+				// inference, which is why stalledExit never deletes what it abandons.
 				if abortAfter > 0 && secs >= abortAfter.Seconds() {
 					if w.abortStalled(key) {
 						w.log.Error("object has published no progress for its stall budget and is "+
@@ -708,7 +713,7 @@ func (w *Worker) runOnce(ctx context.Context) {
 
 // eligible filters out override sidecar files and already-processed keys.
 func (w *Worker) eligible(o store.Object, now time.Time) bool {
-	if strings.HasSuffix(o.Key, termsSuffix) {
+	if strings.HasSuffix(o.Key, termsSuffix) || strings.HasSuffix(o.Key, optsSuffix) {
 		return false // sidecar, consumed alongside its bundle
 	}
 	if strings.HasPrefix(o.Key, w.cfg.ProcessedPrefix) {
@@ -903,14 +908,59 @@ func (w *Worker) clearDeferral(key string) {
 	delete(w.attempts, key)
 }
 
-// deferRetry records a failure and returns the backoff applied.
-func (w *Worker) deferRetry(key string) time.Duration {
+// deferRetry records a failure and returns the backoff applied and which attempt
+// this was. The count is returned rather than read back separately because the
+// caller uses it to decide whether to retry at all, and a second lock acquisition
+// to fetch it would let another consumer's failure land in between.
+func (w *Worker) deferRetry(key string) (time.Duration, int) {
 	w.mu.Lock()
 	defer w.mu.Unlock()
 	w.attempts[key]++
-	d := retryBackoff(w.attempts[key])
+	n := w.attempts[key]
+	d := retryBackoff(n)
 	w.deferUntil[key] = time.Now().Add(d)
-	return d
+	return d, n
+}
+
+// maxAttempts bounds how often an object that panics is retried before it is moved
+// aside. It applies to the panic path ONLY.
+//
+// A panic is the one failure that is object-specific by construction: it is
+// deterministic in the bytes that produced it, so it repeats forever and it repeats
+// for this object alone. Ordinary errors get no such ceiling -- see the comment on
+// the generic branch of fail -- because those are usually deployment-wide, and a
+// ceiling on them would empty the input bucket into processed/ during an outage.
+//
+// Five attempts spans about a minute of backoff: enough that a panic caused by
+// transient memory pressure gets another chance, few enough that a bad bundle stops
+// costing a download and a stack trace every cycle.
+const maxAttempts = 5
+
+// retireInput disposes of an input that must not come back, and returns a sentence
+// saying what happened to it.
+//
+// Shared by the paths that have decided a retry is pointless. It never claims a
+// disposal that did not happen: if the move fails the object really is still in the
+// bucket and really will be picked up again, and saying otherwise sends an operator
+// looking in processed/ for something that was never put there.
+func (w *Worker) retireInput(ctx context.Context, key string) string {
+	// setAside, not finish. Nothing has been published on any path that reaches
+	// here -- policy resolution happens before a single byte is scrubbed, and a
+	// panic means the walk did not complete -- so the object is one the service
+	// never finished with, and Action does not get a say. Under ActionDelete,
+	// finish would destroy a user's upload because their sidecar had a typo, and it
+	// may be their only copy.
+	if err := w.setAside(ctx, key); err != nil {
+		w.log.Warn("could not move a failed input aside; it stays in the input bucket "+
+			"and will be picked up again", "key", key, "err", err)
+		return "The input could NOT be moved aside (" + err.Error() +
+			"), so it stays in the input bucket and will be attempted again."
+	}
+	w.clearDeferral(key)
+	return "The input was moved to " + w.cfg.ProcessedPrefix + key +
+		" and will NOT be retried automatically; re-upload it once the cause is fixed. " +
+		"It was moved rather than deleted even where this deployment deletes finished " +
+		"inputs, because an object the service could not process is not a finished one."
 }
 
 func (w *Worker) processObject(ctx context.Context, o store.Object) {
@@ -1001,11 +1051,48 @@ func (w *Worker) processObject(ctx context.Context, o store.Object) {
 		w.jobs.Upsert(job)
 	}
 
+	// Per-upload settings, if the uploader sent any. Read next to the terms sidecar
+	// and treated far more leniently: a storage error here is not worth failing an
+	// object over, because the worst case is that the object runs on the server
+	// defaults, which is exactly what it would have done anyway.
+	var optNotes []string
+	hadOpts := false
+	scrubBudget := w.cfg.ScrubTimeout
+	objLimits := w.cfg.Limits
+	if _, optBytes, oerr := w.store.Exists(ctx, w.cfg.InputBucket, o.Key+optsSuffix); oerr != nil {
+		w.log.Warn("could not read per-upload settings; using the server defaults",
+			"key", o.Key, "err", oerr)
+		optNotes = append(optNotes, "the per-upload settings could not be read from storage ("+
+			oerr.Error()+"); the server defaults were used")
+	} else if len(optBytes) > 0 {
+		hadOpts = true
+		opts, perr := parseUploadOptions(optBytes)
+		if perr != "" {
+			optNotes = append(optNotes, perr)
+		}
+		wantScrub, wantFile, notes := opts.clamp(w.cfg.UploadOptions)
+		optNotes = append(optNotes, notes...)
+		if wantScrub > 0 {
+			scrubBudget = wantScrub
+			optNotes = append(optNotes, "this object was given a scrub budget of "+
+				roundDur(wantScrub)+" at upload time")
+		}
+		if wantFile > 0 {
+			objLimits.MaxFileTime = wantFile
+			optNotes = append(optNotes, "this object was given a per-file budget of "+
+				roundDur(wantFile)+" at upload time")
+		}
+	}
+	if len(optNotes) > 0 {
+		job.Notes = optNotes
+		record(job)
+	}
+
 	// The object's deadline. Nothing else bounds the walk, so without this a single
 	// bundle holds the one consumer for as long as it takes -- measured at over
 	// three hours on a CPU-throttled pod, with every upload behind it queued.
-	if w.cfg.ScrubTimeout > 0 {
-		deadline := time.AfterFunc(w.cfg.ScrubTimeout, func() {
+	if scrubBudget > 0 {
+		deadline := time.AfterFunc(scrubBudget, func() {
 			// Snapshot BEFORE the flag, so anyone who sees the flag sees the
 			// position that goes with it.
 			if j, ok := w.jobs.Get(o.Key); ok {
@@ -1031,7 +1118,7 @@ func (w *Worker) processObject(ctx context.Context, o store.Object) {
 		dctx, dcancel := context.WithTimeout(context.WithoutCancel(ctx), w.cfg.FinalizeGrace)
 		defer dcancel()
 		if err := w.disposeCancelled(dctx, o.Key); err != nil {
-			d := w.deferRetry(o.Key)
+			d, _ := w.deferRetry(o.Key)
 			w.log.Warn("could not dispose of a cancelled input; it stays in the bucket and is retried",
 				"key", o.Key, "err", err, "retry_in", d)
 			return
@@ -1049,11 +1136,50 @@ func (w *Worker) processObject(ctx context.Context, o store.Object) {
 		}
 		w.metrics.Errors.Inc()
 		w.metrics.Objects.WithLabelValues("panic").Inc()
+
+		// If the outcome was already recorded the walk had finished and decided; a
+		// panic unwinding after that is in cleanup, and re-deciding the disposition
+		// here would undo a delivery that already happened.
+		if recorded {
+			w.log.Error("panic after the object's outcome was already recorded; "+
+				"the recorded outcome stands", "key", o.Key, "panic", r,
+				"stack", string(debug.Stack()))
+			return
+		}
+
+		// The same queue trap as an ordinary error, and sharper here: a panic is
+		// deterministic in the bytes that produced it, so without this the object
+		// keeps its original LastModified, returns to the head of the very next
+		// poll, and panics again — a guaranteed loop that writes a fresh stack
+		// trace every cycle and never lets the queue behind it move.
+		//
+		// Deferred rather than retired on the first occurrence, because a panic is
+		// not always about the object: an allocation failure under memory pressure
+		// presents exactly like this, and that one does clear. maxAttempts is what
+		// separates the two — the object that panics on its own bytes reaches the
+		// ceiling and is retired, the one that panicked because the pod was
+		// briefly out of memory succeeds before it gets there.
+		// Reported as an error even on the attempts that will be retried, which is
+		// the one place this differs from an ordinary transient failure. A panic is a
+		// bug in this service rather than a fault in the object or the storage behind
+		// it, and an operator needs to see it the moment it happens rather than after
+		// the retries drain. The retry is a hedge, not an expectation, so it is stated
+		// in the detail instead of softening the status.
+		d, n := w.deferRetry(o.Key)
+		disposition := fmt.Sprintf("The input stays in the input bucket and is retried "+
+			"in %s (attempt %d of %d).", roundDur(d), n, maxAttempts)
 		job.Status = "error"
-		job.Error = fmt.Sprintf("internal error while processing (panic: %v)", r)
+		job.RetryInSeconds = int(d.Round(time.Second).Seconds())
+		if n >= maxAttempts {
+			job.RetryInSeconds = 0
+			disposition = fmt.Sprintf("This was attempt %d of %d and the last one. %s",
+				n, maxAttempts, w.retireInput(ctx, o.Key))
+		}
+		job.Error = fmt.Sprintf("internal error while processing (panic: %v). %s", r, disposition)
 		record(job)
 		w.log.Error("panic while processing object; object skipped, service continues",
-			"key", o.Key, "panic", r, "stack", string(debug.Stack()))
+			"key", o.Key, "panic", r, "attempt", n, "retry_in", d,
+			"stack", string(debug.Stack()))
 	}()
 
 	fail := func(err error) {
@@ -1074,7 +1200,7 @@ func (w *Worker) processObject(ctx context.Context, o store.Object) {
 			// the bucket — so it returns to the HEAD of the queue and every upload
 			// behind it pays the stall timeout again on every cycle. One unreadable
 			// object would throttle everybody.
-			d := w.deferRetry(o.Key)
+			d, _ := w.deferRetry(o.Key)
 			w.metrics.Objects.WithLabelValues("stalled").Inc()
 			// "retrying", not "error". The object is still in the input bucket and
 			// will be picked up again; calling it an error makes the upload page
@@ -1082,50 +1208,131 @@ func (w *Worker) processObject(ctx context.Context, o store.Object) {
 			// likely to succeed on the next attempt.
 			job.Status = "retrying"
 			job.RetryInSeconds = int(d.Round(time.Second).Seconds())
-			job.Error = failureDetail(err, at(), time.Since(start))
+			job.Error = failureDetail(err, at(), time.Since(start),
+				"The input stays in the input bucket and is retried in "+roundDur(d)+".")
 			record(job)
 			w.log.Error("object storage transfer stalled and was abandoned; the object "+
 				"stays in the input bucket and is retried after a backoff",
 				"key", o.Key, "err", err, "retry_in", d)
 			return
 		}
-		w.metrics.Objects.WithLabelValues("error").Inc()
 		p := at()
-		job.Status = "error"
 		job.Phase = ""
 		job.FilesDone, job.FilesTotal, job.CurrentFile = filesDone, membersTotal, currentFile
-		job.Error = failureDetail(err, p, time.Since(start))
-		record(job)
-		w.log.Error("process object", "key", o.Key, "err", err,
-			"phase", p.phase, "files_done", p.filesDone, "files_total", p.filesTotal,
-			"current_file", p.currentFile, "elapsed", roundDur(time.Since(start)))
+
+		// An ordinary error used to stop here: counted, recorded, logged, and nothing
+		// else. Nothing else was the bug. attempts stays 0, so orderKey falls back to
+		// the object's LastModified — by definition the oldest key still in the
+		// bucket — and the same object sorts to the head of the very next poll, ahead
+		// of every upload that arrived while it was failing. A permanent error
+		// therefore re-downloads and re-walks the same bytes forever, flapping
+		// error → processing → error, with the whole queue held behind it.
+		//
+		// The stalled branch above and the timeout branch below both already do the
+		// opposite, and say why. This is the same reasoning applied to the case that
+		// is most likely to be permanent.
+		//
+		// Three dispositions, because "should this come back?" has three answers. An
+		// error no retry can change retires the input immediately and names what to
+		// fix. An object that has spent its attempts is retired too — by then
+		// "it might be transient" has been tested and disproved. Everything else is
+		// deferred, which backs it off and, because attempts is no longer 0, also
+		// moves it out of the head of the queue so newer uploads are served while it
+		// waits. (Errors is already counted at the top of fail, for every branch.)
+		//
+		// Only ONE class is retired here, and the bar for joining it is high: the
+		// fault has to belong to the object rather than to the deployment. A
+		// deployment-wide fault -- the output bucket refusing writes, the policy
+		// directory misconfigured, scratch full -- fails every object at once, so
+		// retiring on it would move the whole input bucket into processed/ unscrubbed
+		// during an outage that was going to clear. That is a far worse failure than
+		// the stuck queue this is fixing, and it is why there is no blanket attempt
+		// ceiling on this path: an object that can never succeed costs one attempt a
+		// minute, which is survivable, and it no longer costs anyone else their place
+		// in the queue.
+		switch {
+		case errors.Is(err, policy.ErrTermsInvalid):
+			// The malformed sidecar came with the upload and is malformed in the
+			// bucket, so no retry and no configuration change can rescue it. Only a
+			// re-upload can, and this affects exactly one object.
+			w.metrics.Objects.WithLabelValues("unresolvable").Inc()
+			job.Status = "error"
+			job.Error = failureDetail(err, p, time.Since(start), w.retireInput(ctx, o.Key))
+			record(job)
+			w.log.Error("object's own terms sidecar cannot be compiled; no retry can "+
+				"change that, so the input was retired", "key", o.Key, "err", err,
+				"phase", p.phase, "elapsed", roundDur(time.Since(start)))
+
+		default:
+			// Everything else backs off and stays. The deferral is the whole fix: it
+			// makes attempts non-zero, which is what stops orderKey falling back to
+			// the object's LastModified and sorting it ahead of every newer upload.
+			w.metrics.Objects.WithLabelValues("error").Inc()
+			d, n := w.deferRetry(o.Key)
+			// "retrying", not "error", for the reason the stalled branch gives: the
+			// object is still in the bucket and will be picked up again, and calling
+			// that an error makes the upload page show a permanent failure for work
+			// that has not finished failing.
+			job.Status = "retrying"
+			job.RetryInSeconds = int(d.Round(time.Second).Seconds())
+			job.Error = failureDetail(err, p, time.Since(start),
+				fmt.Sprintf("The input stays in the input bucket and is retried in %s "+
+					"(attempt %d).", roundDur(d), n))
+			record(job)
+			w.log.Error("process object", "key", o.Key, "err", err,
+				"phase", p.phase, "files_done", p.filesDone, "files_total", p.filesTotal,
+				"current_file", p.currentFile, "elapsed", roundDur(time.Since(start)),
+				"attempt", n, "retry_in", d)
+		}
 	}
 
 	// stalledExit fails an object the watchdog found had stopped moving.
 	//
-	// Disposed of like a timeout, and for the same reason: leaving it in the bucket
+	// Terminal like a timeout, and for the same reason: leaving it at its own key
 	// means the next poll picks it up, wedges another consumer on it, and does so
 	// forever. Re-uploading is the retry, and it is a decision for a person who has
 	// looked at why it stopped.
+	//
+	// It parts company with timedOutExit on ONE point: the input is always moved
+	// aside, never deleted, even where the deployment deletes finished inputs. The
+	// difference is in how the two verdicts are reached. A timeout is measured — the
+	// operator set the budget and the object really did outrun it. A stall is
+	// INFERRED, from an absence of heartbeats, and the inference can be wrong:
+	// expanding a container publishes nothing for its whole duration, and before the
+	// transfers were plumbed a slow-but-healthy download would have been condemned
+	// as stuck. A heuristic that can fire on healthy work must not be wired to an
+	// irreversible delete. An object the service refused to process is not a
+	// finished one, and it may be the only copy: setting it aside costs the
+	// deployment one key under ProcessedPrefix, in the bucket the object was already
+	// in, and deleting it costs the user their upload.
 	stalledExit := func(p position) {
 		w.metrics.Errors.Inc()
 		w.metrics.Objects.WithLabelValues("no_progress").Inc()
 		disposition := "The input was left in the bucket."
-		if err := w.finish(ctx, o.Key); err != nil {
+		movedTo := ""
+		if err := w.setAside(ctx, o.Key); err != nil {
+			// It really is still at its own key, so it WILL come back — and it must
+			// come back backed off. Without the deferral attempts stays 0, orderKey
+			// falls back to the object's LastModified (by definition the oldest key
+			// in the bucket), and the object retakes the head of the very next poll
+			// to wedge another consumer for another whole stall budget. This branch
+			// is not hypothetical under ActionDelete: such a deployment may hold no
+			// write rights on the input bucket at all, so every set-aside fails.
+			d, _ := w.deferRetry(o.Key)
 			w.log.Warn("could not move a stalled input aside; it stays in the input bucket "+
-				"and will be picked up again", "key", o.Key, "err", err)
+				"and is retried after a backoff", "key", o.Key, "err", err, "retry_in", d)
 			disposition = "The input could NOT be moved aside (" + err.Error() +
-				"), so it stays in the input bucket and will be attempted again."
+				"), so it stays in the input bucket and is attempted again in " +
+				roundDur(d) + "."
 		} else {
 			w.clearDeferral(o.Key)
-			switch w.cfg.Action {
-			case ActionDelete:
-				disposition = "The input was moved aside rather than deleted: this deployment " +
-					"deletes finished inputs, but an object the service refused to process is " +
-					"not a finished one, and it may be the only copy."
-			default:
-				disposition = "The input was moved to " + w.cfg.ProcessedPrefix + o.Key +
-					" and will NOT be retried automatically; re-upload it to try again."
+			movedTo = w.cfg.ProcessedPrefix + o.Key
+			disposition = "The input was moved to " + movedTo +
+				" and will NOT be retried automatically; re-upload it to try again."
+			if w.cfg.Action == ActionDelete {
+				disposition += " It was moved rather than deleted: this deployment deletes " +
+					"finished inputs, but an object the service refused to process is not a " +
+					"finished one, and it may be the only copy."
 			}
 		}
 		job.Status = "error"
@@ -1134,7 +1341,7 @@ func (w *Worker) processObject(ctx context.Context, o store.Object) {
 		job.Error = stallDetail(w.cfg.StallAbortAfter, time.Since(start), p, disposition)
 		record(job)
 		w.log.Error("object abandoned after publishing no progress; the queue continues",
-			"key", o.Key, "stall_abort_after", w.cfg.StallAbortAfter,
+			"key", o.Key, "input_moved_to", movedTo, "stall_abort_after", w.cfg.StallAbortAfter,
 			"elapsed", roundDur(time.Since(start)),
 			"phase", p.phase, "files_done", p.filesDone, "files_total", p.filesTotal,
 			"current_file", p.currentFile, "no_progress", roundDur(p.noProgress))
@@ -1206,7 +1413,7 @@ func (w *Worker) processObject(ctx context.Context, o store.Object) {
 			record(job)
 			w.log.Warn("object too large; skipping", "key", o.Key, "limit", w.cfg.MaxObjectBytes)
 			if ferr := w.finish(ctx, o.Key); ferr != nil {
-				d := w.deferRetry(o.Key)
+				d, _ := w.deferRetry(o.Key)
 				w.log.Warn("could not move oversized input aside; deferring retry",
 					"key", o.Key, "err", ferr, "retry_in", d)
 			} else {
@@ -1321,7 +1528,7 @@ func (w *Worker) processObject(ctx context.Context, o store.Object) {
 	})
 
 	eng := &pipeline.Engine{
-		Matcher: res.Matcher, Report: rep, Limits: w.cfg.Limits, ScrubNames: w.cfg.ScrubNames,
+		Matcher: res.Matcher, Report: rep, Limits: objLimits, ScrubNames: w.cfg.ScrubNames,
 		// The only thing that can stop the walk. It polls this between members; an
 		// aborted walk returns every container unchanged rather than a partial
 		// rebuild, so `changed` collapses to false and there is nothing to deliver.
@@ -1496,15 +1703,21 @@ func (w *Worker) processObject(ctx context.Context, o store.Object) {
 	// bucket and would otherwise be re-scrubbed on every poll forever, so hold it
 	// back with an increasing backoff instead of spinning.
 	if err := w.finish(ctx, o.Key); err != nil {
-		d := w.deferRetry(o.Key)
+		d, _ := w.deferRetry(o.Key)
 		w.log.Warn("could not mark input processed; deferring retry",
 			"key", o.Key, "err", err, "retry_in", d)
 	} else {
 		w.clearDeferral(o.Key)
 	}
-	// Consume the override sidecar if it existed.
+	// Consume the sidecars if they existed. Tracked separately because they arrive
+	// separately: a bundle may carry settings without an override policy, and
+	// deleting the settings only when a terms file happened to exist left them to
+	// accumulate in the input bucket for the life of the deployment.
 	if len(overrideTerms) > 0 {
 		_ = w.store.Delete(ctx, w.cfg.InputBucket, o.Key+termsSuffix)
+	}
+	if hadOpts {
+		_ = w.store.Delete(ctx, w.cfg.InputBucket, o.Key+optsSuffix)
 	}
 
 	// Metrics + job record.
@@ -1580,8 +1793,20 @@ func (w *Worker) finish(ctx context.Context, key string) error {
 	case ActionDelete:
 		return w.store.Delete(ctx, w.cfg.InputBucket, key)
 	default: // move
-		return w.store.Move(ctx, w.cfg.InputBucket, key, w.cfg.ProcessedPrefix+key)
+		return w.setAside(ctx, key)
 	}
+}
+
+// setAside moves an input out of the way without destroying it, whatever Action
+// says. Kept apart from finish because Action answers the narrower question of what
+// should happen to an input the service is FINISHED with, which a caller that never
+// finished with the object has no business consulting — see stalledExit.
+//
+// Safe under every Action: ProcessedPrefix is defaulted in New so it is never
+// empty, and eligible() rejects that prefix without consulting Action, so an object
+// set aside here does not return on the next poll.
+func (w *Worker) setAside(ctx context.Context, key string) error {
+	return w.store.Move(ctx, w.cfg.InputBucket, key, w.cfg.ProcessedPrefix+key)
 }
 
 // Audit detail is configured through report.ParseAuditLevel (shared with the CLI's

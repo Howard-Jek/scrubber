@@ -157,14 +157,14 @@ func (r *Registry) Resolve(key string, overrideTerms []byte, overrideName string
 	if len(overrideTerms) > 0 {
 		m, err := config.CompileBytes(overrideTerms)
 		if err != nil {
-			return Resolution{}, fmt.Errorf("per-object terms invalid: %w", err)
+			return Resolution{}, fmt.Errorf("%w: %w", ErrTermsInvalid, err)
 		}
 		return Resolution{Matcher: m, Name: "override:" + key}, nil
 	}
 	if overrideName != "" {
 		m, ok := r.Get(overrideName)
 		if !ok {
-			return Resolution{}, fmt.Errorf("object requested unknown policy %q", overrideName)
+			return Resolution{}, fmt.Errorf("%w: object requested unknown policy %q", ErrNoPolicy, overrideName)
 		}
 		return Resolution{Matcher: m, Name: overrideName}, nil
 	}
@@ -180,5 +180,5 @@ func (r *Registry) Resolve(key string, overrideTerms []byte, overrideName string
 			return Resolution{Matcher: m, Name: r.defaultPolicy}, nil
 		}
 	}
-	return Resolution{}, fmt.Errorf("no policy resolved for %q and no default set", key)
+	return Resolution{}, fmt.Errorf("%w: no policy resolved for %q and no default set", ErrNoPolicy, key)
 }
