@@ -21,7 +21,7 @@ import (
 	"github.com/minio/minio-go/v7/pkg/credentials"
 )
 
-// ErrTooLarge is returned by GetLimited when an object exceeds the byte cap. The
+// ErrTooLarge is returned by GetLimitedTo when an object exceeds the byte cap. The
 // worker treats it as a graceful skip so an oversized object never OOMs the pod.
 var ErrTooLarge = errors.New("object exceeds size limit")
 
@@ -36,7 +36,6 @@ type Object struct {
 type ObjectStore interface {
 	List(ctx context.Context, bucket, prefix string) ([]Object, error)
 	Get(ctx context.Context, bucket, key string) ([]byte, error)
-	GetLimited(ctx context.Context, bucket, key string, max int64) ([]byte, error)
 	Exists(ctx context.Context, bucket, key string) (bool, []byte, error)
 	Put(ctx context.Context, bucket, key string, data []byte, contentType string) error
 	// PutStream uploads from a reader, so a result assembled on scratch storage is
@@ -44,7 +43,8 @@ type ObjectStore interface {
 	// which switches the client to multipart streaming.
 	PutStream(ctx context.Context, bucket, key string, r io.Reader, size int64, contentType string) error
 	// GetLimitedTo streams an object into w, reading at most max bytes and returning
-	// ErrTooLarge past that. It is GetLimited without the intermediate []byte.
+	// ErrTooLarge past that: the cap is enforced while reading, so an oversized
+	// object never lands on the heap.
 	GetLimitedTo(ctx context.Context, w io.Writer, bucket, key string, max int64) (int64, error)
 	// Stat reports whether an object exists without transferring it. Distinct from
 	// Exists, which returns the body: asking "is this still there?" about a
@@ -242,31 +242,6 @@ func (c *Client) Get(ctx context.Context, bucket, key string) ([]byte, error) {
 	return buf.Bytes(), nil
 }
 
-// GetLimited fetches an object but reads at most max bytes into memory. If the
-// object is larger than max it returns ErrTooLarge without buffering the whole
-// thing — the backstop that keeps a huge object from OOM-killing the pod even if
-// its listed size was unknown or wrong.
-func (c *Client) GetLimited(ctx context.Context, bucket, key string, max int64) ([]byte, error) {
-	ctx, g, cancel := c.guard(ctx)
-	defer cancel()
-	defer g.stop()
-
-	obj, err := c.mc.GetObject(ctx, bucket, key, minio.GetObjectOptions{})
-	if err != nil {
-		return nil, stalledOr(g, err)
-	}
-	defer obj.Close()
-	var buf bytes.Buffer
-	n, err := io.CopyN(&buf, &stallReader{r: obj, g: g}, max+1)
-	if err != nil && err != io.EOF {
-		return nil, stalledOr(g, err)
-	}
-	if n > max {
-		return nil, ErrTooLarge
-	}
-	return buf.Bytes(), nil
-}
-
 // Stat reports whether key exists without transferring its contents. The API
 // uses it to answer "is this object finished?" from durable storage rather than
 // from the process's in-memory job history, which does not survive a restart.
@@ -334,7 +309,7 @@ func (c *Client) PutStream(ctx context.Context, bucket, key string, r io.Reader,
 
 // GetLimitedTo streams an object into w under a byte cap.
 //
-// Same contract as GetLimited — the cap is enforced while reading, so an oversized
+// The cap is enforced while reading, so an oversized
 // object is refused without ever being buffered whole — except the destination is
 // the caller's writer, which lets the worker stage a large upload on scratch storage
 // instead of the heap.

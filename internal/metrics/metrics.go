@@ -370,13 +370,6 @@ func NewJobLog(size int) *JobLog {
 	return &JobLog{size: size, idx: map[string]int{}}
 }
 
-// Add appends a job, evicting the oldest when full.
-func (l *JobLog) Add(j Job) {
-	l.mu.Lock()
-	defer l.mu.Unlock()
-	l.appendLocked(j)
-}
-
 // Upsert replaces the entry for j.Key if present, otherwise appends. Used to
 // publish a "processing" record before work starts and refine it as the job
 // advances, so a client polling mid-flight sees real progress rather than an
