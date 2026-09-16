@@ -3,6 +3,7 @@ package scrub
 import (
 	"encoding/base64"
 	"regexp"
+	"strings"
 	"unicode/utf8"
 )
 
@@ -36,6 +37,11 @@ import (
 //     digests share base64's alphabet and decode to binary noise; re-encoding
 //     one would replace a checksum with garbage. Those are scanned and reported
 //     but never rewritten.
+
+// minWrapWidth is the shortest line length accepted as a wrapped base64 block.
+// PEM wraps at 64 and MIME at 76; nothing legitimate wraps encoded data much
+// narrower, and a low bar would start joining unrelated short lines.
+const minWrapWidth = 32
 
 // MaxEncodedDepth bounds recursion into content that is itself encoded. Secrets
 // wrapped twice are real -- a base64 kubeconfig containing a base64 token -- but
@@ -99,13 +105,173 @@ func (m *Matcher) ScrubEncoded(text string) (string, []EncodedFinding) {
 	return m.scrubEncoded(text, 0)
 }
 
+// wrappedBlock describes a run of consecutive lines that together form one
+// base64 payload, as PEM and MIME emit it.
+type wrappedBlock struct {
+	start, end int // byte offsets into the containing text
+	width      int // the wrap width, so a rewrite can keep the file's shape
+	joined     string
+}
+
+// findWrappedBlocks locates runs of two or more consecutive lines that are
+// base64 all the way across and uniformly wrapped.
+//
+// Decoding such lines one at a time -- which is what happens without this -- is
+// worse than not decoding them at all. A secret straddling a line boundary is
+// never seen whole, while the lines that do decode produce matches, so the run
+// reports a match and a clean verdict over a live credential.
+//
+// The uniformity requirement is the safety rail. Every line but the last must be
+// the same width, that width must be a multiple of four, and the joined result
+// must itself decode. Ragged lines that merely happen to use the base64 alphabet
+// are left to the single-region pass, because joining them would decode
+// something nobody ever encoded.
+func findWrappedBlocks(text string) []wrappedBlock {
+	type line struct{ start, end int }
+	var lines []line
+	for i := 0; i <= len(text); {
+		j := strings.IndexByte(text[i:], '\n')
+		if j < 0 {
+			if i < len(text) {
+				lines = append(lines, line{i, len(text)})
+			}
+			break
+		}
+		lines = append(lines, line{i, i + j})
+		i += j + 1
+	}
+
+	isB64Line := func(l line) bool {
+		if l.end-l.start == 0 {
+			return false
+		}
+		for k := l.start; k < l.end; k++ {
+			c := text[k]
+			if !(c >= 'A' && c <= 'Z' || c >= 'a' && c <= 'z' || c >= '0' && c <= '9' ||
+				c == '+' || c == '/' || c == '=') {
+				return false
+			}
+		}
+		return true
+	}
+
+	var out []wrappedBlock
+	for i := 0; i < len(lines); i++ {
+		if !isB64Line(lines[i]) {
+			continue
+		}
+		width := lines[i].end - lines[i].start
+		if width < minWrapWidth || width%4 != 0 {
+			continue
+		}
+		j := i + 1
+		for j < len(lines) && isB64Line(lines[j]) {
+			w := lines[j].end - lines[j].start
+			if w == width {
+				j++
+				continue
+			}
+			if w < width { // a shorter line can only be the last one
+				j++
+			}
+			break
+		}
+		if j-i < 2 {
+			continue
+		}
+		var b strings.Builder
+		for k := i; k < j; k++ {
+			b.WriteString(text[lines[k].start:lines[k].end])
+		}
+		joined := b.String()
+		if len(joined)%4 == 0 {
+			if _, ok := decodeBase64(joined); ok {
+				out = append(out, wrappedBlock{lines[i].start, lines[j-1].end, width, joined})
+			}
+		}
+		i = j - 1
+	}
+	return out
+}
+
+// rewrap re-emits an encoded payload at the width the file was using, so a
+// rewritten block keeps the shape its reader expects.
+func rewrap(enc string, width int) string {
+	if width <= 0 || len(enc) <= width {
+		return enc
+	}
+	var b strings.Builder
+	for i := 0; i < len(enc); i += width {
+		if i > 0 {
+			b.WriteByte('\n')
+		}
+		end := i + width
+		if end > len(enc) {
+			end = len(enc)
+		}
+		b.WriteString(enc[i:end])
+	}
+	return b.String()
+}
+
+func (m *Matcher) scrubWrapped(text string, depth int) (string, []EncodedFinding) {
+	blocks := findWrappedBlocks(text)
+	if len(blocks) == 0 {
+		return text, nil
+	}
+	var (
+		out      []byte
+		findings []EncodedFinding
+		last     int
+	)
+	for _, blk := range blocks {
+		decoded, ok := decodeBase64(blk.joined)
+		if !ok {
+			continue
+		}
+		inner, innerFindings := m.scrubEncoded(string(decoded), depth+1)
+		scrubbed, matches := m.Scrub(inner)
+		if len(matches) == 0 && len(innerFindings) == 0 {
+			continue
+		}
+		f := EncodedFinding{
+			Encoding: "base64",
+			Offset:   blk.start,
+			Length:   blk.end - blk.start,
+			Depth:    depth,
+			Matches:  matches,
+		}
+		if isText(decoded) {
+			if out == nil {
+				out = make([]byte, 0, len(text))
+			}
+			out = append(out, text[last:blk.start]...)
+			out = append(out, rewrap(base64.StdEncoding.EncodeToString([]byte(scrubbed)), blk.width)...)
+			last = blk.end
+			f.Rewritten = true
+		}
+		findings = append(findings, f)
+		findings = append(findings, innerFindings...)
+	}
+	if out == nil {
+		return text, findings
+	}
+	out = append(out, text[last:]...)
+	return string(out), findings
+}
+
 func (m *Matcher) scrubEncoded(text string, depth int) (string, []EncodedFinding) {
 	if m == nil {
 		return text, nil
 	}
+	var wrappedFindings []EncodedFinding
+	if depth < MaxEncodedDepth {
+		text, wrappedFindings = m.scrubWrapped(text, depth)
+	}
+
 	locs := b64Run.FindAllStringIndex(text, -1)
 	if locs == nil {
-		return text, nil
+		return text, wrappedFindings
 	}
 	if depth >= MaxEncodedDepth {
 		// Out of budget. Say so rather than returning quietly: a clean scan of
@@ -128,7 +294,7 @@ func (m *Matcher) scrubEncoded(text string, depth int) (string, []EncodedFinding
 				Unexamined: true,
 			})
 		}
-		return text, holes
+		return text, append(wrappedFindings, holes...)
 	}
 
 	var (
@@ -178,6 +344,7 @@ func (m *Matcher) scrubEncoded(text string, depth int) (string, []EncodedFinding
 		findings = append(findings, innerFindings...)
 	}
 
+	findings = append(wrappedFindings, findings...)
 	if out == nil {
 		return text, findings
 	}
