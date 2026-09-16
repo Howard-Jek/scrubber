@@ -763,6 +763,23 @@ func (e *Engine) handleLeaf(path string, in *spill.Blob) (*spill.Blob, bool) {
 	// first, then whatever the plaintext pass could not see.
 	if encoded, findings := e.Matcher.ScrubEncoded(scrubbed); len(findings) > 0 {
 		for i := range findings {
+			if findings[i].Unexamined {
+				// The decoder ran out of depth before reaching the bottom. Nobody
+				// looked inside this region, so nothing known about this file says
+				// whether it holds a credential -- and that is a hole, not a pass.
+				// Reporting it is the whole point: the depth limit was previously
+				// silent, which made it the same class of bug as the one this pass
+				// was written to fix.
+				e.Report.Skip(path, report.StatusPassthrough, report.ReasonEncoded,
+					fmt.Sprintf("a %s region at offset %d nests deeper than the %d-level "+
+						"decode limit, so its innermost content was NOT examined and "+
+						"nothing here says whether it contains credentials. Emitted "+
+						"unchanged and NOT scrubbed.",
+						findings[i].Encoding, findings[i].Offset, scrub.MaxEncodedDepth),
+					int(in.Size()), int(in.Size()))
+				e.Report.NoteOpaque()
+				return in, false
+			}
 			if findings[i].Rewritten {
 				continue
 			}

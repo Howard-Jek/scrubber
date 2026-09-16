@@ -37,11 +37,11 @@ import (
 //     one would replace a checksum with garbage. Those are scanned and reported
 //     but never rewritten.
 
-// maxEncodedDepth bounds recursion into content that is itself encoded. Secrets
+// MaxEncodedDepth bounds recursion into content that is itself encoded. Secrets
 // wrapped twice are real -- a base64 kubeconfig containing a base64 token -- but
 // each level costs another decode of the whole payload, and nothing legitimate
 // nests deeply.
-const maxEncodedDepth = 3
+const MaxEncodedDepth = 3
 
 // minB64Run is the shortest candidate considered, in encoded characters. 24
 // characters decode to 18 bytes, comfortably below the shortest credential worth
@@ -76,6 +76,14 @@ type EncodedFinding struct {
 	Depth     int     `json:"depth"`     // 0 for a region in the file itself, 1 inside one of those, ...
 	Matches   []Match `json:"matches"`   // what the policy found in the decoded content
 	Rewritten bool    `json:"rewritten"` // false means the secret survives into the output and must be reported
+	// Unexamined marks a region the depth limit stopped us from decoding. It
+	// carries no Matches, and that is the point: nobody looked inside it, so
+	// nothing here says whether it holds a credential.
+	//
+	// Without this, MaxEncodedDepth was a silent hole -- exactly the shape this
+	// file exists to close, moved up one level. A secret wrapped six times was
+	// neither found nor mentioned, and the run reported complete.
+	Unexamined bool `json:"unexamined,omitempty"`
 }
 
 // ScrubEncoded finds encoded regions in text, runs the policy over their decoded
@@ -92,12 +100,35 @@ func (m *Matcher) ScrubEncoded(text string) (string, []EncodedFinding) {
 }
 
 func (m *Matcher) scrubEncoded(text string, depth int) (string, []EncodedFinding) {
-	if m == nil || depth >= maxEncodedDepth {
+	if m == nil {
 		return text, nil
 	}
 	locs := b64Run.FindAllStringIndex(text, -1)
 	if locs == nil {
 		return text, nil
+	}
+	if depth >= MaxEncodedDepth {
+		// Out of budget. Say so rather than returning quietly: a clean scan of
+		// something nobody could open is the absence of a scan, and this codebase
+		// treats that as a hole everywhere else it occurs.
+		//
+		// Only regions that actually decode are reported. A hex digest shares the
+		// base64 alphabet and would otherwise turn every checksum at the bottom of
+		// the recursion into a spurious hole.
+		var holes []EncodedFinding
+		for _, loc := range locs {
+			if _, ok := decodeBase64(text[loc[0]:loc[1]]); !ok {
+				continue
+			}
+			holes = append(holes, EncodedFinding{
+				Encoding:   "base64",
+				Offset:     loc[0],
+				Length:     loc[1] - loc[0],
+				Depth:      depth,
+				Unexamined: true,
+			})
+		}
+		return text, holes
 	}
 
 	var (
@@ -122,6 +153,8 @@ func (m *Matcher) scrubEncoded(text string, depth int) (string, []EncodedFinding
 		if len(matches) == 0 && len(innerFindings) == 0 {
 			continue
 		}
+		// A region whose only news is "we ran out of depth inside it" is a hole,
+		// not a match. Propagate it without claiming we found something.
 
 		f := EncodedFinding{
 			Encoding: "base64",

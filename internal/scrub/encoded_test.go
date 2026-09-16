@@ -129,3 +129,53 @@ func TestEncodedNestedBase64(t *testing.T) {
 		t.Error("a secret base64-encoded twice was not found; depth must be > 1")
 	}
 }
+
+// The depth limit is a limit on what we LOOKED AT, not a licence to call the rest
+// clean. A secret nested deeper than MaxEncodedDepth was, before this, invisible
+// AND unreported -- the same silent-hole shape the whole file exists to close,
+// moved up one level.
+
+func TestEncodedDepthLimitIsReportedNotIgnored(t *testing.T) {
+	m := encMatcher(t)
+	s := "key AKIAIOSFODNN7EXAMPLE"
+	for i := 0; i < 5; i++ {
+		s = b64(s)
+	}
+	text := "blob=" + s + "\n"
+
+	_, findings := m.ScrubEncoded(text)
+	for _, f := range findings {
+		if f.Unexamined {
+			if len(f.Matches) != 0 {
+				t.Errorf("an unexamined region must carry no matches; we did not look: %+v", f)
+			}
+			return
+		}
+	}
+	t.Fatal("nesting past the depth limit produced no Unexamined finding: " +
+		"the file would be reported clean when nobody looked inside it")
+}
+
+func TestEncodedShallowNestingIsNotAHole(t *testing.T) {
+	m := encMatcher(t)
+	// one level of wrapping, well inside the limit: found, cleaned, and NOT a hole
+	text := "blob=" + b64("key AKIAIOSFODNN7EXAMPLE") + "\n"
+	_, findings := m.ScrubEncoded(text)
+	for _, f := range findings {
+		if f.Unexamined {
+			t.Errorf("reported a hole for content it decoded fine: %+v", f)
+		}
+	}
+}
+
+func TestEncodedPlainTextIsNotAHole(t *testing.T) {
+	m := encMatcher(t)
+	// a hex digest is valid base64 alphabet; it must not be reported as an
+	// unexamined hole just because it sits at the bottom of the recursion
+	_, findings := m.ScrubEncoded("sha=deadbeefdeadbeefdeadbeefdeadbeef\n")
+	for _, f := range findings {
+		if f.Unexamined {
+			t.Errorf("hex digest reported as an unexamined encoded hole: %+v", f)
+		}
+	}
+}
