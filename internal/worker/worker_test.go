@@ -90,19 +90,6 @@ func (m *memStore) Get(_ context.Context, bucket, key string) ([]byte, error) {
 	return append([]byte(nil), v...), nil
 }
 
-func (m *memStore) GetLimited(_ context.Context, bucket, key string, max int64) ([]byte, error) {
-	m.mu.Lock()
-	defer m.mu.Unlock()
-	v, ok := m.buckets[bucket][key]
-	if !ok {
-		return nil, os.ErrNotExist
-	}
-	if int64(len(v)) > max {
-		return nil, store.ErrTooLarge
-	}
-	return append([]byte(nil), v...), nil
-}
-
 func (m *memStore) PutStream(ctx context.Context, bucket, key string, r io.Reader, _ int64, ct string) error {
 	data, err := io.ReadAll(r)
 	if err != nil {
@@ -538,7 +525,7 @@ func TestFinalizeSuccessClearsBackoff(t *testing.T) {
 
 // --- queue behaviour ---
 
-// serialProbe brackets each object's processing. GetLimited is always the first
+// serialProbe brackets each object's processing. GetLimitedTo is always the first
 // store call for an object and Move the last on the success path, so the bracket
 // records both the order objects were started in and how many ran at once. The
 // sleep widens the window: without it a genuine fan-out could interleave so briefly

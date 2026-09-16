@@ -737,7 +737,7 @@ func (w *Worker) eligible(o store.Object, now time.Time) bool {
 	if until, held := w.deferUntil[o.Key]; held && now.Before(until) {
 		return false // finalization failed recently; wait out the backoff
 	}
-	// Size is enforced in processObject via a bounded read (GetLimited), so an
+	// Size is enforced in processObject via a bounded read (GetLimitedTo), so an
 	// object whose listed size is unknown or wrong still can't OOM the pod.
 	return true
 }

@@ -61,11 +61,6 @@ type Queue struct {
 	// notify wakes a blocked Next when Sync adds work. Buffered so Sync never
 	// blocks on a consumer that is busy scrubbing.
 	notify chan struct{}
-
-	// truncated is the size of the last listing that overflowed max, or 0. The
-	// caller reads it to log the drop; a silently capped queue reads as
-	// "everything is queued" when it is not.
-	truncated int
 }
 
 // New builds an empty queue holding at most max pending items (<=0 uses DefaultMax).
@@ -113,7 +108,6 @@ func (q *Queue) Sync(items []Item) (dropped int) {
 		dropped = len(next) - q.max
 		next = next[:q.max] // keep the earliest arrivals
 	}
-	q.truncated = dropped
 	q.pending = next
 	hasWork := len(next) > 0
 	q.mu.Unlock()

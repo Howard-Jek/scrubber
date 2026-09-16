@@ -202,11 +202,6 @@ type Engine struct {
 	// residualLeft is the remaining allowance for scanning uninspected content,
 	// reset per object alongside the expansion budget.
 	residualLeft int64
-	// residualHits and residualLabels accumulate what the scan found across the
-	// whole object. Non-zero is what turns a merely incomplete run into a risky one.
-	residualHits   int
-	residualLabels map[string]int
-
 	// aborted latches once Abort first returns true, so the whole walk agrees on
 	// one answer. Polling the predicate directly at each site would let a walk see
 	// "not aborted" at one level and "aborted" at the next, which is precisely how
@@ -320,10 +315,6 @@ func (a *abortWriter) Write(p []byte) (int, error) {
 	return a.w.Write(p)
 }
 
-// ResidualFindings reports what the safety net found in content this walk did not
-// inspect: the match count and a disclosure-safe label breakdown.
-func (e *Engine) ResidualFindings() (int, map[string]int) { return e.residualHits, e.residualLabels }
-
 // residualScan looks inside a payload the walk declined to inspect and records what
 // it finds on the report.
 //
@@ -357,13 +348,6 @@ func (e *Engine) residualScan(path string, reason report.Reason, b *spill.Blob) 
 	}
 	if res.Hits == 0 {
 		return
-	}
-	e.residualHits += res.Hits
-	if e.residualLabels == nil {
-		e.residualLabels = map[string]int{}
-	}
-	for k, v := range res.Labels {
-		e.residualLabels[k] += v
 	}
 	e.Report.NoteResidual(path, reason, res.Hits, res.Summary())
 }
@@ -526,7 +510,6 @@ func (e *Engine) ProcessBlob(path string, in *spill.Blob, depth int) (*spill.Blo
 		if e.residualLeft == 0 {
 			e.residualLeft = DefaultResidualBudget
 		}
-		e.residualHits, e.residualLabels = 0, nil
 		// The top-level object is nobody's member: it was never counted, so its own
 		// members are added in full.
 		e.asMember = false
@@ -1167,13 +1150,6 @@ func (e *Engine) handlePack(path string, in *spill.Blob) (*spill.Blob, bool) {
 		hits += res.Hits
 		if len(named) < maxNamedPackObjects {
 			named = append(named, objects[i].Ref()+": "+res.Summary())
-		}
-		e.residualHits += res.Hits
-		if e.residualLabels == nil {
-			e.residualLabels = map[string]int{}
-		}
-		for k, v := range res.Labels {
-			e.residualLabels[k] += v
 		}
 	}
 
